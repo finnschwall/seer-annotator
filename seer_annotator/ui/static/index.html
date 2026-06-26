@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SEER Annotator Debug UI</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --surface2: #252836;
+    --border: #2e3347; --text: #e2e8f0; --muted: #8892a4;
+    --blue: #60a5fa; --green: #34d399; --yellow: #fbbf24;
+    --red: #f87171; --purple: #a78bfa; --orange: #fb923c;
+    --radius: 8px; --font: 'Inter', system-ui, sans-serif;
+    --mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  }
+  body { background: var(--bg); color: var(--text); font-family: var(--font);
+    font-size: 14px; line-height: 1.6; min-height: 100vh; }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* Layout */
+  #app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+  nav { background: var(--surface); border-right: 1px solid var(--border);
+    padding: 20px 0; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+  nav h1 { font-size: 13px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--muted); padding: 0 16px 12px; }
+  nav .nav-section { margin-bottom: 20px; }
+  nav .nav-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); padding: 0 16px 6px; }
+  nav a { display: block; padding: 6px 16px; color: var(--text); font-size: 13px;
+    border-radius: 0; transition: background .15s; }
+  nav a:hover, nav a.active { background: var(--surface2); text-decoration: none; }
+  nav a.active { border-left: 3px solid var(--blue); }
+  main { padding: 28px; max-width: 1200px; }
+
+  /* Cards */
+  .card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 20px; }
+  .card h2 { font-size: 16px; margin-bottom: 14px; color: var(--text); }
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+  .stat-card { background: var(--surface2); border-radius: var(--radius);
+    padding: 14px; text-align: center; }
+  .stat-card .val { font-size: 28px; font-weight: 700; color: var(--blue); }
+  .stat-card .lbl { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  /* Table */
+  .tbl-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 8px 12px; background: var(--surface2);
+    color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .05em; border-bottom: 1px solid var(--border); }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface2); cursor: pointer; }
+
+  /* Badges */
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 99px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .badge-done { background: #052e16; color: var(--green); }
+  .badge-posted { background: #1e3a5f; color: var(--blue); }
+  .badge-pending { background: #2d1f00; color: var(--yellow); }
+  .badge-failed { background: #2d0b0b; color: var(--red); }
+  .badge-skipped { background: #1f1d2e; color: var(--muted); }
+
+  /* Filters */
+  .filters { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+  select, input { background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text); padding: 6px 10px; border-radius: var(--radius);
+    font-size: 13px; font-family: var(--font); }
+  select:focus, input:focus { outline: 2px solid var(--blue); border-color: transparent; }
+  button { background: var(--blue); color: #000; border: none; padding: 6px 14px;
+    border-radius: var(--radius); font-size: 13px; font-weight: 600; cursor: pointer; }
+  button:hover { opacity: .85; }
+  button.secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+
+  /* Detail panel */
+  #detail-panel { position: fixed; top: 0; right: 0; width: 720px; max-width: 90vw;
+    height: 100vh; background: var(--surface); border-left: 1px solid var(--border);
+    overflow-y: auto; z-index: 100; transform: translateX(100%);
+    transition: transform .25s ease; padding: 24px; }
+  #detail-panel.open { transform: translateX(0); }
+  #detail-panel h3 { font-size: 15px; margin-bottom: 16px; }
+  .close-btn { float: right; background: none; color: var(--muted);
+    border: 1px solid var(--border); padding: 4px 10px; border-radius: var(--radius);
+    cursor: pointer; font-size: 13px; }
+  .close-btn:hover { color: var(--text); }
+  .overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 99; }
+  .overlay.open { display: block; }
+
+  /* Code / pre */
+  pre { background: var(--surface2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px; overflow-x: auto;
+    font-family: var(--mono); font-size: 12px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word; }
+  .section-label { font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--muted); margin-bottom: 6px; margin-top: 18px; }
+  .answer-value { font-size: 18px; font-weight: 700; color: var(--green);
+    font-family: var(--mono); }
+  .kv { display: grid; grid-template-columns: 140px 1fr; gap: 6px 12px; font-size: 13px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-family: var(--mono); word-break: break-all; }
+  .verify-ok { color: var(--green); }
+  .verify-fail { color: var(--red); }
+  .tab-bar { display: flex; gap: 4px; margin-bottom: 16px; }
+  .tab { padding: 6px 14px; border-radius: var(--radius); cursor: pointer;
+    background: var(--surface2); border: 1px solid var(--border); font-size: 13px; }
+  .tab.active { background: var(--blue); color: #000; border-color: transparent; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* Cost table */
+  .cost-row td:nth-child(n+2) { text-align: right; font-family: var(--mono); }
+
+  /* Check columns */
+  .chk { text-align: center; font-size: 15px; }
+  .chk-yes { color: var(--green); }
+  .chk-no  { color: var(--orange); }
+  .chk-null { color: var(--muted); }
+
+  /* Toast */
+  #toast { position: fixed; bottom: 20px; right: 20px; background: var(--surface2);
+    border: 1px solid var(--border); padding: 10px 18px; border-radius: var(--radius);
+    font-size: 13px; opacity: 0; pointer-events: none; transition: opacity .3s; z-index: 200; }
+  #toast.show { opacity: 1; }
+
+  /* Spinner */
+  .spinner { display: inline-block; width: 16px; height: 16px;
+    border: 2px solid var(--border); border-top-color: var(--blue);
+    border-radius: 50%; animation: spin .6s linear infinite; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="app">
+  <nav>
+    <h1>Seer Annotator</h1>
+    <div class="nav-section">
+      <div class="nav-label">Views</div>
+      <a href="#" data-view="overview" class="active">Overview</a>
+      <a href="#" data-view="answers">Answers</a>
+      <a href="#" data-view="cost">Tokens &amp; Cost</a>
+    </div>
+    <div class="nav-section" id="run-nav">
+      <div class="nav-label">Runs</div>
+      <!-- populated dynamically -->
+    </div>
+  </nav>
+
+  <main id="main-content">
+    <div id="view-overview"></div>
+    <div id="view-answers" style="display:none"></div>
+    <div id="view-cost" style="display:none"></div>
+  </main>
+</div>
+
+<div class="overlay" id="overlay" onclick="closeDetail()"></div>
+<div id="detail-panel">
+  <button class="close-btn" onclick="closeDetail()">✕ Close</button>
+  <div id="detail-content"></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+
+let state = { pipeline: null, stats: null, answers: [], activeRun: null };
+
+// ---- Routing ----
+function showView(name) {
+  $$('[data-view]').forEach(a => a.classList.toggle('active', a.dataset.view === name));
+  ['overview','answers','cost'].forEach(v => {
+    $(`#view-${v}`).style.display = v === name ? '' : 'none';
+  });
+  if (name === 'overview') renderOverview();
+  if (name === 'answers') renderAnswers();
+  if (name === 'cost') renderCost();
+}
+
+$$('[data-view]').forEach(a => a.addEventListener('click', e => {
+  e.preventDefault();
+  showView(a.dataset.view);
+}));
+
+// ---- API helpers ----
+async function api(path) {
+  const r = await fetch('/api' + path);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+function toast(msg, ms=2500) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), ms);
+}
+
+// ---- Load data ----
+async function loadAll() {
+  [state.pipeline, state.stats] = await Promise.all([api('/pipeline'), api('/stats')]);
+  renderRunNav();
+  renderOverview();
+}
+
+function renderRunNav() {
+  const nav = $('#run-nav');
+  const links = state.pipeline.runs.map(r =>
+    `<a href="#" data-run="${r.run_id}" onclick="filterRun(${r.run_id});return false"
+      title="${r.model} (${r.provider})">${r.name}</a>`
+  ).join('');
+  nav.innerHTML = `<div class="nav-label">Runs</div>${links}`;
+}
+
+function filterRun(runId) {
+  state.activeRun = runId;
+  $$('[data-run]').forEach(a => a.classList.toggle('active', +a.dataset.run === runId));
+  showView('answers');
+}
+
+// ---- Overview ----
+function renderOverview() {
+  const s = state.stats?.stats || {};
+  const ans = s.answers || {};
+  const total = Object.values(ans).reduce((a,b) => a+b, 0);
+  const p = state.pipeline;
+
+  const statusColors = {done:'green',posted:'blue',pending:'yellow',failed:'red',skipped:'muted'};
+
+  const statusCards = Object.entries(ans).map(([k,v]) =>
+    `<div class="stat-card"><div class="val" style="color:var(--${statusColors[k]||'text'})">${v}</div>
+     <div class="lbl">${k}</div></div>`
+  ).join('');
+
+  $(`#view-overview`).innerHTML = `
+    <div class="card">
+      <h2>Pipeline: review ${p?.review_id}, setup ${p?.setup_id}</h2>
+      <div class="kv">
+        <span class="k">Runs</span><span class="v">${p?.runs?.length || 0}</span>
+        <span class="k">Papers</span><span class="v">${p?.papers?.length || 0}</span>
+        <span class="k">Questions</span><span class="v">${p?.questions?.length || 0}</span>
+        <span class="k">OCR cached</span><span class="v">${s.ocr_cached || 0}</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Answer status (${total} total)</h2>
+      <div class="card-grid">${statusCards || '<span style="color:var(--muted)">No answers yet</span>'}</div>
+    </div>
+
+    <div class="card">
+      <h2>Runs</h2>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>ID</th><th>Name</th><th>Model</th><th>Provider</th><th>Batching</th><th>Text source</th></tr></thead>
+        <tbody>
+        ${(p?.runs||[]).map(r => `<tr>
+          <td>${r.run_id}</td>
+          <td><a href="#" onclick="filterRun(${r.run_id});return false">${r.name}</a></td>
+          <td style="font-family:var(--mono)">${r.model}</td>
+          <td>${r.provider}</td>
+          <td style="font-family:var(--mono)">${JSON.stringify(r.config.batching)}</td>
+          <td>${r.config.text_source}</td>
+        </tr>`).join('')}
+        </tbody>
+      </table></div>
+    </div>
+
+    <div class="card">
+      <h2>Questions</h2>
+      <div class="tbl-wrap"><table>
+        <thead><tr><th>ID</th><th>Key</th><th>Label</th><th>Type</th><th>Version ID</th></tr></thead>
+        <tbody>
+        ${(p?.questions||[]).map(q => `<tr>
+          <td>${q.question_id}</td>
+          <td style="font-family:var(--mono)">${q.key}</td>
+          <td>${q.label}</td>
+          <td>${q.question_type}</td>
+          <td>${q.version_id}</td>
+        </tr>`).join('')}
+        </tbody>
+      </table></div>
+    </div>
+  `;
+}
+
+// ---- Answers view ----
+let answerState = { runId: '', paperId: '', loaded: false };
+
+async function renderAnswers() {
+  const view = $('#view-answers');
+  view.innerHTML = `
+    <div class="card">
+      <h2>Answers</h2>
+      <div class="filters">
+        <select id="filter-run">
+          <option value="">All runs</option>
+          ${(state.pipeline?.runs||[]).map(r => `<option value="${r.run_id}"${state.activeRun===r.run_id?' selected':''}>${r.name}</option>`).join('')}
+        </select>
+        <select id="filter-paper">
+          <option value="">All papers</option>
+          ${(state.pipeline?.papers||[]).map(p => `<option value="${p.paper_id}">${p.paper_id}: ${p.title.slice(0,50)}</option>`).join('')}
+        </select>
+        <select id="filter-status">
+          <option value="">All statuses</option>
+          ${['pending','done','posted','failed','skipped'].map(s => `<option value="${s}">${s}</option>`).join('')}
+        </select>
+        <button onclick="loadAnswers()">Load</button>
+      </div>
+      <div id="answers-table"><span class="spinner"></span> loading…</div>
+    </div>
+  `;
+
+  $('#filter-run').value = state.activeRun || '';
+  await loadAnswers();
+}
+
+async function loadAnswers() {
+  const runId = $('#filter-run')?.value || '';
+  const paperId = $('#filter-paper')?.value || '';
+  const statusFilter = $('#filter-status')?.value || '';
+  let url = '/answers?';
+  if (runId) url += `run_id=${runId}&`;
+  if (paperId) url += `paper_id=${paperId}&`;
+
+  const el = $('#answers-table');
+  el.innerHTML = '<span class="spinner"></span> loading…';
+
+  try {
+    let rows = await api(url);
+    if (statusFilter) rows = rows.filter(r => r.status === statusFilter);
+    state.answers = rows;
+    el.innerHTML = renderAnswerTable(rows);
+  } catch(e) {
+    el.innerHTML = `<span style="color:var(--red)">Error: ${e.message}</span>`;
+  }
+}
+
+function renderAnswerTable(rows) {
+  if (!rows.length) return '<p style="color:var(--muted);padding:12px">No answers found.</p>';
+
+  const qMap = {};
+  (state.pipeline?.questions||[]).forEach(q => { qMap[q.version_id] = q; });
+
+  return `<div class="tbl-wrap"><table>
+    <thead><tr>
+      <th>Run</th><th>Paper</th><th>Question</th><th>Status</th>
+      <th>Value</th><th title="Citation verified">Cite ✓</th><th title="Posted to server">Post ✓</th>
+      <th>Latency</th><th>Tokens</th><th>Cost</th>
+    </tr></thead>
+    <tbody>
+    ${rows.map(r => {
+      const p = r.payload;
+      const val = p ? (p.value_boolean!==null && p.value_boolean!==undefined ? String(p.value_boolean) :
+                  p.value_categorical || p.value_text ||
+                  (p.value_categorical_multi?.length ? p.value_categorical_multi.join(', ') : '')) : '';
+      const isNullAnswer = !!p && !val;
+      const qinfo = r.question_info || {};
+      const cv = p?.cited_text_verified;
+      const citeIcon = cv === true  ? '<span class="chk-yes">✓</span>'
+                     : cv === false ? '<span class="chk-no">✗</span>'
+                     :                '<span class="chk-null">—</span>';
+      const postIcon = r.status === 'posted'
+        ? '<span class="chk-yes" title="Posted to server">✓</span>'
+        : '<span class="chk-null">—</span>';
+      return `<tr onclick="openDetail(${r.run_id},${r.paper_id},${r.version_id})">
+        <td title="${r.run_id}">${r.run_name}</td>
+        <td title="${r.paper_id}">${r.paper_title?.slice(0,35) || r.paper_id}…</td>
+        <td><span style="font-family:var(--mono);font-size:12px">${qinfo.key||r.version_id}</span></td>
+        <td><span class="badge badge-${r.status}">${r.status}</span></td>
+        <td style="font-family:var(--mono);${val?'color:var(--green)':isNullAnswer?'color:var(--red)':''}">${val||(isNullAnswer?'null':'—')}</td>
+        <td class="chk">${citeIcon}</td>
+        <td class="chk">${postIcon}</td>
+        <td style="font-family:var(--mono)">${p?.latency_ms ? p.latency_ms+'ms' : '—'}</td>
+        <td style="font-family:var(--mono)">${p?.tokens_total ? p.tokens_total.toLocaleString() : '—'}</td>
+        <td style="font-family:var(--mono)">${p?.cost ? '$'+parseFloat(p.cost).toFixed(5) : '—'}</td>
+      </tr>`;
+    }).join('')}
+    </tbody>
+  </table></div>`;
+}
+
+// ---- Detail panel ----
+async function openDetail(runId, paperId, versionId) {
+  const panel = $('#detail-panel');
+  const overlay = $('#overlay');
+  const content = $('#detail-content');
+  content.innerHTML = '<span class="spinner"></span> loading…';
+  panel.classList.add('open');
+  overlay.classList.add('open');
+
+  try {
+    const [detail, ocr] = await Promise.all([
+      api(`/answer/${runId}/${paperId}/${versionId}`),
+      api(`/ocr/${paperId}`),
+    ]);
+    content.innerHTML = renderDetail(detail, ocr);
+    activateTab('tab-structured');
+  } catch(e) {
+    content.innerHTML = `<span style="color:var(--red)">Error: ${e.message}</span>`;
+  }
+}
+
+function closeDetail() {
+  $('#detail-panel').classList.remove('open');
+  $('#overlay').classList.remove('open');
+}
+
+function renderDetail(d, ocr) {
+  const p = d.payload;
+  if (!p) return `<h3>No payload — status: ${d.status}</h3><pre>${d.error||'no error'}</pre>`;
+
+  const raw = p.raw_response || {};
+  const qinfo = (state.pipeline?.questions||[]).find(q => q.version_id === d.version_id) || {};
+  const verify = raw.verify || {};
+
+  const getValue = () => {
+    if (p.value_boolean !== null && p.value_boolean !== undefined) return String(p.value_boolean);
+    if (p.value_categorical) return p.value_categorical;
+    if (p.value_categorical_multi?.length) return p.value_categorical_multi.join(', ');
+    if (p.value_text) return p.value_text;
+    return null;
+  };
+  const valueStr = getValue();
+
+  return `
+    <h3>${qinfo.label || 'Question'} <span style="color:var(--muted);font-size:12px;font-weight:400">${qinfo.key||''}</span></h3>
+
+    <div class="tab-bar">
+      <div class="tab active" id="tab-structured" onclick="activateTab('tab-structured')">Structured</div>
+      <div class="tab" id="tab-pass1" onclick="activateTab('tab-pass1')">Pass 1 (reason)</div>
+      <div class="tab" id="tab-pass2" onclick="activateTab('tab-pass2')">Pass 2 (format)</div>
+      <div class="tab" id="tab-raw" onclick="activateTab('tab-raw')">Full raw</div>
+      ${ocr?.has_ocr ? `<div class="tab" id="tab-ocr" onclick="activateTab('tab-ocr')">OCR text</div>` : ''}
+    </div>
+
+    <div id="tab-structured-content" class="tab-content active">
+      ${valueStr !== null
+        ? `<div class="answer-value">${valueStr}</div>`
+        : `<div class="answer-value" style="color:var(--red)">null <span style="font-size:13px;font-weight:400;color:var(--muted)">— no value extracted</span></div>`
+      }
+
+      <div class="section-label">Paper / Run</div>
+      <div class="kv">
+        <span class="k">Paper</span><span class="v">${ocr?.title||d.paper_id}</span>
+        <span class="k">Run</span><span class="v">${d.run_id}</span>
+        <span class="k">Status</span><span class="v"><span class="badge badge-${d.status}">${d.status}</span></span>
+        ${d.error ? `<span class="k">Error</span><span class="v" style="color:var(--red)">${escHtml(d.error)}</span>` : ''}
+        <span class="k">Extraction status</span><span class="v" style="color:${p.extraction_status==='ok'?'var(--green)':p.extraction_status==='invalid'?'var(--yellow)':'var(--red)'}">${p.extraction_status||'—'}</span>
+        ${p.extraction_detail ? `<span class="k">Extraction detail</span><span class="v" style="color:var(--muted)">${escHtml(p.extraction_detail)}</span>` : ''}
+        <span class="k">Text source</span><span class="v">${raw.text_source||'—'}</span>
+        <span class="k">Batch group</span><span class="v">${raw.batch_group_id||'—'}</span>
+      </div>
+
+      <div class="section-label">Token usage</div>
+      <div class="kv">
+        <span class="k">Total</span><span class="v">${(p.tokens_total||0).toLocaleString()}</span>
+        <span class="k">Input</span><span class="v">${(p.tokens_input||0).toLocaleString()}</span>
+        <span class="k">Output</span><span class="v">${(p.tokens_output||0).toLocaleString()}</span>
+        <span class="k">Cached</span><span class="v" style="color:var(--green)">${(p.tokens_cached||0).toLocaleString()}</span>
+        <span class="k">Latency</span><span class="v">${p.latency_ms||0}ms</span>
+        <span class="k">Cost</span><span class="v">${p.cost ? '$'+parseFloat(p.cost).toFixed(6)+' '+p.cost_currency : '—'}</span>
+      </div>
+
+      <div class="section-label">Cited text
+        <span class="${verify.ok ? 'verify-ok':'verify-fail'}" style="margin-left:8px">
+          ${verify.ok ? '✓ verified' : '⚠ ' + (verify.note||'not verified')}
+        </span>
+      </div>
+      <pre>${escHtml(p.cited_text||'—')}</pre>
+
+      <div class="section-label">Comment (reasoning summary)</div>
+      <pre>${escHtml(p.comment||'—')}</pre>
+    </div>
+
+    <div id="tab-pass1-content" class="tab-content">
+      <div class="section-label">Pass 1 — free-form reasoning</div>
+      <pre>${escHtml(raw.pass1_text||'—')}</pre>
+    </div>
+
+    <div id="tab-pass2-content" class="tab-content">
+      <div class="section-label">Pass 2 — formatted output</div>
+      <pre>${escHtml(raw.pass2_text||'—')}</pre>
+      <div class="section-label">Parse result</div>
+      <pre>${escHtml(JSON.stringify(raw.parse_result, null, 2)||'—')}</pre>
+    </div>
+
+    <div id="tab-raw-content" class="tab-content">
+      <div class="section-label">Full raw_response</div>
+      <pre>${escHtml(JSON.stringify(raw, null, 2))}</pre>
+    </div>
+
+    ${ocr?.has_ocr ? `
+    <div id="tab-ocr-content" class="tab-content">
+      <div class="section-label">OCR markdown (${ocr.markdown?.length?.toLocaleString()||0} chars)</div>
+      <pre>${escHtml((ocr.markdown||'').slice(0, 20000))}${(ocr.markdown||'').length > 20000 ? '\n… [truncated at 20k chars]' : ''}</pre>
+    </div>` : ''}
+  `;
+}
+
+function activateTab(tabId) {
+  $$('.tab').forEach(t => t.classList.toggle('active', t.id === tabId));
+  $$('.tab-content').forEach(c => c.classList.toggle('active', c.id === tabId + '-content'));
+}
+
+// ---- Cost view ----
+async function renderCost() {
+  const view = $('#view-cost');
+  view.innerHTML = '<span class="spinner"></span>';
+  try {
+    const data = await api('/stats');
+    const costs = data.cost_summary || [];
+    const runs = state.pipeline?.runs || [];
+    const runMap = {};
+    runs.forEach(r => { runMap[r.run_id] = r; });
+
+    if (!costs.length) {
+      view.innerHTML = `<div class="card"><h2>Tokens &amp; Cost</h2>
+        <p style="color:var(--muted)">No completed answers yet.</p></div>`;
+      return;
+    }
+
+    const rows = costs.map(c => {
+      const r = runMap[c.run_id];
+      const cacheRatio = c.tokens_input > 0
+        ? (c.tokens_cached / c.tokens_input * 100).toFixed(1)
+        : '0.0';
+      return `<tr class="cost-row">
+        <td>${c.run_name}</td>
+        <td>${r?.model||'—'}</td>
+        <td>${c.answers}</td>
+        <td>${c.tokens_total.toLocaleString()}</td>
+        <td>${c.tokens_input.toLocaleString()}</td>
+        <td>${c.tokens_output.toLocaleString()}</td>
+        <td style="color:var(--green)">${c.tokens_cached.toLocaleString()} <span style="color:var(--muted);font-size:11px">(${cacheRatio}%)</span></td>
+        <td style="color:var(--yellow)">$${c.cost_usd.toFixed(4)}</td>
+      </tr>`;
+    }).join('');
+
+    const totals = costs.reduce((acc, c) => {
+      acc.answers += c.answers;
+      acc.tokens_total += c.tokens_total;
+      acc.tokens_input += c.tokens_input;
+      acc.tokens_output += c.tokens_output;
+      acc.tokens_cached += c.tokens_cached;
+      acc.cost_usd += c.cost_usd;
+      return acc;
+    }, {answers:0, tokens_total:0, tokens_input:0, tokens_output:0, tokens_cached:0, cost_usd:0});
+
+    view.innerHTML = `
+      <div class="card">
+        <h2>Tokens &amp; Cost</h2>
+        <div class="tbl-wrap"><table>
+          <thead><tr>
+            <th>Run</th><th>Model</th><th>Answers</th>
+            <th>Total tokens</th><th>Input</th><th>Output</th>
+            <th>Cached</th><th>Cost (USD)</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+          <tfoot>
+            <tr style="font-weight:700;border-top:2px solid var(--border)">
+              <td colspan="2">Total</td>
+              <td style="text-align:right">${totals.answers}</td>
+              <td style="text-align:right">${totals.tokens_total.toLocaleString()}</td>
+              <td style="text-align:right">${totals.tokens_input.toLocaleString()}</td>
+              <td style="text-align:right">${totals.tokens_output.toLocaleString()}</td>
+              <td style="text-align:right;color:var(--green)">${totals.tokens_cached.toLocaleString()}</td>
+              <td style="text-align:right;color:var(--yellow)">$${totals.cost_usd.toFixed(4)}</td>
+            </tr>
+          </tfoot>
+        </table></div>
+      </div>
+    `;
+  } catch(e) {
+    view.innerHTML = `<span style="color:var(--red)">Error: ${e.message}</span>`;
+  }
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+
+// ---- Boot ----
+loadAll().catch(e => console.error('Init error:', e));
+</script>
+</body>
+</html>

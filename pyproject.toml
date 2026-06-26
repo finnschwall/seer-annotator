@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seer-annotator"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "litellm>=1.40",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "rich>=13",
+    "tomli>=2.0; python_version < '3.11'",
+    "click>=8.1",
+    "json-repair>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "httpx",
+]
+
+[project.scripts]
+seer-annotate = "seer_annotator.cli:cli"
+seer-ui = "seer_annotator.ui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
