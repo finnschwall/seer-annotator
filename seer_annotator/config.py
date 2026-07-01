@@ -65,6 +65,7 @@ class RunConfig(BaseModel):
     cache_first: Literal["text", "questions"] = "text"
     cache_ttl: Literal["5m", "1h"] = "1h"
     system_prompt: str | None = None
+    chunk_papers: int = 10
     batch_p1: bool = False
     batch_p2: bool = False
     fail_fast: bool = False
@@ -142,6 +143,7 @@ class RunDefaults(BaseModel):
     cache_first: Literal["text", "questions"] | None = None
     cache_ttl: Literal["5m", "1h"] | None = None
     system_prompt: str | None = None
+    chunk_papers: int | None = None
     batch_p1: bool | None = None
     batch_p2: bool | None = None
     fail_fast: bool | None = None

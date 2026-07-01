@@ -23,3 +23,7 @@ jupyter/
 working_dir/
 .vscode/
 .pytest_cache/
+*.toml/
+working_dir_old/
+working_dir/
+.seer_state.db

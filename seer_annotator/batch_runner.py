@@ -14,7 +14,7 @@ import json
 import logging
 import time
 from decimal import Decimal
-from typing import Protocol, runtime_checkable
+from typing import Callable, Protocol, runtime_checkable
 
 from rich.console import Console
 from rich.progress import (
@@ -390,245 +390,307 @@ def _load_p1_dump(dump_dir: str, run_id: int) -> "dict | None":
     return None
 
 
-async def run_batch_pipeline(
-    pipeline,
+async def _execute_pass1_with_groups(
+    run,
+    cfg,
+    papers,
+    source_texts: dict,
+    pending_cells: dict,
+    store,
     settings,
+    dry_run: bool,
+    groups_def,
     *,
-    store=None,
-    client=None,
-    dry_run: bool = False,
-    run_ids: list[int] | None = None,
-    paper_ids: list[int] | None = None,
-) -> None:
-    from .config import ProviderSettings, RunConfig, effective_run_config
-    from .seer_client import SeerClient, DryRunSeerClient
-    from .store import Store
-    from .batching import resolve_groups
+    sem: "asyncio.Semaphore | None" = None,
+    limiter=None,
+    on_cell_done: "Callable[[], None] | None" = None,
+    on_total_known: "Callable[[int], None] | None" = None,
+) -> "tuple[dict, dict, str | None]":
+    """Internal implementation of _execute_pass1 that also receives groups_def."""
+    from .config import ProviderSettings
     from .caching import apply_cache
-    from .annotate.prompt import build_messages, build_format_messages
-    from .annotate.parse import ExtractionError, parse_structured_output
-    from .annotate.verify import verify_citation
-    from .mapping import build_llm_answer, build_error_answer
+    from .annotate.prompt import build_messages
     from .llm import complete as llm_complete, dummy_complete
 
-    pipeline_cfg = effective_run_config(RunConfig(), settings.run_defaults)
-
-    import litellm as _litellm
-    _litellm.drop_params = pipeline_cfg.drop_params
-
-    store = store or Store(settings.runtime.store_path)
-    client = client or (
-        DryRunSeerClient(pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions)
-        if dry_run
-        else SeerClient(pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions)
-    )
-
     _base_complete = dummy_complete if dry_run else llm_complete
-    runs = [r for r in pipeline.runs if (run_ids is None or r.run_id in run_ids)]
-    papers = [p for p in pipeline.papers if (paper_ids is None or p.paper_id in paper_ids)]
 
-    for run in runs:
-        cfg = effective_run_config(run.config, settings.run_defaults)
-        batch_p1 = cfg.batch_p1
-        batch_p2 = cfg.batch_p2
-        prov_settings = settings.providers.get(run.model_provider, ProviderSettings())
-        p1_api_key = prov_settings.resolved_api_key()
-        p1_base_url = prov_settings.base_url
+    prov_settings = settings.providers.get(run.model_provider, ProviderSettings())
+    p1_api_key = prov_settings.resolved_api_key()
+    p1_base_url = prov_settings.base_url
 
-        effective_fmt_provider = cfg.format_model_provider or run.model_provider
-        effective_fmt_model = cfg.format_model or "gpt-4o-mini"
-        fmt_prov_settings = settings.providers.get(effective_fmt_provider, ProviderSettings())
-        p2_api_key = fmt_prov_settings.resolved_api_key()
-        p2_base_url = fmt_prov_settings.base_url
+    effective_system = cfg.system_prompt
+    batch_p1 = cfg.batch_p1
 
-        # Validate that batch providers are supported before starting
-        if batch_p1 and not dry_run:
-            make_provider(run.model_provider, p1_api_key, p1_base_url)  # raises on unsupported
-        if batch_p2 and not dry_run:
-            make_provider(effective_fmt_provider, p2_api_key, p2_base_url)
+    # Build pending_cells in-place (unified path — replaces the duplicate blocks
+    # that previously existed in the batch_p1 and online branches).
+    pending_cells.clear()
+    for paper in papers:
+        if paper.paper_id not in source_texts:
+            continue
+        for group_idx, group in enumerate(groups_def):
+            cells = [(run.run_id, paper.paper_id, q.version_id) for q in group]
+            if all(store.should_skip_cell(*c) for c in cells):
+                continue
+            cid = f"{run.run_id}-{paper.paper_id}-{group_idx}"
+            pending_cells[cid] = (paper, group, group_idx)
 
-        groups_def = resolve_groups(cfg, pipeline.questions)
+    if on_total_known is not None:
+        on_total_known(len(pending_cells))
 
-        # ---- Collect source texts ----
-        source_texts: dict[int, str] = {}
-        for paper in papers:
-            if cfg.text_source == "full_text":
-                source = store.get_ocr(paper.paper_id)
-                if source is None:
-                    source = await client.fetch_ocr_markdown(paper.paper_id)
-                    store.save_ocr(paper.paper_id, source)
-                if source is None:
-                    logger.warning("No OCR for paper %d — posting error for all questions", paper.paper_id)
-                    for q in pipeline.questions:
-                        store.save_answer(
-                            run.run_id, paper.paper_id, q.version_id,
-                            build_error_answer(run_id=run.run_id, paper_id=paper.paper_id, question=q, extraction_detail="no_ocr"),
-                        )
-                    continue
-                source_texts[paper.paper_id] = source
+    if batch_p1 and not dry_run:
+        # Try loading a saved P1 dump (crash-safe resume without re-billing)
+        p1_texts: dict[str, str] = _load_p1_dump(settings.runtime.p1_dump_dir, run.run_id) or {}
+        p1_usage: dict[str, dict] = {}  # {cid: usage_stats} — empty when loaded from dump
+
+        if not p1_texts:
+            if not pending_cells:
+                logger.info("Run %d: no pending P1 work", run.run_id)
             else:
-                source_texts[paper.paper_id] = paper.abstract
+                p1_requests = []
+                for cid, (paper, group, _) in pending_cells.items():
+                    source = source_texts[paper.paper_id]
+                    messages = build_messages(
+                        source,
+                        group,
+                        text_source=cfg.text_source,
+                        system_prompt=effective_system,
+                        cache_first=cfg.cache_first,
+                    )
+                    messages = apply_cache(run.model_provider, messages, cfg.cache, ttl=cfg.cache_ttl)
+                    p1_requests.append(build_p1_request(
+                        custom_id=cid,
+                        provider=run.model_provider,
+                        model=run.model_name,
+                        messages=messages,
+                        temperature=cfg.temperature,
+                        model_params=cfg.model_params,
+                    ))
 
-        effective_system = cfg.system_prompt
+                provider = make_provider(run.model_provider, p1_api_key, p1_base_url)
 
-        # ---- Phase 1 ----
-        # p1_texts: {custom_id: text}
-        if batch_p1 and not dry_run:
-            # Build the full pending_cells map first (needed regardless of dump)
-            pending_cells: dict[str, tuple] = {}
-            for paper in papers:
-                if paper.paper_id not in source_texts:
-                    continue
-                source = source_texts[paper.paper_id]
-                for group_idx, group in enumerate(groups_def):
-                    cells = [(run.run_id, paper.paper_id, q.version_id) for q in group]
-                    if all(store.should_skip_cell(*c) for c in cells):
-                        continue
-                    cid = f"{run.run_id}-{paper.paper_id}-{group_idx}"
-                    pending_cells[cid] = (paper, group, group_idx)
-
-            # Try loading a saved P1 dump (crash-safe resume without re-billing)
-            p1_texts: dict[str, str] = _load_p1_dump(settings.runtime.p1_dump_dir, run.run_id) or {}
-            p1_usage: dict[str, dict] = {}  # {cid: usage_stats} — empty when loaded from dump
-
-            if not p1_texts:
-                if not pending_cells:
-                    logger.info("Run %d: no pending P1 work", run.run_id)
+                # Cache pre-warm: submit the first request alone so it writes
+                # the shared prefix to the 1h cache before the main batch starts.
+                # All subsequent requests then hit the warm cache instead of racing
+                # to write it in parallel (which caused ~48 writes vs 1 in testing).
+                # Only worthwhile when caching is enabled and there are multiple requests.
+                use_prewarm = cfg.cache and len(p1_requests) > 1
+                if use_prewarm:
+                    logger.info(
+                        "Run %d: submitting prewarm request to warm 1h cache before main batch",
+                        run.run_id,
+                    )
+                    prewarm_texts, prewarm_usage = await submit_and_poll(
+                        provider, p1_requests[:1], store, f"{run.run_id}:p1_prewarm",
+                        label="Cache warm-up",
+                    )
+                    main_texts, main_usage = await submit_and_poll(
+                        provider, p1_requests[1:], store, f"{run.run_id}:p1",
+                        label="Batch P1",
+                    )
+                    p1_texts = {**prewarm_texts, **main_texts}
+                    p1_usage = {**prewarm_usage, **main_usage}
                 else:
-                    p1_requests = []
-                    for cid, (paper, group, _) in pending_cells.items():
-                        source = source_texts[paper.paper_id]
-                        messages = build_messages(
-                            source,
-                            group,
-                            text_source=cfg.text_source,
-                            system_prompt=effective_system,
-                            cache_first=cfg.cache_first,
-                        )
-                        messages = apply_cache(run.model_provider, messages, cfg.cache, ttl=cfg.cache_ttl)
-                        p1_requests.append(build_p1_request(
-                            custom_id=cid,
-                            provider=run.model_provider,
-                            model=run.model_name,
-                            messages=messages,
-                            temperature=cfg.temperature,
-                            model_params=cfg.model_params,
-                        ))
+                    p1_texts, p1_usage = await submit_and_poll(
+                        provider, p1_requests, store, f"{run.run_id}:p1",
+                        label="Batch P1",
+                    )
 
-                    provider = make_provider(run.model_provider, p1_api_key, p1_base_url)
+                _save_p1_dump(settings.runtime.p1_dump_dir, run.run_id, p1_texts)
+    else:
+        # P1 online: gather all papers concurrently
+        p1_texts = {}
+        p1_usage = {}
+        p1_tasks = []
 
-                    # Cache pre-warm: submit the first request alone so it writes
-                    # the shared prefix to the 1h cache before the main batch starts.
-                    # All subsequent requests then hit the warm cache instead of racing
-                    # to write it in parallel (which caused ~48 writes vs 1 in testing).
-                    # Only worthwhile when caching is enabled and there are multiple requests.
-                    use_prewarm = cfg.cache and len(p1_requests) > 1
-                    if use_prewarm:
-                        logger.info(
-                            "Run %d: submitting prewarm request to warm 1h cache before main batch",
-                            run.run_id,
-                        )
-                        prewarm_texts, prewarm_usage = await submit_and_poll(
-                            provider, p1_requests[:1], store, f"{run.run_id}:p1_prewarm",
-                            label="Cache warm-up",
-                        )
-                        main_texts, main_usage = await submit_and_poll(
-                            provider, p1_requests[1:], store, f"{run.run_id}:p1",
-                            label="Batch P1",
-                        )
-                        p1_texts = {**prewarm_texts, **main_texts}
-                        p1_usage = {**prewarm_usage, **main_usage}
+        for cid, (paper, group, group_idx) in pending_cells.items():
+            source = source_texts[paper.paper_id]
+
+            async def _run_p1(cid=cid, paper=paper, group=group, source=source):
+                try:
+                    messages = build_messages(
+                        source,
+                        group,
+                        text_source=cfg.text_source,
+                        system_prompt=effective_system,
+                        cache_first=cfg.cache_first,
+                    )
+                    messages = apply_cache(run.model_provider, messages, cfg.cache, ttl=cfg.cache_ttl)
+                    p1_kwargs: dict = {"temperature": cfg.temperature}
+                    if cfg.reasoning_effort:
+                        p1_kwargs["reasoning_effort"] = cfg.reasoning_effort
+                    p1_kwargs.update(cfg.model_params)
+                    if p1_api_key:
+                        p1_kwargs["api_key"] = p1_api_key
+                    if p1_base_url:
+                        p1_kwargs["api_base"] = p1_base_url
+                    if limiter is not None:
+                        await limiter.acquire(run.model_provider)
+                    if sem is not None:
+                        async with sem:
+                            result = await _base_complete(
+                                run.model_name, run.model_provider, messages, **p1_kwargs
+                            )
                     else:
-                        p1_texts, p1_usage = await submit_and_poll(
-                            provider, p1_requests, store, f"{run.run_id}:p1",
-                            label="Batch P1",
-                        )
-
-                    _save_p1_dump(settings.runtime.p1_dump_dir, run.run_id, p1_texts)
-        else:
-            # P1 online: gather all papers concurrently
-            p1_texts = {}
-            p1_usage = {}
-            pending_cells = {}
-            p1_tasks = []
-
-            for paper in papers:
-                if paper.paper_id not in source_texts:
-                    continue
-                source = source_texts[paper.paper_id]
-                for group_idx, group in enumerate(groups_def):
-                    cells = [(run.run_id, paper.paper_id, q.version_id) for q in group]
-                    if all(store.should_skip_cell(*c) for c in cells):
-                        continue
-                    cid = f"{run.run_id}-{paper.paper_id}-{group_idx}"
-                    pending_cells[cid] = (paper, group, group_idx)
-
-                    async def _run_p1(cid=cid, paper=paper, group=group, source=source):
-                        messages = build_messages(
-                            source,
-                            group,
-                            text_source=cfg.text_source,
-                            system_prompt=effective_system,
-                            cache_first=cfg.cache_first,
-                        )
-                        messages = apply_cache(run.model_provider, messages, cfg.cache, ttl=cfg.cache_ttl)
-                        p1_kwargs: dict = {"temperature": cfg.temperature}
-                        if cfg.reasoning_effort:
-                            p1_kwargs["reasoning_effort"] = cfg.reasoning_effort
-                        p1_kwargs.update(cfg.model_params)
-                        if p1_api_key:
-                            p1_kwargs["api_key"] = p1_api_key
-                        if p1_base_url:
-                            p1_kwargs["api_base"] = p1_base_url
                         result = await _base_complete(
                             run.model_name, run.model_provider, messages, **p1_kwargs
                         )
-                        return cid, result.text
+                    usage = {
+                        "input_tokens": result.usage.input_tokens,
+                        "output_tokens": result.usage.output_tokens,
+                        "cache_read_tokens": result.usage.cached_tokens,
+                        "cost": result.cost,
+                        "latency_ms": result.latency_ms,
+                    }
+                    return cid, result.text, usage
+                finally:
+                    if on_cell_done is not None:
+                        on_cell_done()
 
-                    p1_tasks.append(_run_p1())
+            p1_tasks.append(_run_p1())
 
+        # Probe with the first call alone — if it fails immediately, abort before
+        # launching hundreds of identical failing requests.
+        if p1_tasks:
+            try:
+                first = await p1_tasks[0]
+            except Exception as exc:
+                logger.error("P1 online error on first call — aborting: %s: %s", type(exc).__name__, exc)
+                for coro in p1_tasks[1:]:
+                    coro.close()
+                return {}, {}, f"{type(exc).__name__}: {exc}"
+            cid, text, usage = first
+            p1_texts[cid] = text
+            p1_usage[cid] = usage
+            p1_tasks = p1_tasks[1:]
+
+        if p1_tasks:
             results_list = await asyncio.gather(*p1_tasks, return_exceptions=True)
             for item in results_list:
                 if isinstance(item, Exception):
-                    logger.error("P1 online error: %s", item)
-                    continue
-                cid, text = item
-                p1_texts[cid] = text
+                    logger.error("P1 online error: %s: %s", type(item).__name__, item)
+                else:
+                    cid, text, usage = item
+                    p1_texts[cid] = text
+                    p1_usage[cid] = usage
 
-        # ---- Phase 2 ----
-        # Only process entries that are still pending (dump may contain already-completed cells)
-        pending_p1 = {cid: text for cid, text in p1_texts.items() if cid in pending_cells}
+    return p1_texts, p1_usage, None
 
-        from .annotate.engine import _RESPONSE_FORMAT
-        p2_response_format = _RESPONSE_FORMAT if cfg.format_structured_output else None
 
-        if batch_p2 and not dry_run:
-            p2_requests = []
-            for cid, p1_text in pending_p1.items():
-                paper, group, group_idx = pending_cells[cid]
-                p2_messages = build_format_messages(p1_text, group)
-                p2_requests.append(build_p2_request(
-                    custom_id=cid,
-                    provider=effective_fmt_provider,
-                    model=effective_fmt_model,
-                    messages=p2_messages,
-                    model_params=cfg.format_model_params,
-                    response_format=p2_response_format,
-                ))
+async def _execute_pass1(
+    run,
+    cfg,
+    papers,
+    source_texts: dict,
+    pending_cells: dict,
+    store,
+    settings,
+    dry_run: bool,
+    *,
+    groups_def,
+    sem: "asyncio.Semaphore | None" = None,
+    limiter=None,
+    on_cell_done: "Callable[[], None] | None" = None,
+    on_total_known: "Callable[[int], None] | None" = None,
+) -> "tuple[dict, dict, str | None]":
+    """Run the Pass-1 phase. Returns ({custom_id: p1_text}, {custom_id: usage_stats}, error_or_None).
 
-            if p2_requests:
-                p2_provider = make_provider(effective_fmt_provider, p2_api_key, p2_base_url)
-                p2_texts, _ = await submit_and_poll(
-                    p2_provider, p2_requests, store, f"{run.run_id}:p2",
-                    label="Batch P2",
-                )
-            else:
-                p2_texts = {}
+    ``pending_cells`` is mutated in-place: cleared then re-populated with
+    ``{cid: (paper, group, group_idx)}`` for every cell that still needs work.
+    Both batch and online sub-modes share this single build path; the caller sees
+    the same map regardless of which sub-mode ran.
+
+    ``groups_def`` (keyword-only) is the pre-resolved list of question groups for
+    this run, obtained via ``resolve_groups(cfg, pipeline.questions)``.  Callers
+    resolve it before passing it here.
+
+    ``sem`` and ``limiter`` are optional concurrency/rate-limit guards applied to
+    the online path only.  When both are None, behavior is unchanged.
+
+    ``on_total_known`` is called once after pending_cells is built, with the total count.
+    ``on_cell_done`` is called after each cell completes (success or failure).
+    """
+    return await _execute_pass1_with_groups(
+        run, cfg, papers, source_texts, pending_cells, store, settings, dry_run, groups_def,
+        sem=sem, limiter=limiter,
+        on_cell_done=on_cell_done, on_total_known=on_total_known,
+    )
+
+
+async def _execute_pass2(
+    run,
+    cfg,
+    pending_p1: dict,
+    pending_cells: dict,
+    store,
+    settings,
+    dry_run: bool,
+    *,
+    sem: "asyncio.Semaphore | None" = None,
+    limiter=None,
+    on_p2_start: "Callable[[int, str], None] | None" = None,
+    on_p2_advance: "Callable[[], None] | None" = None,
+) -> tuple[dict, dict]:
+    """Run the Pass-2 phase. Returns ({custom_id: p2_text}, {custom_id: usage_stats}).
+
+    ``usage_stats`` carries the format-model (Pass-2) usage with keys
+    ``input_tokens, output_tokens, cache_read_tokens, cost, latency_ms``.
+    In batch mode, the cost/latency keys may be absent (the batch API does not
+    expose them); callers must read via ``.get(...)`` with sensible defaults.
+    """
+    from .config import ProviderSettings
+    from .annotate.prompt import build_format_messages
+    from .annotate.engine import _RESPONSE_FORMAT
+    from .llm import complete as llm_complete, dummy_complete
+
+    _base_complete = dummy_complete if dry_run else llm_complete
+
+    effective_fmt_provider = cfg.format_model_provider or run.model_provider
+    effective_fmt_model = cfg.format_model or "gpt-4o-mini"
+    fmt_prov_settings = settings.providers.get(effective_fmt_provider, ProviderSettings())
+    p2_api_key = fmt_prov_settings.resolved_api_key()
+    p2_base_url = fmt_prov_settings.base_url
+
+    p2_response_format = _RESPONSE_FORMAT if cfg.format_structured_output else None
+    batch_p2 = cfg.batch_p2
+
+    if batch_p2 and not dry_run:
+        p2_requests = []
+        for cid, p1_text in pending_p1.items():
+            paper, group, group_idx = pending_cells[cid]
+            p2_messages = build_format_messages(p1_text, group)
+            p2_requests.append(build_p2_request(
+                custom_id=cid,
+                provider=effective_fmt_provider,
+                model=effective_fmt_model,
+                messages=p2_messages,
+                model_params=cfg.format_model_params,
+                response_format=p2_response_format,
+            ))
+
+        if p2_requests:
+            p2_provider = make_provider(effective_fmt_provider, p2_api_key, p2_base_url)
+            p2_texts, p2_usage = await submit_and_poll(
+                p2_provider, p2_requests, store, f"{run.run_id}:p2",
+                label="Batch P2",
+            )
         else:
-            # P2 online — run concurrently with a progress bar
             p2_texts = {}
-            if pending_p1:
-                with Progress(
+            p2_usage = {}
+    else:
+        # P2 online — run concurrently
+        p2_texts = {}
+        p2_usage = {}
+        if pending_p1:
+            p2_label = f"Pass 2 ({effective_fmt_model})"
+
+            # Use caller-supplied progress callbacks when available (avoids nested Live
+            # contexts which cause terminal flickering); fall back to a self-owned Progress.
+            if on_p2_start is not None:
+                on_p2_start(len(pending_p1), p2_label)
+                _advance_p2 = on_p2_advance or (lambda: None)
+                _own_progress: "Progress | None" = None
+            else:
+                _own_progress = Progress(
                     SpinnerColumn(),
                     TextColumn("[bold]{task.description}"),
                     BarColumn(),
@@ -636,128 +698,76 @@ async def run_batch_pipeline(
                     TextColumn("•"),
                     TimeElapsedColumn(),
                     console=_console,
-                ) as progress:
-                    p2_prog = progress.add_task(
-                        f"Pass 2 ({effective_fmt_model})", total=len(pending_p1)
-                    )
+                )
+                _own_progress.start()
+                _p2_prog = _own_progress.add_task(p2_label, total=len(pending_p1))
+                _advance_p2 = lambda: _own_progress.advance(_p2_prog)  # type: ignore[union-attr]
 
-                    async def _run_p2(cid: str, p1_text: str, paper, group, group_idx: int):
-                        p2_messages = build_format_messages(p1_text, group)
-                        p2_kwargs: dict = {"temperature": 0.0}
-                        p2_kwargs.update(cfg.format_model_params)
-                        if p2_api_key:
-                            p2_kwargs["api_key"] = p2_api_key
-                        if p2_base_url:
-                            p2_kwargs["api_base"] = p2_base_url
-                        if p2_response_format is not None:
-                            p2_kwargs["response_format"] = p2_response_format
+            try:
+                async def _run_p2(cid: str, p1_text: str, paper, group, group_idx: int):
+                    p2_messages = build_format_messages(p1_text, group)
+                    p2_kwargs: dict = {"temperature": 0.0}
+                    p2_kwargs.update(cfg.format_model_params)
+                    if p2_api_key:
+                        p2_kwargs["api_key"] = p2_api_key
+                    if p2_base_url:
+                        p2_kwargs["api_base"] = p2_base_url
+                    if p2_response_format is not None:
+                        p2_kwargs["response_format"] = p2_response_format
+                    if limiter is not None:
+                        await limiter.acquire(effective_fmt_provider)
+                    if sem is not None:
+                        async with sem:
+                            result = await _base_complete(
+                                effective_fmt_model, effective_fmt_provider, p2_messages, **p2_kwargs
+                            )
+                    else:
                         result = await _base_complete(
                             effective_fmt_model, effective_fmt_provider, p2_messages, **p2_kwargs
                         )
-                        progress.advance(p2_prog)
-                        return cid, result.text
+                    _advance_p2()
+                    usage = {
+                        "input_tokens": result.usage.input_tokens,
+                        "output_tokens": result.usage.output_tokens,
+                        "cache_read_tokens": result.usage.cached_tokens,
+                        "cost": result.cost,
+                        "latency_ms": result.latency_ms,
+                    }
+                    return cid, result.text, usage
 
-                    p2_tasks = [
-                        _run_p2(cid, p1_text, *pending_cells[cid])
-                        for cid, p1_text in pending_p1.items()
-                    ]
-                    p2_results = await asyncio.gather(*p2_tasks, return_exceptions=True)
+                p2_tasks = [
+                    _run_p2(cid, p1_text, *pending_cells[cid])
+                    for cid, p1_text in pending_p1.items()
+                ]
+                # Probe with the first call alone — abort if the first fails.
+                p2_results: list = []
+                if p2_tasks:
+                    try:
+                        p2_results.append(await p2_tasks[0])
+                    except Exception as exc:
+                        _console.print(
+                            f"[bold red]LLM call failed[/] — {type(exc).__name__}: {exc}\n"
+                            "[dim]Aborting remaining P2 calls.[/]"
+                        )
+                        logger.error("P2 online error on first call — aborting: %s: %s", type(exc).__name__, exc)
+                        for coro in p2_tasks[1:]:
+                            coro.close()
+                        return {}, {}
+                    if len(p2_tasks) > 1:
+                        p2_results.extend(
+                            await asyncio.gather(*p2_tasks[1:], return_exceptions=True)
+                        )
+            finally:
+                if _own_progress is not None:
+                    _own_progress.stop()
 
-                for item in p2_results:
-                    if isinstance(item, Exception):
-                        logger.error("P2 online error: %s", item)
-                        continue
-                    cid, text = item
+            for item in p2_results:
+                if isinstance(item, Exception):
+                    logger.error("P2 online error: %s: %s", type(item).__name__, item)
+                    _console.print(f"[yellow]P2 error (skipping cell):[/] {type(item).__name__}: {item}")
+                else:
+                    cid, text, usage = item
                     p2_texts[cid] = text
+                    p2_usage[cid] = usage
 
-        # ---- Parse, save, post ----
-        first_extraction_error: ExtractionError | None = None
-
-        for cid in p2_texts:
-            if cid not in pending_cells:
-                continue
-            paper, group, group_idx = pending_cells[cid]
-            p1_text = p1_texts.get(cid, "")
-            p2_text = p2_texts[cid]
-
-            u = p1_usage.get(cid, {})
-            tok_input  = u.get("input_tokens", 0)
-            tok_output = u.get("output_tokens", 0)
-            tok_cached = u.get("cache_read_tokens", 0)
-
-            parsed = parse_structured_output(p2_text, [q.key for q in group])
-
-            failed_keys = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
-            if failed_keys:
-                err = ExtractionError(failed_keys)
-                logger.error(
-                    "EXTRACTION FAILURE — run %d, paper %d, group %d: %s\n"
-                    "  Pass-2 output was:\n%s",
-                    run.run_id, paper.paper_id, group_idx, err,
-                    p2_text[:2000],
-                )
-                for q in group:
-                    store.save_answer(
-                        run.run_id, paper.paper_id, q.version_id,
-                        build_error_answer(run_id=run.run_id, paper_id=paper.paper_id, question=q, extraction_detail=str(err)),
-                    )
-                if cfg.fail_fast and first_extraction_error is None:
-                    first_extraction_error = err
-                continue
-
-            for i, (question, result) in enumerate(zip(group, parsed)):
-                verify = verify_citation(
-                    result.get("cited_text", ""),
-                    source_texts.get(paper.paper_id, ""),
-                    max_error_rate=cfg.citation_max_error_rate,
-                    max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
-                )
-                cited_text_verified = None if verify.get("note") == "no citation provided" else verify["ok"]
-                raw_response = {
-                    "pass1_text": p1_text,
-                    "pass2_text": p2_text,
-                    "parse_result": result,
-                    "verify": verify,
-                    "text_source": cfg.text_source,
-                    "batch_group_id": cid,
-                    "batch_mode": True,
-                    "p1_usage": u,
-                }
-                payload = build_llm_answer(
-                    run_id=run.run_id,
-                    paper_id=paper.paper_id,
-                    question=question,
-                    value=result.get("value"),
-                    comment=result.get("comment", ""),
-                    cited_text=result.get("cited_text", ""),
-                    cited_text_verified=cited_text_verified,
-                    raw_response=raw_response,
-                    latency_ms=0,
-                    tokens_total=tok_input + tok_output + tok_cached,
-                    tokens_input=tok_input,
-                    tokens_output=tok_output,
-                    tokens_cached=tok_cached,
-                    cost=None,
-                    cost_currency="USD",
-                    confidence=result.get("confidence"),
-                )
-                store.save_answer(run.run_id, paper.paper_id, question.version_id, payload, cid)
-
-        if first_extraction_error is not None and cfg.fail_fast:
-            raise first_extraction_error
-
-        # Post per-paper (includes no-OCR error records)
-        for paper in papers:
-            unposted = store.get_unposted(run.run_id, paper.paper_id)
-            if not unposted:
-                continue
-            try:
-                await client.post_answers_bulk(unposted)
-                if not dry_run:
-                    version_ids = [p["question_version"] for p in unposted]
-                    store.mark_posted(run.run_id, paper.paper_id, version_ids)
-                logger.info("Posted %d answers for paper %d", len(unposted), paper.paper_id)
-            except Exception as exc:
-                logger.error("Post failed for paper %d: %s", paper.paper_id, exc)
-
-        logger.info("Run %d batch pipeline complete", run.run_id)
+    return p2_texts, p2_usage

@@ -59,7 +59,6 @@ def pipeline():
 def settings(tmp_path):
     s = Settings()
     s.runtime.store_path = str(tmp_path / "test.db")
-    s.runtime.format_model = "gpt-4o-mini"
     return s
 
 

@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
 
-ANSWER_STATUSES = {"pending", "done", "posted", "failed", "skipped"}
+ANSWER_STATUSES = {"pending", "done", "posted", "failed", "skipped", "pass1_done"}
 
 
 def _now() -> str:
@@ -129,6 +129,29 @@ class Store:
                 ),
             )
 
+    def save_pass1(
+        self,
+        run_id: int,
+        paper_id: int,
+        version_id: int,
+        payload: dict,
+        batch_group_id: str | None = None,
+    ) -> None:
+        with self._tx() as con:
+            con.execute(
+                """INSERT OR REPLACE INTO answers
+                   (run_id, paper_id, version_id, status, payload_json, batch_group_id, updated_at)
+                   VALUES (?,?,?,'pass1_done',?,?,?)""",
+                (
+                    run_id,
+                    paper_id,
+                    version_id,
+                    json.dumps(payload),
+                    batch_group_id,
+                    _now(),
+                ),
+            )
+
     def mark_skipped(self, run_id: int, paper_id: int, version_id: int, reason: str = "") -> None:
         with self._tx() as con:
             con.execute(
@@ -239,6 +262,26 @@ class Store:
             rows = con.execute(
                 """SELECT run_id, paper_id, version_id, status, payload_json FROM answers
                    WHERE run_id=? AND paper_id=? AND status IN ('done', 'posted')
+                   AND payload_json IS NOT NULL""",
+                (run_id, paper_id),
+            ).fetchall()
+        return [
+            {
+                "run_id": row["run_id"],
+                "paper_id": row["paper_id"],
+                "version_id": row["version_id"],
+                "status": row["status"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in rows
+        ]
+
+    def get_pass1_rows(self, run_id: int, paper_id: int) -> list[dict]:
+        """Return pass1_done answer rows with parsed payloads, ready for Pass-2 processing."""
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT run_id, paper_id, version_id, status, payload_json FROM answers
+                   WHERE run_id=? AND paper_id=? AND status='pass1_done'
                    AND payload_json IS NOT NULL""",
                 (run_id, paper_id),
             ).fetchall()

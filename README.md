@@ -35,6 +35,59 @@ Resume after interruption: just re-run the same command. Already-done and posted
 
 ---
 
+## Running the two stages separately
+
+The `pass1` and `pass2` commands split the annotation into independent stages. This is useful when you want to run the expensive reasoning model and the cheap formatting model on different machines, at different times, or with different concurrency limits.
+
+```bash
+# Step 1 — reasoning model, GPU/high-memory machine, lower concurrency
+seer-annotate pass1 pipeline.json --concurrency 4
+
+# Step 2 — formatting model, any machine, massively parallel
+seer-annotate pass2 pipeline.json --concurrency 64
+```
+
+After `pass1`, cells have status `pass1_done` in the local store. No answers are posted yet.
+After `pass2`, cells become `done` and are automatically posted to SEER.
+
+To run Pass 2 without posting (post later with `repost`):
+
+```bash
+seer-annotate pass2 pipeline.json --concurrency 64 --no-post
+# ... inspect results ...
+seer-annotate repost pipeline.json
+```
+
+To switch the formatting model for Pass 2:
+
+```bash
+seer-annotate pass2 pipeline.json --format-model claude-3-5-haiku-20241022 --format-model-provider anthropic
+```
+
+### `run` with `--chunk-papers`
+
+`run` processes papers in chunks (default: 10 papers per chunk). For each chunk it completes all of Pass 1, then all of Pass 2, then posts, before moving to the next chunk. This balances early posting and fine crash recovery (small chunk) against batching efficiency (large chunk).
+
+```bash
+# Post results every 5 papers
+seer-annotate run pipeline.json --chunk-papers 5
+
+# Process all papers in one phase pair before posting (maximum batching)
+seer-annotate run pipeline.json --chunk-papers 0
+```
+
+### Concurrency and rate-limit overrides
+
+All three annotation commands accept `--concurrency` (max parallel LLM calls) and `--rpm` (max requests per minute per provider). These override the per-run config and `settings.toml` values for the duration of that invocation.
+
+```bash
+seer-annotate run pipeline.json --concurrency 16 --rpm 500
+seer-annotate pass1 pipeline.json --concurrency 4 --rpm 60
+seer-annotate pass2 pipeline.json --concurrency 64
+```
+
+---
+
 ## The two-pass pipeline
 
 Every `(paper × question)` cell is processed in two sequential LLM calls with separate models and separate concerns. Knowing which pass to look at cuts debugging time significantly.
@@ -225,6 +278,7 @@ These set default values for all per-run settings. Any field present here applie
 concurrency             = 8       # max parallel LLM calls
 per_provider_rpm        = null    # omit for unlimited
 drop_params             = false
+chunk_papers            = 10      # papers per chunk for 'run' (0 = all at once)
 
 # Citation verification
 citation_max_error_rate   = 0.05
@@ -255,6 +309,7 @@ batch_p2                = false
 | `concurrency` | `8` | Max parallel LLM calls across all papers and groups |
 | `per_provider_rpm` | `null` | Max requests-per-minute per provider; `null` = unlimited |
 | `drop_params` | `false` | LiteLLM: silently strip unsupported parameters instead of raising |
+| `chunk_papers` | `10` | Papers per chunk for `run` (0 = all papers in one chunk); overridable via `--chunk-papers` |
 | `citation_max_error_rate` | `0.05` | Fuzzy match tolerance for citation verification — see [Citation verification](#citation-verification) |
 | `citation_max_ellipsis_gap` | `600` | Max source-character gap between ellipsis parts — see [Citation verification](#citation-verification) |
 | `text_source` | `"full_text"` | Document source: `"full_text"` (OCR) or `"abstract"` |
@@ -354,12 +409,13 @@ State is kept in a SQLite database (default: `.seer_state.db`).
 | Status | Meaning |
 |---|---|
 | `pending` | Not yet computed |
+| `pass1_done` | Pass-1 reasoning text stored; awaiting Pass-2 formatting (written by `pass1`, not by `run`) |
 | `done` | Computed (including error answers), not yet posted to SEER |
 | `posted` | Posted to SEER successfully |
 | `failed` | Fatal error that prevented saving any answer (e.g. unrecoverable DB or posting failure) |
 | `skipped` | Intentionally skipped (e.g. paper filtered out); never posted to SEER |
 
-`posted` and `done` cells are never recomputed on resume.
+`posted`, `done`, and `pass1_done` cells are never recomputed by `pass1` on resume. `done` and `posted` cells are skipped by `run`.
 
 When the LLM pipeline itself fails for a question (no OCR, API error, parse failure), the answer is still saved as `done` and posted to SEER, but with `extraction_status` set to `"error"` (or `"invalid"` for type-validation failures) and an `extraction_detail` message explaining the cause. The `extraction_status` field has three values:
 
@@ -368,6 +424,18 @@ When the LLM pipeline itself fails for a question (no OCR, API error, parse fail
 | `ok` | Value extracted and validated successfully |
 | `invalid` | Value failed type validation (e.g. categorical value not in allowed options) |
 | `error` | Pipeline failed entirely (no OCR, API error, parse error) |
+
+---
+
+## Inspecting prompts
+
+To see the exact prompts that would be sent to the LLM — including batching, cache markers, and system prompt — without making any API calls:
+
+```bash
+seer-annotate preview-prompt pipeline.json --no-fetch --output prompt.txt
+```
+
+`--no-fetch` skips the SEER OCR call and uses stored cache only (a placeholder is shown if OCR is not yet cached). Without it, OCR is fetched from SEER as normal. Use `--runs` / `--papers` to narrow to one cell, and `--pass 1` or `--pass 2` to see only the pass you care about.
 
 ---
 

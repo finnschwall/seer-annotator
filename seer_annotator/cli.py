@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import PipelineConfig, Settings
+from .orchestrator import pass1_pipeline, pass2_pipeline
 from .store import Store
 
 console = Console()
@@ -36,12 +37,18 @@ def cli(verbose: bool) -> None:
 @click.option("--runs", default=None, help="Comma-separated run IDs to process")
 @click.option("--papers", default=None, help="Comma-separated paper IDs to process")
 @click.option("--dry-run", is_flag=True)
+@click.option("--chunk-papers", default=None, type=int, help="Override chunk_papers for all runs")
+@click.option("--concurrency", default=None, type=int, help="Override max concurrency")
+@click.option("--rpm", default=None, type=float, help="Override requests-per-minute limit")
 def run(
     pipeline_json: str,
     settings_path: str | None,
     runs: str | None,
     papers: str | None,
     dry_run: bool,
+    chunk_papers: int | None,
+    concurrency: int | None,
+    rpm: float | None,
 ) -> None:
     """Execute annotation for PIPELINE_JSON."""
     from .orchestrator import run_pipeline
@@ -53,6 +60,10 @@ def run(
 
     run_ids = [int(x) for x in runs.split(",")] if runs else None
     paper_ids = [int(x) for x in papers.split(",")] if papers else None
+
+    if chunk_papers is not None:
+        for r in pipeline.runs:
+            r.config.chunk_papers = chunk_papers
 
     log_path = pathlib.Path("seer-annotate.log")
     root = logging.getLogger()
@@ -73,6 +84,8 @@ def run(
                 dry_run=dry_run,
                 run_ids=run_ids,
                 paper_ids=paper_ids,
+                concurrency=concurrency,
+                rpm=rpm,
             )
         )
     except Exception as exc:
@@ -241,6 +254,289 @@ def reformat(
         console.print(f"[green]Reformat done: {n_done} answers updated.[/]")
     if n_done and not dry_run:
         console.print("[dim]Run 'seer-annotate repost' to push the updated answers to SEER.[/]")
+
+
+@cli.command()
+@click.argument("pipeline_json", type=click.Path(exists=True))
+@click.option("--settings", "settings_path", default=None)
+@click.option("--runs", default=None, help="Comma-separated run IDs to process")
+@click.option("--papers", default=None, help="Comma-separated paper IDs to process")
+@click.option("--dry-run", is_flag=True)
+@click.option("--concurrency", default=None, type=int, help="Override max concurrency")
+@click.option("--rpm", default=None, type=float, help="Override requests-per-minute limit")
+def pass1(
+    pipeline_json: str,
+    settings_path: str | None,
+    runs: str | None,
+    papers: str | None,
+    dry_run: bool,
+    concurrency: int | None,
+    rpm: float | None,
+) -> None:
+    """Run only Pass-1 (reasoning) and store results as pass1_done for a later pass2.
+
+    Executes the expensive reasoning model for each pending cell and persists the
+    raw reasoning text with status 'pass1_done'. No answers are posted to SEER.
+    Run 'seer-annotate pass2' afterwards to format and post results.
+    """
+    with open(pipeline_json) as f:
+        pipeline = PipelineConfig.model_validate(json.load(f))
+
+    settings = Settings.load(settings_path)
+
+    run_ids = [int(x) for x in runs.split(",")] if runs else None
+    paper_ids = [int(x) for x in papers.split(",")] if papers else None
+
+    if dry_run:
+        console.print("[yellow]Dry-run mode — LLM calls use dummy provider[/]")
+
+    try:
+        n_done, n_failed = asyncio.run(
+            pass1_pipeline(
+                pipeline,
+                settings,
+                dry_run=dry_run,
+                run_ids=run_ids,
+                paper_ids=paper_ids,
+                concurrency=concurrency,
+                rpm=rpm,
+            )
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Pass 1 failed")
+        console.print(f"\n[bold red]Error:[/] {exc}")
+        sys.exit(1)
+
+    if n_failed:
+        console.print(f"[yellow]Pass 1 complete: {n_done} cells, {n_failed} failed (see logs)[/]")
+    else:
+        console.print(f"[green]Pass 1 complete: {n_done} cells, {n_failed} failed.[/]")
+
+
+@cli.command()
+@click.argument("pipeline_json", type=click.Path(exists=True))
+@click.option("--format-model", default=None, help="Override the format model (e.g. gpt-4o-mini)")
+@click.option("--format-model-provider", default=None, help="Override the format model provider")
+@click.option("--settings", "settings_path", default=None)
+@click.option("--runs", default=None, help="Comma-separated run IDs to process")
+@click.option("--papers", default=None, help="Comma-separated paper IDs to process")
+@click.option("--dry-run", is_flag=True)
+@click.option("--concurrency", default=None, type=int, help="Override max concurrency")
+@click.option("--rpm", default=None, type=float, help="Override requests-per-minute limit")
+@click.option("--no-post", is_flag=True, help="Skip posting answers to SEER (leave as 'done')")
+def pass2(
+    pipeline_json: str,
+    format_model: str | None,
+    format_model_provider: str | None,
+    settings_path: str | None,
+    runs: str | None,
+    papers: str | None,
+    dry_run: bool,
+    concurrency: int | None,
+    rpm: float | None,
+    no_post: bool,
+) -> None:
+    """Pick up pass1_done cells, run Pass-2 (formatting), and post answers to SEER.
+
+    Reads cells with status 'pass1_done' (written by 'seer-annotate pass1'), runs the
+    cheap format model to produce typed JSON answers, and posts them to SEER unless
+    --no-post is given. Use --no-post followed by 'seer-annotate repost' to post later.
+    """
+    with open(pipeline_json) as f:
+        pipeline = PipelineConfig.model_validate(json.load(f))
+
+    settings = Settings.load(settings_path)
+
+    run_ids = [int(x) for x in runs.split(",")] if runs else None
+    paper_ids = [int(x) for x in papers.split(",")] if papers else None
+
+    if dry_run:
+        console.print("[yellow]Dry-run mode — LLM calls use dummy provider[/]")
+
+    effective_model = format_model or settings.run_defaults.format_model
+    console.print(f"[dim]Format model: {effective_model}[/]")
+
+    try:
+        n_done, n_failed = asyncio.run(
+            pass2_pipeline(
+                pipeline,
+                settings,
+                format_model=format_model,
+                format_model_provider=format_model_provider,
+                dry_run=dry_run,
+                run_ids=run_ids,
+                paper_ids=paper_ids,
+                concurrency=concurrency,
+                rpm=rpm,
+                post=not no_post,
+            )
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Pass 2 failed")
+        console.print(f"\n[bold red]Error:[/] {exc}")
+        sys.exit(1)
+
+    if n_failed:
+        console.print(f"[yellow]Pass 2 complete: {n_done} cells, {n_failed} failed (see logs)[/]")
+    else:
+        console.print(f"[green]Pass 2 complete: {n_done} cells, {n_failed} failed.[/]")
+    if n_done and not dry_run and no_post:
+        console.print("[dim]Run 'seer-annotate repost' to push the answers to SEER.[/]")
+
+
+@cli.command(name="preview-prompt")
+@click.argument("pipeline_json", type=click.Path(exists=True))
+@click.option("--settings", "settings_path", default=None)
+@click.option("--runs", default=None, help="Comma-separated run IDs to include")
+@click.option("--papers", default=None, help="Comma-separated paper IDs to include")
+@click.option(
+    "--pass", "which_pass",
+    default="both",
+    type=click.Choice(["1", "2", "both"]),
+    help="Which pass to show (default: both)",
+)
+@click.option("--output", "output_path", default=None, help="Write to file instead of stdout")
+@click.option(
+    "--no-fetch",
+    is_flag=True,
+    help="Do not fetch OCR from SEER; use store cache only (placeholder text if not cached)",
+)
+def preview_prompt(
+    pipeline_json: str,
+    settings_path: str | None,
+    runs: str | None,
+    papers: str | None,
+    which_pass: str,
+    output_path: str | None,
+    no_fetch: bool,
+) -> None:
+    """Show the exact LLM prompt(s) for each (run, paper, question-group) cell.
+
+    Reflects the real batching, caching markers, system prompt, and pass-2 format
+    instructions. Pass-2 is shown with a placeholder for the pass-1 output since no
+    actual inference is done.
+
+    OCR text is read from the local store cache. Use --no-fetch to suppress the
+    SEER network call when OCR is not yet cached (a placeholder is used instead).
+    """
+    with open(pipeline_json) as f:
+        pipeline = PipelineConfig.model_validate(json.load(f))
+
+    settings = Settings.load(settings_path)
+
+    run_ids = {int(x) for x in runs.split(",")} if runs else None
+    paper_ids = {int(x) for x in papers.split(",")} if papers else None
+
+    runs_to_process = [r for r in pipeline.runs if run_ids is None or r.run_id in run_ids]
+    papers_to_process = [p for p in pipeline.papers if paper_ids is None or p.paper_id in paper_ids]
+
+    if not runs_to_process:
+        console.print("[yellow]No matching runs.[/]")
+        return
+    if not papers_to_process:
+        console.print("[yellow]No matching papers.[/]")
+        return
+
+    from .annotate.prompt import build_messages, build_format_messages
+    from .batching import resolve_groups
+    from .caching import apply_cache
+    from .config import effective_run_config
+    from .store import Store
+    from .seer_client import SeerClient
+
+    store = Store(settings.runtime.store_path)
+
+    async def _fetch_ocr(paper_id: int) -> str | None:
+        cached = store.get_ocr(paper_id)
+        if cached is not None:
+            return cached
+        if no_fetch:
+            return None
+        client = SeerClient(pipeline.api_base, pipeline.api_token)
+        text = await client.fetch_ocr_markdown(paper_id)
+        if text is not None:
+            store.save_ocr(paper_id, text)
+        return text
+
+    lines: list[str] = []
+
+    async def _build() -> None:
+        for exp_run in runs_to_process:
+            cfg = effective_run_config(exp_run.config, settings.run_defaults)
+            groups = resolve_groups(cfg, pipeline.questions)
+
+            for paper in papers_to_process:
+                ocr_text = await _fetch_ocr(paper.paper_id)
+                if ocr_text is None:
+                    ocr_text = "[OCR TEXT NOT AVAILABLE — run the pipeline first or remove --no-fetch]"
+
+                source_text = paper.abstract if cfg.text_source == "abstract" else ocr_text
+
+                for group_idx, question_group in enumerate(groups):
+                    keys = ", ".join(q.key for q in question_group)
+                    header = (
+                        f"{'=' * 80}\n"
+                        f"RUN:    {exp_run.name}  (id={exp_run.run_id})\n"
+                        f"MODEL:  {exp_run.model_provider}/{exp_run.model_name}\n"
+                        f"PAPER:  {paper.title}  (id={paper.paper_id})\n"
+                        f"GROUP:  {group_idx + 1}/{len(groups)}  keys=[{keys}]\n"
+                        f"CACHE:  {'on' if cfg.cache else 'off'}"
+                        f"  batching={cfg.batching}  text_source={cfg.text_source}\n"
+                        f"{'=' * 80}"
+                    )
+                    lines.append(header)
+
+                    if which_pass in ("1", "both"):
+                        msgs = build_messages(
+                            source_text,
+                            question_group,
+                            text_source=cfg.text_source,
+                            system_prompt=cfg.system_prompt,
+                            cache_first=cfg.cache_first,
+                        )
+                        msgs = apply_cache(
+                            exp_run.model_provider,
+                            msgs,
+                            enabled=cfg.cache,
+                            ttl=cfg.cache_ttl,
+                        )
+                        lines.append("\n--- PASS 1 ---\n")
+                        for msg in msgs:
+                            role = msg["role"].upper()
+                            content = msg["content"]
+                            if isinstance(content, list):
+                                # cache-annotated content blocks
+                                text_parts = []
+                                for block in content:
+                                    if isinstance(block, dict):
+                                        text_parts.append(block.get("text", repr(block)))
+                                    else:
+                                        text_parts.append(str(block))
+                                content_str = "".join(text_parts)
+                            else:
+                                content_str = content
+                            lines.append(f"[{role}]\n{content_str}\n")
+
+                    if which_pass in ("2", "both"):
+                        placeholder = (
+                            "[PASS-1 OUTPUT WOULD GO HERE — "
+                            "this is the reasoning text that pass-2 reformats into JSON]"
+                        )
+                        fmt_msgs = build_format_messages(placeholder, question_group)
+                        lines.append("\n--- PASS 2 ---\n")
+                        for msg in fmt_msgs:
+                            role = msg["role"].upper()
+                            lines.append(f"[{role}]\n{msg['content']}\n")
+
+    asyncio.run(_build())
+
+    output = "\n".join(lines)
+
+    if output_path:
+        pathlib.Path(output_path).write_text(output, encoding="utf-8")
+        console.print(f"[green]Wrote {len(lines)} sections to {output_path}[/]")
+    else:
+        click.echo(output)
 
 
 @cli.command(name="ui")
