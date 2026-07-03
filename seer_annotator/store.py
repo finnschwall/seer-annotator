@@ -64,6 +64,19 @@ class Store:
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS resolutions (
+                    arbiter_run_id  INTEGER NOT NULL,
+                    dispute_item_id INTEGER NOT NULL,
+                    paper_id        INTEGER NOT NULL,
+                    version_id      INTEGER NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'pending',
+                    payload_json    TEXT,
+                    batch_group_id  TEXT,
+                    error           TEXT,
+                    updated_at      TEXT NOT NULL,
+                    PRIMARY KEY (arbiter_run_id, dispute_item_id)
+                );
             """)
 
     # ------------------------------------------------------------------
@@ -202,6 +215,266 @@ class Store:
         """Return True if this cell is already done/posted and should not be recomputed."""
         status = self.get_status(run_id, paper_id, version_id)
         return status in ("done", "posted")
+
+    def reset_runs(self, run_ids: list[int]) -> None:
+        """Delete all cached answer rows for these run ids, forcing a fresh re-annotation on
+        the next run without disturbing other runs' cached state in a shared store."""
+        if not run_ids:
+            return
+        with self._tx() as con:
+            placeholders = ",".join("?" * len(run_ids))
+            con.execute(f"DELETE FROM answers WHERE run_id IN ({placeholders})", run_ids)
+
+    # ------------------------------------------------------------------
+    # Resolution state (arbitration) — mirrors the answers-table methods above,
+    # keyed by (arbiter_run_id, dispute_item_id) instead of (run_id, version_id).
+    # ------------------------------------------------------------------
+
+    def get_resolution_status(self, arbiter_run_id: int, dispute_item_id: int) -> str | None:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT status FROM resolutions WHERE arbiter_run_id=? AND dispute_item_id=?",
+                (arbiter_run_id, dispute_item_id),
+            ).fetchone()
+        return row["status"] if row else None
+
+    def upsert_pending_resolution(
+        self, arbiter_run_id: int, dispute_item_id: int, paper_id: int, version_id: int
+    ) -> None:
+        """Insert as pending only if no row exists yet."""
+        with self._tx() as con:
+            con.execute(
+                """INSERT OR IGNORE INTO resolutions
+                   (arbiter_run_id, dispute_item_id, paper_id, version_id, status, updated_at)
+                   VALUES (?,?,?,?,'pending',?)""",
+                (arbiter_run_id, dispute_item_id, paper_id, version_id, _now()),
+            )
+
+    def save_resolution(
+        self,
+        arbiter_run_id: int,
+        dispute_item_id: int,
+        paper_id: int,
+        version_id: int,
+        payload: dict,
+        batch_group_id: str | None = None,
+    ) -> None:
+        with self._tx() as con:
+            con.execute(
+                """INSERT OR REPLACE INTO resolutions
+                   (arbiter_run_id, dispute_item_id, paper_id, version_id, status, payload_json, batch_group_id, updated_at)
+                   VALUES (?,?,?,?,'done',?,?,?)""",
+                (
+                    arbiter_run_id,
+                    dispute_item_id,
+                    paper_id,
+                    version_id,
+                    json.dumps(payload),
+                    batch_group_id,
+                    _now(),
+                ),
+            )
+
+    def save_pass1_resolution(
+        self,
+        arbiter_run_id: int,
+        dispute_item_id: int,
+        paper_id: int,
+        version_id: int,
+        payload: dict,
+        batch_group_id: str | None = None,
+    ) -> None:
+        with self._tx() as con:
+            con.execute(
+                """INSERT OR REPLACE INTO resolutions
+                   (arbiter_run_id, dispute_item_id, paper_id, version_id, status, payload_json, batch_group_id, updated_at)
+                   VALUES (?,?,?,?,'pass1_done',?,?,?)""",
+                (
+                    arbiter_run_id,
+                    dispute_item_id,
+                    paper_id,
+                    version_id,
+                    json.dumps(payload),
+                    batch_group_id,
+                    _now(),
+                ),
+            )
+
+    def mark_resolution_skipped(
+        self, arbiter_run_id: int, dispute_item_id: int, paper_id: int, version_id: int, reason: str = ""
+    ) -> None:
+        with self._tx() as con:
+            con.execute(
+                """INSERT OR REPLACE INTO resolutions
+                   (arbiter_run_id, dispute_item_id, paper_id, version_id, status, error, updated_at)
+                   VALUES (?,?,?,?,'skipped',?,?)""",
+                (arbiter_run_id, dispute_item_id, paper_id, version_id, reason, _now()),
+            )
+
+    def mark_resolution_failed(self, arbiter_run_id: int, dispute_item_id: int, error: str) -> None:
+        with self._tx() as con:
+            con.execute(
+                """UPDATE resolutions SET status='failed', error=?, updated_at=?
+                   WHERE arbiter_run_id=? AND dispute_item_id=?""",
+                (error, _now(), arbiter_run_id, dispute_item_id),
+            )
+
+    def mark_resolutions_posted(self, arbiter_run_id: int, dispute_item_ids: list[int]) -> None:
+        with self._tx() as con:
+            con.executemany(
+                """UPDATE resolutions SET status='posted', updated_at=?
+                   WHERE arbiter_run_id=? AND dispute_item_id=?""",
+                [(_now(), arbiter_run_id, did) for did in dispute_item_ids],
+            )
+
+    def get_unposted_resolutions(self, arbiter_run_id: int, paper_id: int) -> list[dict]:
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT payload_json FROM resolutions
+                   WHERE arbiter_run_id=? AND paper_id=? AND status='done'
+                   AND payload_json IS NOT NULL""",
+                (arbiter_run_id, paper_id),
+            ).fetchall()
+        return [json.loads(r["payload_json"]) for r in rows]
+
+    def get_postable_resolutions(self, arbiter_run_id: int, paper_id: int) -> list[dict]:
+        """Return payloads for resolutions that are done or already posted (for repost)."""
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT payload_json FROM resolutions
+                   WHERE arbiter_run_id=? AND paper_id=? AND status IN ('done', 'posted')
+                   AND payload_json IS NOT NULL""",
+                (arbiter_run_id, paper_id),
+            ).fetchall()
+        return [json.loads(r["payload_json"]) for r in rows]
+
+    def should_skip_resolution_cell(self, arbiter_run_id: int, dispute_item_id: int) -> bool:
+        """Return True if this dispute is already done/posted and should not be recomputed."""
+        status = self.get_resolution_status(arbiter_run_id, dispute_item_id)
+        return status in ("done", "posted")
+
+    def should_skip_resolution_cell_by_paper_version(
+        self, arbiter_run_id: int, paper_id: int, version_id: int
+    ) -> bool:
+        """Like should_skip_resolution_cell, keyed by (paper_id, version_id) instead of
+        dispute_item_id — for use as batch_runner's should_skip_cell callback, which
+        only knows (run_id, paper_id, version_id). A dispute is unique per
+        (dispute_set, paper, question_version), so this triple is unambiguous."""
+        with self._connect() as con:
+            row = con.execute(
+                """SELECT status FROM resolutions
+                   WHERE arbiter_run_id=? AND paper_id=? AND version_id=?""",
+                (arbiter_run_id, paper_id, version_id),
+            ).fetchone()
+        return (row["status"] if row else None) in ("done", "posted")
+
+    def get_pass1_resolution_rows(self, arbiter_run_id: int, paper_id: int) -> list[dict]:
+        """Return pass1_done resolution rows with parsed payloads, ready for Pass-2 processing."""
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT arbiter_run_id, dispute_item_id, paper_id, version_id, status, payload_json
+                   FROM resolutions
+                   WHERE arbiter_run_id=? AND paper_id=? AND status='pass1_done'
+                   AND payload_json IS NOT NULL""",
+                (arbiter_run_id, paper_id),
+            ).fetchall()
+        return [
+            {
+                "arbiter_run_id": row["arbiter_run_id"],
+                "dispute_item_id": row["dispute_item_id"],
+                "paper_id": row["paper_id"],
+                "version_id": row["version_id"],
+                "status": row["status"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in rows
+        ]
+
+    def get_reformattable_resolution_rows(self, arbiter_run_id: int, paper_id: int) -> list[dict]:
+        """Return done/posted resolution rows with parsed payloads, ready for reformatting."""
+        with self._connect() as con:
+            rows = con.execute(
+                """SELECT arbiter_run_id, dispute_item_id, paper_id, version_id, status, payload_json
+                   FROM resolutions
+                   WHERE arbiter_run_id=? AND paper_id=? AND status IN ('done', 'posted')
+                   AND payload_json IS NOT NULL""",
+                (arbiter_run_id, paper_id),
+            ).fetchall()
+        return [
+            {
+                "arbiter_run_id": row["arbiter_run_id"],
+                "dispute_item_id": row["dispute_item_id"],
+                "paper_id": row["paper_id"],
+                "version_id": row["version_id"],
+                "status": row["status"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in rows
+        ]
+
+    def update_reformatted_resolution(
+        self, arbiter_run_id: int, dispute_item_id: int, payload: dict
+    ) -> None:
+        """Replace stored payload after a reformat and reset status to done."""
+        with self._tx() as con:
+            con.execute(
+                """UPDATE resolutions SET payload_json=?, status='done', updated_at=?
+                   WHERE arbiter_run_id=? AND dispute_item_id=?""",
+                (json.dumps(payload), _now(), arbiter_run_id, dispute_item_id),
+            )
+
+    def resolution_stats(self) -> dict:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT status, COUNT(*) as n FROM resolutions GROUP BY status"
+            ).fetchall()
+        return {r["status"]: r["n"] for r in rows}
+
+    def resolution_cost_summary(self) -> list[dict]:
+        """Aggregate token/cost totals per arbiter run from stored resolution payloads."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT arbiter_run_id, payload_json FROM resolutions WHERE payload_json IS NOT NULL"
+            ).fetchall()
+
+        totals: dict[int, dict] = {}
+        for row in rows:
+            rid = row["arbiter_run_id"]
+            payload = json.loads(row["payload_json"])
+            t = totals.setdefault(
+                rid,
+                {
+                    "run_id": rid,
+                    "tokens_total": 0,
+                    "tokens_input": 0,
+                    "tokens_output": 0,
+                    "tokens_cached": 0,
+                    "cost_usd": 0.0,
+                    "fmt_tokens_total": 0,
+                    "fmt_tokens_input": 0,
+                    "fmt_tokens_output": 0,
+                    "fmt_tokens_cached": 0,
+                    "fmt_cost_usd": 0.0,
+                    "answers": 0,
+                },
+            )
+            t["tokens_total"] += payload.get("tokens_total", 0) or 0
+            t["tokens_input"] += payload.get("tokens_input", 0) or 0
+            t["tokens_output"] += payload.get("tokens_output", 0) or 0
+            t["tokens_cached"] += payload.get("tokens_cached", 0) or 0
+            cost = payload.get("cost")
+            if cost:
+                t["cost_usd"] += float(cost)
+            t["fmt_tokens_total"] += payload.get("fmt_tokens_total", 0) or 0
+            t["fmt_tokens_input"] += payload.get("fmt_tokens_input", 0) or 0
+            t["fmt_tokens_output"] += payload.get("fmt_tokens_output", 0) or 0
+            t["fmt_tokens_cached"] += payload.get("fmt_tokens_cached", 0) or 0
+            fmt_cost = payload.get("fmt_cost")
+            if fmt_cost:
+                t["fmt_cost_usd"] += float(fmt_cost)
+            t["answers"] += 1
+
+        return list(totals.values())
 
     # ------------------------------------------------------------------
     # Batch job ID persistence (for resuming async batch runs)

@@ -16,47 +16,11 @@ from ..config import ExperimentRun, Question
 from ..llm import LLMResult, complete as llm_complete, dummy_complete
 from ..mapping import build_llm_answer
 from .prompt import build_messages, build_format_messages
-from .parse import ExtractionError, parse_structured_output
+from .parse import ExtractionError, parse_structured_output, _RESPONSE_FORMAT
 from .verify import verify_citation
 
 
 CompleteFn = Callable[..., object]  # async (model, provider, messages, **kw) -> LLMResult
-
-_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "annotation_results",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "results": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "key":        {"type": "string"},
-                            "value":      {"anyOf": [
-                                {"type": "boolean"},
-                                {"type": "number"},
-                                {"type": "string"},
-                                {"type": "array", "items": {"type": "string"}},
-                                {"type": "null"},
-                            ]},
-                            "cited_text": {"anyOf": [
-                                {"type": "string"},
-                                {"type": "array", "items": {"type": "string"}},
-                            ]},
-                            "comment":    {"type": "string"},
-                            "confidence": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
-                        },
-                        "required": ["key", "value", "cited_text", "comment", "confidence"],
-                    },
-                },
-            },
-            "required": ["results"],
-        },
-    },
-}
 
 
 def _dump_debug(

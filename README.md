@@ -470,6 +470,105 @@ The pipeline JSON includes an `api_token` field containing a DRF token for SEER.
 
 ---
 
+## Arbitration
+
+Arbitration adjudicates disputed `(paper, question)` cells — where two or more raters (human annotators and/or LLM runs) disagree — into authoritative `Resolution` records. It's a separate pipeline from annotation: instead of a `papers[]`/`questions[]`/`runs[]` pipeline JSON, SEER exports a **dispute pipeline JSON** with `runs[]` (arbiter runs), `questions[]`, and `disputes[]` (the disputed cells, each carrying the candidates that disagree). Every arbitration command mirrors its annotation counterpart.
+
+```bash
+# Adjudicate all disputes
+seer-annotate arbitrate dispute_pipeline.json
+
+# Filter to specific arbiter runs or disputes
+seer-annotate arbitrate dispute_pipeline.json --runs 21 --disputes 501,502
+
+# Dry run — dummy LLM, prints resolutions instead of posting
+seer-annotate arbitrate dispute_pipeline.json --dry-run
+
+# Check progress
+seer-annotate arbitrate-status dispute_pipeline.json
+```
+
+Like annotation, arbitration is a two-pass pipeline — Pass-1 reasons over the dispute (paper text + candidates' proposed values/evidence) and produces free-form output in the same template annotation uses; Pass-2 formats that into typed `Resolution` JSON. This means Pass-2, citation verification, and JSON parsing are the exact same code paths as annotation — only Pass-1's prompt (which presents the disputed question and its candidates instead of a blank question to answer) is arbitration-specific. The stages can be split the same way:
+
+```bash
+seer-annotate arbitrate-pass1 dispute_pipeline.json --concurrency 4
+seer-annotate arbitrate-pass2 dispute_pipeline.json --concurrency 64
+seer-annotate arbitrate-repost dispute_pipeline.json      # post previously-formatted resolutions
+seer-annotate arbitrate-reformat dispute_pipeline.json --format-model gpt-4o-mini  # re-run Pass-2 only
+```
+
+### Arbitration configuration (`runs[*].config`)
+
+Most fields are the same as annotation's `RunConfig` (`concurrency`, `per_provider_rpm`, `temperature`, `model_params`, `cache`/`cache_first`/`cache_ttl`, `citation_max_error_rate`/`citation_max_ellipsis_gap`, `format_model`/`format_model_provider`, `chunk_papers`, `batch_p1`/`batch_p2`, `fail_fast`). Arbitration-specific fields:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `text_source` | `"full_text"` | `"full_text"` (OCR), `"abstract"`, or `"candidates_only"` — skip the source paper entirely and adjudicate from the candidates' stated values/reasoning/citations alone. |
+| `batching` | `"all"` | Same `BatchingConfig` shape as annotation's `batching` (`"per_question"`, `"all"`, `{"size": N}`, explicit groups), applied per paper against that paper's disputed questions. `"all"` (default) puts every disputed question for a paper in one Pass-1 call — cheaper, shared paper-text context. |
+| `anonymize_raters` | `true` | Present candidates as "Candidate A/B/C" rather than their `rater_key` (`user:3`, `run:10`). Reduces the risk of the adjudicator developing an attribution bias (e.g. always preferring LLM-run candidates). Set `false` to show attribution for experimentation. |
+
+Defaults for these can be set project-wide in `settings.toml [arbiter_run_defaults]`, mirroring `[run_defaults]`.
+
+### Dispute pipeline JSON shape
+
+```json
+{
+  "review_id": 1, "dispute_set_id": 3, "api_base": "...", "api_token": "...",
+  "runs": [{"run_id": 21, "name": "gpt-4o-arbiter", "model_name": "gpt-4o", "model_provider": "openai", "config": {}}],
+  "questions": [{"question_id": 7, "key": "study_design", "version_id": 14, "question_type": "categorical", "is_ic": false, "options": [...]}],
+  "disputes": [
+    {
+      "dispute_item_id": 501, "paper_id": 42, "paper_title": "...", "abstract": "...",
+      "question_key": "study_design", "version_id": 14,
+      "candidates": [
+        {"rater_key": "user:3", "value": "rct", "comment": "...", "cited_text": "...", "source_answer_id": 9001},
+        {"rater_key": "run:10", "value": "cohort", "comment": "...", "cited_text": "", "source_answer_id": 8801}
+      ]
+    }
+  ]
+}
+```
+
+Resolutions POST to `arbiter-runs/{run_id}/resolutions/bulk/`, identified by `dispute_item` (from `disputes[].dispute_item_id`) rather than `paper` + `question_key`.
+
+---
+
+## Progress / heartbeat contract
+
+When SEER launches `seer-annotate run` as a background subprocess (SEER-orchestrated mode), it passes `--progress-url` and `--log-file`, and expects heartbeat POSTs so the run-detail page can show live progress. This section is the authoritative reference for that contract.
+
+```bash
+seer-annotate run pipeline.json --progress-url https://seer.example.org/api/v1/annotation-jobs/10/progress/ --log-file /var/log/job-10.log
+```
+
+Manual/pull-mode users (running `seer-annotate` themselves against a downloaded pipeline JSON) can ignore both flags entirely — they default to no heartbeats and a local `seer-annotate.log`.
+
+Heartbeats are POSTed with `Authorization: Token <api_token>` (the pipeline JSON's own `api_token`) at three points: run start, after each chunk, and on completion (success or failure). Shape:
+
+```json
+{
+  "run_id": 10,
+  "status": "running",
+  "cells_total": 240,
+  "cells_done": 60,
+  "cells_error": 1,
+  "message": "chunk 2/8"
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `run_id` | int | The `ExperimentRun` this run belongs to (`runs[0].run_id` in the pipeline JSON). |
+| `status` | string | `running` \| `succeeded` \| `failed`. |
+| `cells_total` | int | `len(papers) × len(questions)` for the run's filtered scope, computed once at run start. |
+| `cells_done` | int | Cumulative count of built answer payloads (including error payloads) across all chunks so far. |
+| `cells_error` | int | Cumulative count of those payloads with `extraction_status == "error"`. |
+| `message` | string, optional | Human-readable progress line (e.g. `"starting"`, `"chunk 2/8"`). Empty/absent never clobbers a previously-set message server-side. |
+
+A broken or unreachable `--progress-url` is logged and otherwise ignored — it never fails the underlying annotation run.
+
+---
+
 ## Development
 
 ```bash

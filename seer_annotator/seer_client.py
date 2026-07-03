@@ -173,6 +173,76 @@ class SeerClient:
                 return
 
 
+    async def post_resolutions_bulk(self, resolutions: list[dict]) -> None:
+        """POST resolutions to /arbiter-runs/{run_id}/resolutions/bulk/.
+
+        Endpoint is idempotent: re-posting upserts on (run, paper, question_version).
+        All resolutions in a single call must belong to the same arbiter_run_id.
+        """
+        if not resolutions:
+            return
+
+        run_id = resolutions[0]["arbiter_run"]
+        url = f"{self._base}/arbiter-runs/{run_id}/resolutions/bulk/"
+
+        payload = []
+        for stored in resolutions:
+            version_id = stored.get("question_version")
+            question = self._question_map.get(version_id)
+            if question is None:
+                logger.warning("Unknown question version_id=%s, skipping", version_id)
+                continue
+
+            item: dict = {
+                "dispute_item": stored.get("dispute_item"),
+                "value": _extract_value(stored, question),
+                "resolution_status": stored.get("resolution_status") or "ok",
+                "resolution_detail": stored.get("resolution_detail") or "",
+                "confidence": stored.get("confidence"),
+                "comment": stored.get("comment") or "",
+                "cited_text": _coerce_cited_text(stored.get("cited_text")),
+                "raw_response": _extract_pass1_text(stored.get("raw_response")),
+                "tokens_total": stored.get("tokens_total") or 0,
+                "tokens_input": stored.get("tokens_input") or 0,
+                "tokens_output": stored.get("tokens_output") or 0,
+                "tokens_cached": stored.get("tokens_cached") or 0,
+                "latency_ms": stored.get("latency_ms") or 0,
+            }
+            if stored.get("cost"):
+                item["cost"] = f"{float(stored['cost']):.6f}"
+                item["cost_currency"] = stored.get("cost_currency") or "USD"
+            payload.append(item)
+
+        if not payload:
+            return
+
+        async with self._client() as client:
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    resp = await client.post(url, json=payload)
+                except httpx.HTTPError as exc:
+                    logger.warning("Bulk resolution post error run=%s (attempt %d): %s", run_id, attempt, exc)
+                    if attempt == _MAX_RETRIES - 1:
+                        raise
+                    await asyncio.sleep(_BACKOFF_BASE ** attempt)
+                    continue
+
+                if resp.status_code in _RETRY_STATUSES and attempt < _MAX_RETRIES - 1:
+                    await asyncio.sleep(_BACKOFF_BASE ** attempt)
+                    continue
+
+                resp.raise_for_status()
+                result = resp.json()
+                logger.info(
+                    "Bulk resolutions posted run=%s: created=%s updated=%s errors=%s",
+                    run_id,
+                    result.get("created", "?"),
+                    result.get("updated", "?"),
+                    result.get("errors", []),
+                )
+                return
+
+
 class DryRunSeerClient(SeerClient):
     """Prints payloads instead of posting; still fetches real OCR if reachable."""
 
@@ -185,3 +255,13 @@ class DryRunSeerClient(SeerClient):
             key = question.key if question else f"version_id={version_id}"
             value = _extract_value(stored, question) if question else "?"
             print(f"  paper={stored['paper']} q={key} value={value!r}")
+
+    async def post_resolutions_bulk(self, resolutions: list[dict]) -> None:
+        run_id = resolutions[0]["arbiter_run"] if resolutions else "?"
+        print(f"[dry-run] Would POST {len(resolutions)} resolutions to arbiter-runs/{run_id}/resolutions/bulk/:")
+        for stored in resolutions:
+            version_id = stored.get("question_version")
+            question = self._question_map.get(version_id)
+            key = question.key if question else f"version_id={version_id}"
+            value = _extract_value(stored, question) if question else "?"
+            print(f"  paper={stored['paper']} dispute_item={stored.get('dispute_item')} q={key} value={value!r}")

@@ -1,13 +1,18 @@
-"""Main annotation loop: run → paper → group → annotate → persist → post."""
+"""Arbitration loop: dispute → adjudicate → format → verify → persist → post.
+
+Mirrors orchestrator.py's structure function-for-function, reusing the same
+_execute_pass1/_execute_pass2 engine (batch_runner.py) and Pass-2 machinery
+(annotate.parse/annotate.verify/annotate.engine.reformat_group) — only Pass-1
+message construction (arbitrate.prompt) and the tail payload builder
+(mapping.build_resolution) are arbitration-specific.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import time
 from decimal import Decimal
-from typing import Callable
 
 from rich.console import Console
 from rich.progress import (
@@ -23,26 +28,103 @@ _console = Console()
 
 from .batching import resolve_groups
 from .batch_runner import _execute_pass1, _execute_pass2
-from .config import PipelineConfig, ProviderSettings, RunConfig, Settings, effective_run_config
-from .progress import ProgressReporter
+from .config import (
+    ArbiterRunConfig,
+    Candidate,
+    DisputeItem,
+    DisputePipelineConfig,
+    Paper,
+    ProviderSettings,
+    Question,
+    Settings,
+    effective_arbiter_config,
+)
 from .rate_limiter import PerProviderRateLimiter
 from .seer_client import SeerClient
 from .store import Store
-from .mapping import build_error_answer, build_llm_answer
+from .mapping import build_error_resolution, build_resolution
 from .annotate.parse import ExtractionError, parse_structured_output
 from .annotate.verify import verify_citation
+from .arbitrate.prompt import build_dispute_messages
+from .orchestrator import _chunks
 
 logger = logging.getLogger(__name__)
 
 
-def _chunks(lst: list, size: int) -> list[list]:
-    """Split lst into sublists of at most size elements. size<=0 → one chunk."""
-    if size <= 0:
-        return [lst] if lst else []
-    return [lst[i : i + size] for i in range(0, len(lst), size)] if lst else []
+def _papers_from_disputes(disputes: list[DisputeItem]) -> list[Paper]:
+    """Dispute pipeline JSON has no papers[] — synthesize one Paper per distinct
+    paper appearing in disputes[], reusing config.Paper (paper_id/title/abstract)."""
+    seen: dict[int, Paper] = {}
+    for d in disputes:
+        if d.paper_id not in seen:
+            seen[d.paper_id] = Paper(paper_id=d.paper_id, title=d.paper_title, abstract=d.abstract, split="")
+    return list(seen.values())
 
 
-def _parse_save_post_tail(
+def _dispute_index(
+    disputes: list[DisputeItem],
+) -> tuple[dict[tuple[int, int], DisputeItem], dict[tuple[int, int], list[Candidate]]]:
+    """Returns (dispute_by_paper_version, candidates_by_paper_version), both keyed
+    by (paper_id, version_id) — the unique locator for a dispute within one dispute set."""
+    dispute_by_paper_version: dict[tuple[int, int], DisputeItem] = {}
+    candidates_by_paper_version: dict[tuple[int, int], list[Candidate]] = {}
+    for d in disputes:
+        key = (d.paper_id, d.version_id)
+        dispute_by_paper_version[key] = d
+        candidates_by_paper_version[key] = d.candidates
+    return dispute_by_paper_version, candidates_by_paper_version
+
+
+def _questions_for_paper(disputes_for_paper: list[DisputeItem], question_by_key: dict[str, Question]) -> list[Question]:
+    questions: list[Question] = []
+    seen_versions: set[int] = set()
+    for d in disputes_for_paper:
+        q = question_by_key.get(d.question_key)
+        if q is None or q.version_id in seen_versions:
+            continue
+        seen_versions.add(q.version_id)
+        questions.append(q)
+    return questions
+
+
+def _build_p1_messages_fn(cfg: ArbiterRunConfig, candidates_by_paper_version: dict[tuple[int, int], list[Candidate]]):
+    """Closure passed as batch_runner's build_p1_messages — (source, group, paper_id) -> messages."""
+
+    def _fn(source_text: str, group: list[Question], paper_id: int) -> list[dict]:
+        candidates_by_version_id = {
+            q.version_id: candidates_by_paper_version.get((paper_id, q.version_id), []) for q in group
+        }
+        return build_dispute_messages(
+            None if cfg.text_source == "candidates_only" else source_text,
+            group,
+            candidates_by_version_id,
+            anonymize_raters=cfg.anonymize_raters,
+            text_source=cfg.text_source,
+            system_prompt=cfg.system_prompt,
+            cache_first=cfg.cache_first,
+        )
+
+    return _fn
+
+
+def _skip_resolution_cell_fn(store: Store):
+    """Closure passed as batch_runner's should_skip_cell — checks the resolutions table."""
+
+    def _fn(run_id: int, paper_id: int, version_id: int) -> bool:
+        return store.should_skip_resolution_cell_by_paper_version(run_id, paper_id, version_id)
+
+    return _fn
+
+
+def _resolve_source_text(cfg: ArbiterRunConfig, paper: Paper, store: Store) -> str:
+    if cfg.text_source == "candidates_only":
+        return ""
+    if cfg.text_source == "abstract":
+        return paper.abstract
+    return store.get_ocr(paper.paper_id) or ""
+
+
+def _parse_save_post_tail_resolutions(
     *,
     p1_texts: dict,
     p1_usage: dict,
@@ -53,15 +135,10 @@ def _parse_save_post_tail(
     run,
     cfg,
     store: Store,
+    dispute_by_paper_version: dict[tuple[int, int], DisputeItem],
     fail_fast: bool,
-    on_payload_saved: "Callable[[dict], None] | None" = None,
 ) -> "ExtractionError | None":
-    """Parse/verify/save answers from p2_texts. Returns first ExtractionError if any.
-
-    ``on_payload_saved``, when given, is called once per built payload right after
-    it's persisted — used by the progress heartbeat to track cells_done/cells_error
-    without a separate store query.
-    """
+    """Parse/verify/save resolutions from p2_texts. Returns first ExtractionError if any."""
     first_extraction_error: ExtractionError | None = None
 
     for cid in p2_texts:
@@ -72,18 +149,18 @@ def _parse_save_post_tail(
         p2_text = p2_texts[cid]
 
         u = p1_usage.get(cid, {})
-        tok_input  = u.get("input_tokens", 0)
+        tok_input = u.get("input_tokens", 0)
         tok_output = u.get("output_tokens", 0)
         tok_cached = u.get("cache_read_tokens", 0)
-        p1_cost    = u.get("cost")
+        p1_cost = u.get("cost")
         p1_latency = u.get("latency_ms", 0) or 0
 
         fu = p2_usage.get(cid, {})
-        fmt_input  = fu.get("input_tokens", 0)
+        fmt_input = fu.get("input_tokens", 0)
         fmt_output = fu.get("output_tokens", 0)
         fmt_cached = fu.get("cache_read_tokens", 0)
-        fmt_total  = fmt_input + fmt_output + fmt_cached
-        fmt_cost   = fu.get("cost")
+        fmt_total = fmt_input + fmt_output + fmt_cached
+        fmt_cost = fu.get("cost")
         p2_latency = fu.get("latency_ms", 0) or 0
 
         parsed = parse_structured_output(p2_text, [q.key for q in group])
@@ -98,18 +175,32 @@ def _parse_save_post_tail(
                 p2_text[:2000],
             )
             for q in group:
-                error_payload = build_error_answer(run_id=run.run_id, paper_id=paper.paper_id, question=q, extraction_detail=str(err))
-                store.save_answer(run.run_id, paper.paper_id, q.version_id, error_payload)
-                if on_payload_saved is not None:
-                    on_payload_saved(error_payload)
+                d = dispute_by_paper_version.get((paper.paper_id, q.version_id))
+                if d is None:
+                    continue
+                store.save_resolution(
+                    run.run_id, d.dispute_item_id, paper.paper_id, q.version_id,
+                    build_error_resolution(
+                        arbiter_run_id=run.run_id, paper_id=paper.paper_id,
+                        dispute_item_id=d.dispute_item_id, question=q, resolution_detail=str(err),
+                    ),
+                )
             if fail_fast and first_extraction_error is None:
                 first_extraction_error = err
             continue
 
         for i, (question, result) in enumerate(zip(group, parsed)):
+            d = dispute_by_paper_version.get((paper.paper_id, question.version_id))
+            if d is None:
+                logger.warning(
+                    "No dispute item for paper=%d version_id=%d — skipping",
+                    paper.paper_id, question.version_id,
+                )
+                continue
+
             verify = verify_citation(
                 result.get("cited_text", ""),
-                source_texts.get(paper.paper_id, ""),
+                source_texts.get(paper.paper_id, "") or "",
                 max_error_rate=cfg.citation_max_error_rate,
                 max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
             )
@@ -124,9 +215,10 @@ def _parse_save_post_tail(
                 "batch_mode": True,
                 "p1_usage": u,
             }
-            payload = build_llm_answer(
-                run_id=run.run_id,
+            payload = build_resolution(
+                arbiter_run_id=run.run_id,
                 paper_id=paper.paper_id,
+                dispute_item_id=d.dispute_item_id,
                 question=question,
                 value=result.get("value"),
                 comment=result.get("comment", ""),
@@ -147,30 +239,26 @@ def _parse_save_post_tail(
                 fmt_cost=fmt_cost if i == 0 else None,
                 confidence=result.get("confidence"),
             )
-            store.save_answer(run.run_id, paper.paper_id, question.version_id, payload, cid)
-            if on_payload_saved is not None:
-                on_payload_saved(payload)
+            store.save_resolution(run.run_id, d.dispute_item_id, paper.paper_id, question.version_id, payload, cid)
 
     return first_extraction_error
 
 
-async def run_pipeline(
-    pipeline: PipelineConfig,
+async def run_arbitration_pipeline(
+    pipeline: DisputePipelineConfig,
     settings: Settings,
     *,
     store: Store | None = None,
     client: SeerClient | None = None,
     dry_run: bool = False,
     run_ids: list[int] | None = None,
-    paper_ids: list[int] | None = None,
+    dispute_item_ids: list[int] | None = None,
     concurrency: int | None = None,
     rpm: float | None = None,
-    progress_url: str | None = None,
 ) -> None:
     from .seer_client import DryRunSeerClient
 
-    # Pipeline-wide settings: code defaults < run_defaults < CLI overrides
-    pipeline_cfg = effective_run_config(RunConfig(), settings.run_defaults)
+    pipeline_cfg = effective_arbiter_config(ArbiterRunConfig(), settings.arbiter_run_defaults)
     if concurrency is not None:
         pipeline_cfg.concurrency = concurrency
     if rpm is not None:
@@ -191,7 +279,14 @@ async def run_pipeline(
     limiter = PerProviderRateLimiter(pipeline_cfg.per_provider_rpm)
 
     runs = [r for r in pipeline.runs if (run_ids is None or r.run_id in run_ids)]
-    papers = [p for p in pipeline.papers if (paper_ids is None or p.paper_id in paper_ids)]
+    disputes = [d for d in pipeline.disputes if (dispute_item_ids is None or d.dispute_item_id in dispute_item_ids)]
+
+    question_by_key = {q.key: q for q in pipeline.questions}
+    dispute_by_paper_version, candidates_by_paper_version = _dispute_index(disputes)
+    all_papers = _papers_from_disputes(disputes)
+    disputes_by_paper: dict[int, list[DisputeItem]] = {}
+    for d in disputes:
+        disputes_by_paper.setdefault(d.paper_id, []).append(d)
 
     progress = Progress(
         SpinnerColumn(),
@@ -203,74 +298,33 @@ async def run_pipeline(
     )
 
     all_run_errors: list[str] = []
-    any_run_failed = False
+    first_error: list[ExtractionError] = []
 
     with progress:
-        run_task = progress.add_task("Runs", total=len(runs))
+        run_task = progress.add_task("Arbiter runs", total=len(runs))
         chunk_task = progress.add_task("  Chunks", total=0, visible=False)
         cell_task = progress.add_task("    Cells", total=0, visible=False)
         p2_task = progress.add_task("    Pass 2", total=0, visible=False)
 
-        for run_idx, run in enumerate(runs):
+        for run in runs:
             progress.update(
                 run_task,
                 description=f"Run {run.run_id} [cyan]({run.name})[/cyan]",
             )
-            logger.debug("Run %d (%s) starting", run.run_id, run.name)
+            logger.debug("Arbiter run %d (%s) starting", run.run_id, run.name)
 
-            cfg = effective_run_config(run.config, settings.run_defaults)
-            groups_def = resolve_groups(cfg, pipeline.questions)
+            cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
 
-            chunks = _chunks(papers, cfg.chunk_papers)
+            groups_def: dict[int, list[list[Question]]] = {
+                paper_id: resolve_groups(cfg, _questions_for_paper(paper_disputes, question_by_key))
+                for paper_id, paper_disputes in disputes_by_paper.items()
+            }
+
+            chunks = _chunks(all_papers, cfg.chunk_papers)
             progress.reset(chunk_task, total=len(chunks), visible=True)
 
-            first_error: list[ExtractionError] = []
+            first_error = []
             run_cell_errors = 0
-            run_had_fatal_error = False
-
-            reporter = ProgressReporter(progress_url, pipeline.api_token, run.run_id)
-            cells_total = len(papers) * len(pipeline.questions)
-            cell_counters = {"done": 0, "error": 0}
-
-            # Multi-run pipelines (a whole ExperimentSetup run sequentially in one
-            # invocation) share this same --progress-url across every run, so the
-            # message is the only signal that tells the poller which run is active.
-            def _progress_message(suffix: str, _idx=run_idx, _run=run) -> str:
-                if len(runs) <= 1:
-                    return suffix
-                return f"run {_idx + 1}/{len(runs)} ({_run.name}): {suffix}"
-
-            # Fire-and-forget per-cell heartbeats, throttled — supplements the
-            # guaranteed start/chunk-boundary/end heartbeats below with something
-            # closer to real-time progress for runs that fit in a single chunk
-            # (chunk-boundary heartbeats alone would otherwise sit at 0 done for
-            # the whole run and then jump straight to 100%).
-            _heartbeat_tasks: set = set()
-            _last_heartbeat_ts = [0.0]
-
-            def _maybe_heartbeat(min_interval: float = 1.5) -> None:
-                now = time.monotonic()
-                if now - _last_heartbeat_ts[0] < min_interval:
-                    return
-                _last_heartbeat_ts[0] = now
-                task = asyncio.create_task(reporter.heartbeat(
-                    status="running", cells_total=cells_total,
-                    cells_done=cell_counters["done"], cells_error=cell_counters["error"],
-                    message=_progress_message(f"{cell_counters['done']}/{cells_total} cells done"),
-                ))
-                _heartbeat_tasks.add(task)
-                task.add_done_callback(_heartbeat_tasks.discard)
-
-            def _count_payload(payload: dict, _c=cell_counters) -> None:
-                _c["done"] += 1
-                if payload.get("extraction_status") == "error":
-                    _c["error"] += 1
-                _maybe_heartbeat()
-
-            await reporter.heartbeat(
-                status="running", cells_total=cells_total, cells_done=0, cells_error=0,
-                message=_progress_message("starting"),
-            )
 
             for chunk_i, chunk_papers in enumerate(chunks):
                 progress.update(chunk_task, description=f"  Chunk {chunk_i + 1}/{len(chunks)}")
@@ -282,35 +336,45 @@ async def run_pipeline(
                 def _on_cell_done(_t=cell_task):
                     progress.advance(_t)
 
-                # Resolve source texts for this chunk
                 source_texts: dict[int, str] = {}
-                no_ocr_papers: list = []
-
                 for paper in chunk_papers:
+                    if cfg.text_source == "candidates_only":
+                        source_texts[paper.paper_id] = ""
+                        continue
                     if cfg.text_source == "full_text":
                         source = store.get_ocr(paper.paper_id)
                         if source is None:
                             source = await client.fetch_ocr_markdown(paper.paper_id)
                             store.save_ocr(paper.paper_id, source)
                         if source is None:
-                            logger.warning("No OCR for paper %d — posting error for all questions", paper.paper_id)
-                            no_ocr_papers.append(paper)
-                            for q in pipeline.questions:
-                                no_ocr_payload = build_error_answer(run_id=run.run_id, paper_id=paper.paper_id, question=q, extraction_detail="no_ocr")
-                                store.save_answer(run.run_id, paper.paper_id, q.version_id, no_ocr_payload)
-                                _count_payload(no_ocr_payload)
+                            logger.warning(
+                                "No OCR for paper %d — posting error for all its disputes", paper.paper_id
+                            )
+                            for d in disputes_by_paper.get(paper.paper_id, []):
+                                q = question_by_key.get(d.question_key)
+                                if q is None:
+                                    continue
+                                store.save_resolution(
+                                    run.run_id, d.dispute_item_id, paper.paper_id, d.version_id,
+                                    build_error_resolution(
+                                        arbiter_run_id=run.run_id, paper_id=paper.paper_id,
+                                        dispute_item_id=d.dispute_item_id, question=q,
+                                        resolution_detail="no_ocr",
+                                    ),
+                                )
                         else:
                             source_texts[paper.paper_id] = source
                     else:
                         source_texts[paper.paper_id] = paper.abstract
 
-                # Phase 1
                 pending_cells: dict[str, tuple] = {}
                 p1_texts, p1_usage, p1_error = await _execute_pass1(
                     run, cfg, chunk_papers, source_texts, pending_cells,
                     store, settings, dry_run, groups_def=groups_def,
                     sem=sem, limiter=limiter,
                     on_cell_done=_on_cell_done, on_total_known=_on_total,
+                    build_p1_messages=_build_p1_messages_fn(cfg, candidates_by_paper_version),
+                    should_skip_cell=_skip_resolution_cell_fn(store),
                 )
 
                 n_pending = len(pending_cells)
@@ -322,17 +386,12 @@ async def run_pipeline(
                     msg = f"Run {run.run_id} ({run.name}): {p1_error}"
                     all_run_errors.append(msg)
                     logger.error("P1 aborted — %s", msg)
-                    # p1_error signals a fatal, run-aborting failure (e.g. bad model name/API
-                    # key — the "probe first call" path in _execute_pass1_with_groups), not a
-                    # per-cell parsing issue. Treat it like first_error for fail_fast purposes
-                    # so a totally broken run is actually reported as failed (and stops a
-                    # multi-run "Run all" pipeline) instead of silently completing 0/N cells
-                    # and reporting "succeeded".
-                    run_had_fatal_error = True
                 elif chunk_failed > 0:
-                    logger.warning("Run %d: %d/%d cells failed in chunk %d", run.run_id, chunk_failed, n_pending, chunk_i + 1)
+                    logger.warning(
+                        "Run %d: %d/%d cells failed in chunk %d",
+                        run.run_id, chunk_failed, n_pending, chunk_i + 1,
+                    )
 
-                # Phase 2
                 pending_p1 = {cid: t for cid, t in p1_texts.items() if cid in pending_cells}
 
                 def _on_p2_start(n: int, desc: str, _t=p2_task) -> None:
@@ -350,8 +409,7 @@ async def run_pipeline(
                     on_p2_advance=_on_p2_advance,
                 )
 
-                # Parse / verify / save
-                err = _parse_save_post_tail(
+                err = _parse_save_post_tail_resolutions(
                     p1_texts=p1_texts,
                     p1_usage=p1_usage,
                     p2_texts=p2_texts,
@@ -361,43 +419,33 @@ async def run_pipeline(
                     run=run,
                     cfg=cfg,
                     store=store,
+                    dispute_by_paper_version=dispute_by_paper_version,
                     fail_fast=cfg.fail_fast,
-                    on_payload_saved=_count_payload,
                 )
                 if err is not None:
                     first_error.append(err)
 
-                # Post per paper in chunk (includes no-OCR error records)
                 for paper in chunk_papers:
-                    unposted = store.get_unposted(run.run_id, paper.paper_id)
+                    unposted = store.get_unposted_resolutions(run.run_id, paper.paper_id)
                     if unposted:
                         try:
-                            await client.post_answers_bulk(unposted)
+                            await client.post_resolutions_bulk(unposted)
                             if not dry_run:
-                                version_ids = [p["question_version"] for p in unposted]
-                                store.mark_posted(run.run_id, paper.paper_id, version_ids)
-                            logger.info("Posted %d answers for paper %d", len(unposted), paper.paper_id)
+                                dispute_ids = [r["dispute_item"] for r in unposted]
+                                store.mark_resolutions_posted(run.run_id, dispute_ids)
+                            logger.info("Posted %d resolutions for paper %d", len(unposted), paper.paper_id)
                         except Exception as exc:
                             logger.error("Post failed for paper %d: %s", paper.paper_id, exc)
 
                 progress.advance(chunk_task)
 
-                await reporter.heartbeat(
-                    status="running",
-                    cells_total=cells_total,
-                    cells_done=cell_counters["done"],
-                    cells_error=cell_counters["error"],
-                    message=_progress_message(f"chunk {chunk_i + 1}/{len(chunks)}"),
-                )
-
-                if (first_error or run_had_fatal_error) and cfg.fail_fast:
+                if first_error and cfg.fail_fast:
                     break
 
             progress.update(chunk_task, visible=False)
             progress.update(cell_task, visible=False)
             progress.update(p2_task, visible=False)
 
-            # Update run bar to show outcome
             if run_cell_errors > 0:
                 progress.update(
                     run_task,
@@ -410,44 +458,9 @@ async def run_pipeline(
                 )
 
             progress.advance(run_task)
-            logger.debug("Run %d complete", run.run_id)
+            logger.debug("Arbiter run %d complete", run.run_id)
 
-            run_failed = (bool(first_error) or run_had_fatal_error) and cfg.fail_fast
-            any_run_failed = any_run_failed or run_failed
-            will_continue = (run_idx < len(runs) - 1) and not run_failed
-
-            # Let any still-in-flight per-cell heartbeats land before this run's own
-            # terminal signal, so a late one can never race past it and revert the
-            # job's reported status.
-            if _heartbeat_tasks:
-                await asyncio.gather(*_heartbeat_tasks, return_exceptions=True)
-
-            # Multi-run pipelines (a whole ExperimentSetup run sequentially, see
-            # build_setup_pipeline_json on the SEER side) share one --progress-url/
-            # AnnotationJob across every run they process: only the LAST run actually
-            # processed (either the literal last one, or the run a fail_fast abort stops
-            # on) may report a terminal "succeeded"/"failed" status. An earlier run
-            # finishing successfully must still report "running", or SEER's poller would
-            # think the whole job is done after run 1 of N and stop watching before the
-            # rest even start.
-            if will_continue:
-                await reporter.heartbeat(
-                    status="running",
-                    cells_total=cells_total,
-                    cells_done=cell_counters["done"],
-                    cells_error=cell_counters["error"],
-                    message=_progress_message("done, moving to next run"),
-                )
-            else:
-                await reporter.heartbeat(
-                    status="failed" if run_failed else "succeeded",
-                    cells_total=cells_total,
-                    cells_done=cell_counters["done"],
-                    cells_error=cell_counters["error"],
-                    message=_progress_message("failed" if run_failed else "succeeded"),
-                )
-
-            if run_failed:
+            if first_error and cfg.fail_fast:
                 break
 
     if all_run_errors:
@@ -457,27 +470,23 @@ async def run_pipeline(
 
     if first_error:
         raise first_error[0]
-    if any_run_failed:
-        raise RuntimeError("One or more runs failed — see errors above.")
 
 
-async def pass1_pipeline(
-    pipeline: PipelineConfig,
+async def arbitration_pass1_pipeline(
+    pipeline: DisputePipelineConfig,
     settings: Settings,
     *,
     dry_run: bool = False,
     run_ids: list[int] | None = None,
-    paper_ids: list[int] | None = None,
+    dispute_item_ids: list[int] | None = None,
     concurrency: int | None = None,
     rpm: float | None = None,
 ) -> tuple[int, int]:
-    """Run only Pass-1 for all pending cells, saving results as pass1_done.
-
-    Returns (n_pass1_cells_saved, n_failed).
-    """
+    """Run only Pass-1 (adjudication reasoning) for all pending disputes, saving
+    results as pass1_done. Returns (n_pass1_cells_saved, n_failed)."""
     from .seer_client import DryRunSeerClient
 
-    pipeline_cfg = effective_run_config(RunConfig(), settings.run_defaults)
+    pipeline_cfg = effective_arbiter_config(ArbiterRunConfig(), settings.arbiter_run_defaults)
     if concurrency is not None:
         pipeline_cfg.concurrency = concurrency
     if rpm is not None:
@@ -498,19 +507,30 @@ async def pass1_pipeline(
     limiter = PerProviderRateLimiter(pipeline_cfg.per_provider_rpm)
 
     runs = [r for r in pipeline.runs if (run_ids is None or r.run_id in run_ids)]
-    papers = [p for p in pipeline.papers if (paper_ids is None or p.paper_id in paper_ids)]
+    disputes = [d for d in pipeline.disputes if (dispute_item_ids is None or d.dispute_item_id in dispute_item_ids)]
+
+    question_by_key = {q.key: q for q in pipeline.questions}
+    dispute_by_paper_version, candidates_by_paper_version = _dispute_index(disputes)
+    all_papers = _papers_from_disputes(disputes)
+    disputes_by_paper: dict[int, list[DisputeItem]] = {}
+    for d in disputes:
+        disputes_by_paper.setdefault(d.paper_id, []).append(d)
 
     n_saved = 0
     n_failed = 0
 
     for run in runs:
-        cfg = effective_run_config(run.config, settings.run_defaults)
-        groups_def = resolve_groups(cfg, pipeline.questions)
+        cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
+        groups_def: dict[int, list[list[Question]]] = {
+            paper_id: resolve_groups(cfg, _questions_for_paper(paper_disputes, question_by_key))
+            for paper_id, paper_disputes in disputes_by_paper.items()
+        }
 
-        # Resolve source texts for all papers
         source_texts: dict[int, str] = {}
-        for paper in papers:
-            if cfg.text_source == "full_text":
+        for paper in all_papers:
+            if cfg.text_source == "candidates_only":
+                source_texts[paper.paper_id] = ""
+            elif cfg.text_source == "full_text":
                 source = store.get_ocr(paper.paper_id)
                 if source is None:
                     source = await client.fetch_ocr_markdown(paper.paper_id)
@@ -521,53 +541,49 @@ async def pass1_pipeline(
             else:
                 source_texts[paper.paper_id] = paper.abstract
 
-        # Build pending_cells, but pre-filter to exclude pass1_done/done/posted
-        # _execute_pass1 uses should_skip_cell (done/posted only) — we additionally
-        # exclude pass1_done by providing a filtered source_texts that omits those papers.
-        # Strategy: for each candidate (paper, group), check if all questions in that
-        # group are already pass1_done/done/posted; if so, exclude from source_texts
-        # for _execute_pass1 by using a filtered set.
-        # Actually the cleanest approach: let _execute_pass1 build pending_cells normally,
-        # then remove cells that are pass1_done afterward (before saving).
-
         pending_cells: dict[str, tuple] = {}
         p1_texts, p1_usage, p1_error = await _execute_pass1(
-            run, cfg, papers, source_texts, pending_cells,
+            run, cfg, all_papers, source_texts, pending_cells,
             store, settings, dry_run, groups_def=groups_def,
             sem=sem, limiter=limiter,
+            build_p1_messages=_build_p1_messages_fn(cfg, candidates_by_paper_version),
+            should_skip_cell=_skip_resolution_cell_fn(store),
         )
         if p1_error:
             logger.error("Pass-1 aborted for run %d: %s", run.run_id, p1_error)
 
-        # Remove cells that are already pass1_done (should_skip_cell only checks done/posted)
+        # Remove cells already pass1_done (should_skip_cell only checks done/posted)
         pass1_done_cids = set()
         for cid, (paper, group, group_idx) in list(pending_cells.items()):
-            if all(
-                store.get_status(run.run_id, paper.paper_id, q.version_id) == "pass1_done"
-                for q in group
-            ):
+            statuses = []
+            for q in group:
+                d = dispute_by_paper_version.get((paper.paper_id, q.version_id))
+                if d is None:
+                    continue
+                statuses.append(store.get_resolution_status(run.run_id, d.dispute_item_id))
+            if statuses and all(s == "pass1_done" for s in statuses):
                 pass1_done_cids.add(cid)
         for cid in pass1_done_cids:
             del pending_cells[cid]
 
-        # Save pass1_done rows for the remaining pending cells
-        question_order = {q.version_id: i for i, q in enumerate(pipeline.questions)}
-
         for cid, (paper, group, group_idx) in pending_cells.items():
             p1_text = p1_texts.get(cid)
             if p1_text is None:
-                # P1 failed for this cell
                 n_failed += len(group)
                 continue
 
             u = p1_usage.get(cid, {})
-            tok_input  = u.get("input_tokens", 0)
+            tok_input = u.get("input_tokens", 0)
             tok_output = u.get("output_tokens", 0)
             tok_cached = u.get("cache_read_tokens", 0)
-            p1_cost    = u.get("cost")
+            p1_cost = u.get("cost")
             p1_latency = u.get("latency_ms", 0) or 0
 
             for i, question in enumerate(group):
+                d = dispute_by_paper_version.get((paper.paper_id, question.version_id))
+                if d is None:
+                    continue
+
                 raw_response: dict = {
                     "text_source": cfg.text_source,
                     "batch_group_id": cid,
@@ -577,9 +593,10 @@ async def pass1_pipeline(
                 if i == 0:
                     raw_response["pass1_text"] = p1_text
 
-                payload = build_llm_answer(
-                    run_id=run.run_id,
+                payload = build_resolution(
+                    arbiter_run_id=run.run_id,
                     paper_id=paper.paper_id,
+                    dispute_item_id=d.dispute_item_id,
                     question=question,
                     value=None,
                     comment="",
@@ -594,33 +611,35 @@ async def pass1_pipeline(
                     cost=p1_cost if i == 0 else None,
                     cost_currency="USD",
                 )
-                store.save_pass1(run.run_id, paper.paper_id, question.version_id, payload, cid)
+                store.save_pass1_resolution(
+                    run.run_id, d.dispute_item_id, paper.paper_id, question.version_id, payload, cid
+                )
                 n_saved += 1
 
-    logger.info("Pass-1 complete: %d cells saved, %d failed", n_saved, n_failed)
+    logger.info("Arbitration Pass-1 complete: %d cells saved, %d failed", n_saved, n_failed)
     return n_saved, n_failed
 
 
-async def pass2_pipeline(
-    pipeline: PipelineConfig,
+async def arbitration_pass2_pipeline(
+    pipeline: DisputePipelineConfig,
     settings: Settings,
     *,
     format_model: str | None = None,
     format_model_provider: str | None = None,
     dry_run: bool = False,
     run_ids: list[int] | None = None,
-    paper_ids: list[int] | None = None,
+    dispute_item_ids: list[int] | None = None,
     concurrency: int | None = None,
     rpm: float | None = None,
     post: bool = True,
 ) -> tuple[int, int]:
-    """Run only Pass-2 on pass1_done cells, producing done answers.
+    """Run only Pass-2 on pass1_done disputes, producing done resolutions.
 
     Returns (n_done, n_failed).
     """
     from .seer_client import DryRunSeerClient
 
-    pipeline_cfg = effective_run_config(RunConfig(), settings.run_defaults)
+    pipeline_cfg = effective_arbiter_config(ArbiterRunConfig(), settings.arbiter_run_defaults)
     if concurrency is not None:
         pipeline_cfg.concurrency = concurrency
     if rpm is not None:
@@ -641,49 +660,43 @@ async def pass2_pipeline(
     limiter = PerProviderRateLimiter(pipeline_cfg.per_provider_rpm)
 
     runs = [r for r in pipeline.runs if (run_ids is None or r.run_id in run_ids)]
-    papers = [p for p in pipeline.papers if (paper_ids is None or p.paper_id in paper_ids)]
+    disputes = [d for d in pipeline.disputes if (dispute_item_ids is None or d.dispute_item_id in dispute_item_ids)]
 
     question_map = {q.version_id: q for q in pipeline.questions}
     question_order = {q.version_id: i for i, q in enumerate(pipeline.questions)}
+    dispute_by_paper_version, _ = _dispute_index(disputes)
+    all_papers = _papers_from_disputes(disputes)
 
     n_done = 0
     n_failed = 0
 
     for run in runs:
-        cfg = effective_run_config(run.config, settings.run_defaults)
+        cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
 
-        # Apply format model overrides
         if format_model is not None:
             cfg.format_model = format_model
         if format_model_provider is not None:
             cfg.format_model_provider = format_model_provider
 
-        for paper in papers:
-            rows = store.get_pass1_rows(run.run_id, paper.paper_id)
+        for paper in all_papers:
+            rows = store.get_pass1_resolution_rows(run.run_id, paper.paper_id)
             if not rows:
                 continue
 
-            # Resolve source text for citation verification
-            if cfg.text_source == "full_text":
-                source_text = store.get_ocr(paper.paper_id) or ""
-            else:
-                source_text = paper.abstract
+            source_text = _resolve_source_text(cfg, paper, store)
 
-            # Group rows by batch_group_id (same approach as reformat_pipeline)
             groups: dict[str, list[dict]] = {}
             for row in rows:
                 raw_resp = json.loads(row["payload"]["raw_response"])
                 group_id = raw_resp.get("batch_group_id") or f"solo_{row['version_id']}"
                 groups.setdefault(group_id, []).append(row)
 
-            # Reconstruct pending_cells and pending_p1 from stored rows
             pending_cells: dict[str, tuple] = {}
             pending_p1: dict[str, str] = {}
             p1_usage_by_cid: dict[str, dict] = {}
-            p1_payload_by_cid: dict[str, dict] = {}  # the row payload with i==0 (has p1 tokens)
+            p1_payload_by_cid: dict[str, dict] = {}
 
             for group_id, group_rows in groups.items():
-                # Sort questions by pipeline order
                 questions_in_group = sorted(
                     [question_map[r["version_id"]] for r in group_rows if r["version_id"] in question_map],
                     key=lambda q: question_order.get(q.version_id, 0),
@@ -691,8 +704,6 @@ async def pass2_pipeline(
                 if not questions_in_group:
                     continue
 
-                # Find pass1_text — stored in the row with i==0 (the one with tokens)
-                # Sort rows by question order and take the first one's raw_response for pass1_text
                 q_to_row = {r["version_id"]: r for r in group_rows}
                 ordered_rows = [q_to_row[q.version_id] for q in questions_in_group if q.version_id in q_to_row]
                 if not ordered_rows:
@@ -711,23 +722,17 @@ async def pass2_pipeline(
                 pending_cells[group_id] = (paper, questions_in_group, 0)
                 pending_p1[group_id] = pass1_text
                 p1_usage_by_cid[group_id] = raw0.get("p1_usage", {})
-                # Store the first row's payload for p1 token/cost carry-over
                 p1_payload_by_cid[group_id] = ordered_rows[0]["payload"]
 
             if not pending_p1:
                 continue
 
-            # source_texts dict for tail logic
-            source_texts = {paper.paper_id: source_text}
-
-            # Run pass 2
             p2_texts, p2_usage = await _execute_pass2(
                 run, cfg, pending_p1, pending_cells,
                 store, settings, dry_run,
                 sem=sem, limiter=limiter,
             )
 
-            # Parse / verify / save with p1 token carry-over
             for cid, p2_text in p2_texts.items():
                 if cid not in pending_cells:
                     continue
@@ -735,22 +740,20 @@ async def pass2_pipeline(
                 p1_payload_row0 = p1_payload_by_cid.get(cid, {})
                 u = p1_usage_by_cid.get(cid, {})
 
-                # p1 token/cost figures from stored payload (row 0)
-                p1_tok_input  = p1_payload_row0.get("tokens_input", 0) or 0
+                p1_tok_input = p1_payload_row0.get("tokens_input", 0) or 0
                 p1_tok_output = p1_payload_row0.get("tokens_output", 0) or 0
                 p1_tok_cached = p1_payload_row0.get("tokens_cached", 0) or 0
-                p1_tok_total  = p1_payload_row0.get("tokens_total", 0) or 0
-                p1_cost_str   = p1_payload_row0.get("cost")
-                p1_cost       = Decimal(p1_cost_str) if p1_cost_str else None
-                p1_latency    = p1_payload_row0.get("latency_ms", 0) or 0
+                p1_tok_total = p1_payload_row0.get("tokens_total", 0) or 0
+                p1_cost_str = p1_payload_row0.get("cost")
+                p1_cost = Decimal(p1_cost_str) if p1_cost_str else None
+                p1_latency = p1_payload_row0.get("latency_ms", 0) or 0
 
-                # p2 (format) figures from this stage's usage
                 fu = p2_usage.get(cid, {})
-                fmt_input  = fu.get("input_tokens", 0)
+                fmt_input = fu.get("input_tokens", 0)
                 fmt_output = fu.get("output_tokens", 0)
                 fmt_cached = fu.get("cache_read_tokens", 0)
-                fmt_total  = fmt_input + fmt_output + fmt_cached
-                fmt_cost   = fu.get("cost")
+                fmt_total = fmt_input + fmt_output + fmt_cached
+                fmt_cost = fu.get("cost")
                 p2_latency = fu.get("latency_ms", 0) or 0
 
                 parsed = parse_structured_output(p2_text, [q.key for q in group])
@@ -762,14 +765,24 @@ async def pass2_pipeline(
                         run.run_id, paper_cell.paper_id, cid, err,
                     )
                     for q in group:
-                        store.save_answer(
-                            run.run_id, paper_cell.paper_id, q.version_id,
-                            build_error_answer(run_id=run.run_id, paper_id=paper_cell.paper_id, question=q, extraction_detail=str(err)),
+                        d = dispute_by_paper_version.get((paper_cell.paper_id, q.version_id))
+                        if d is None:
+                            continue
+                        store.save_resolution(
+                            run.run_id, d.dispute_item_id, paper_cell.paper_id, q.version_id,
+                            build_error_resolution(
+                                arbiter_run_id=run.run_id, paper_id=paper_cell.paper_id,
+                                dispute_item_id=d.dispute_item_id, question=q, resolution_detail=str(err),
+                            ),
                         )
                     n_failed += len(group)
                     continue
 
                 for i, (question, result) in enumerate(zip(group, parsed)):
+                    d = dispute_by_paper_version.get((paper_cell.paper_id, question.version_id))
+                    if d is None:
+                        continue
+
                     verify = verify_citation(
                         result.get("cited_text", ""),
                         source_text,
@@ -778,7 +791,6 @@ async def pass2_pipeline(
                     )
                     cited_text_verified = None if verify.get("note") == "no citation provided" else verify["ok"]
 
-                    # Retrieve pass1_text for raw_response from pending_p1
                     p1_text_for_raw = pending_p1.get(cid, "")
 
                     raw_response = {
@@ -792,9 +804,10 @@ async def pass2_pipeline(
                         "p1_usage": u,
                     }
 
-                    payload = build_llm_answer(
-                        run_id=run.run_id,
+                    payload = build_resolution(
+                        arbiter_run_id=run.run_id,
                         paper_id=paper_cell.paper_id,
+                        dispute_item_id=d.dispute_item_id,
                         question=question,
                         value=result.get("value"),
                         comment=result.get("comment", ""),
@@ -802,14 +815,12 @@ async def pass2_pipeline(
                         cited_text_verified=cited_text_verified,
                         raw_response=raw_response,
                         latency_ms=(p1_latency + p2_latency) if i == 0 else 0,
-                        # Carry p1 token/cost from stored pass1 payload (i==0 only)
                         tokens_total=p1_tok_total if i == 0 else 0,
                         tokens_input=p1_tok_input if i == 0 else 0,
                         tokens_output=p1_tok_output if i == 0 else 0,
                         tokens_cached=p1_tok_cached if i == 0 else 0,
                         cost=p1_cost if i == 0 else None,
                         cost_currency="USD",
-                        # p2 (format) figures from this stage (i==0 only)
                         fmt_tokens_total=fmt_total if i == 0 else 0,
                         fmt_tokens_input=fmt_input if i == 0 else 0,
                         fmt_tokens_output=fmt_output if i == 0 else 0,
@@ -817,58 +828,59 @@ async def pass2_pipeline(
                         fmt_cost=fmt_cost if i == 0 else None,
                         confidence=result.get("confidence"),
                     )
-                    store.save_answer(run.run_id, paper_cell.paper_id, question.version_id, payload, cid)
+                    store.save_resolution(
+                        run.run_id, d.dispute_item_id, paper_cell.paper_id, question.version_id, payload, cid
+                    )
                     n_done += 1
 
-            # Post per paper if requested
             if post:
-                unposted = store.get_unposted(run.run_id, paper.paper_id)
+                unposted = store.get_unposted_resolutions(run.run_id, paper.paper_id)
                 if unposted:
                     try:
-                        await client.post_answers_bulk(unposted)
+                        await client.post_resolutions_bulk(unposted)
                         if not dry_run:
-                            version_ids = [p["question_version"] for p in unposted]
-                            store.mark_posted(run.run_id, paper.paper_id, version_ids)
-                        logger.info("Posted %d answers for paper %d", len(unposted), paper.paper_id)
+                            dispute_ids = [r["dispute_item"] for r in unposted]
+                            store.mark_resolutions_posted(run.run_id, dispute_ids)
+                        logger.info("Posted %d resolutions for paper %d", len(unposted), paper.paper_id)
                     except Exception as exc:
                         logger.error("Post failed for paper %d: %s", paper.paper_id, exc)
 
-    logger.info("Pass-2 complete: %d done, %d failed", n_done, n_failed)
+    logger.info("Arbitration Pass-2 complete: %d done, %d failed", n_done, n_failed)
     return n_done, n_failed
 
 
-async def reformat_pipeline(
-    pipeline: PipelineConfig,
+async def reformat_arbitration_pipeline(
+    pipeline: DisputePipelineConfig,
     settings: Settings,
     *,
     format_model: str | None = None,
     format_model_provider: str | None = None,
     dry_run: bool = False,
     run_ids: list[int] | None = None,
-    paper_ids: list[int] | None = None,
+    dispute_item_ids: list[int] | None = None,
 ) -> tuple[int, int]:
-    """Re-run pass-2 formatting on stored answers, optionally with a different model.
+    """Re-run pass-2 formatting on stored resolutions, optionally with a different model.
 
-    Returns (n_updated, n_failed).
-    Answers are reset to status='done' so they can be reposted afterwards.
+    Returns (n_updated, n_failed). Reuses annotate.engine.reformat_group() unchanged —
+    Pass-2-only reformatting needs no candidates, only the stored pass1_text.
     """
-    import asyncio
     import functools
 
     from .annotate.engine import reformat_group
-    from .annotate.parse import ExtractionError
     from .llm import complete as llm_complete, dummy_complete
 
-    pipeline_cfg = effective_run_config(RunConfig(), settings.run_defaults)
+    pipeline_cfg = effective_arbiter_config(ArbiterRunConfig(), settings.arbiter_run_defaults)
 
     import litellm as _litellm
     _litellm.drop_params = pipeline_cfg.drop_params
     _litellm.suppress_debug_info = True
 
     store = Store(settings.runtime.store_path)
+    disputes = [d for d in pipeline.disputes if (dispute_item_ids is None or d.dispute_item_id in dispute_item_ids)]
     question_map = {q.version_id: q for q in pipeline.questions}
     question_order = {q.version_id: i for i, q in enumerate(pipeline.questions)}
-    paper_map = {p.paper_id: p for p in pipeline.papers}
+    all_papers = _papers_from_disputes(disputes)
+    paper_map = {p.paper_id: p for p in all_papers}
 
     _base_complete = dummy_complete if dry_run else llm_complete
     _limiter = PerProviderRateLimiter(pipeline_cfg.per_provider_rpm)
@@ -880,7 +892,6 @@ async def reformat_pipeline(
     sem = asyncio.Semaphore(pipeline_cfg.concurrency)
 
     runs = [r for r in pipeline.runs if (run_ids is None or r.run_id in run_ids)]
-    papers = [p for p in pipeline.papers if (paper_ids is None or p.paper_id in paper_ids)]
 
     total_done = 0
     total_failed = 0
@@ -895,21 +906,16 @@ async def reformat_pipeline(
     )
 
     with progress:
-        run_task = progress.add_task("Runs", total=len(runs))
-        paper_task = progress.add_task("", total=len(papers), visible=False)
+        run_task = progress.add_task("Arbiter runs", total=len(runs))
+        paper_task = progress.add_task("", total=len(all_papers), visible=False)
 
         for run in runs:
             progress.update(run_task, description=f"Run {run.run_id} [cyan]({run.name})[/cyan]")
-            progress.reset(paper_task, total=len(papers), visible=True)
+            progress.reset(paper_task, total=len(all_papers), visible=True)
 
-            cfg = effective_run_config(run.config, settings.run_defaults)
-            # CLI arg > effective run config (run_defaults merged with per-run) > run's own provider
+            cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
             final_model = format_model or cfg.format_model or "gpt-4o-mini"
-            final_provider = (
-                format_model_provider
-                or cfg.format_model_provider
-                or run.model_provider
-            )
+            final_provider = format_model_provider or cfg.format_model_provider or run.model_provider
 
             fmt_extra: dict = {}
             if not dry_run:
@@ -925,20 +931,16 @@ async def reformat_pipeline(
                 functools.partial(_rate_limited, **fmt_extra) if fmt_extra else _rate_limited
             )
 
-            for paper in papers:
+            for paper in all_papers:
                 progress.update(paper_task, description=f"  Paper {paper.paper_id}")
 
-                rows = store.get_reformattable_rows(run.run_id, paper.paper_id)
+                rows = store.get_reformattable_resolution_rows(run.run_id, paper.paper_id)
                 if not rows:
                     progress.advance(paper_task)
                     continue
 
-                if cfg.text_source == "full_text":
-                    source_text = store.get_ocr(paper.paper_id) or ""
-                else:
-                    source_text = paper_map.get(paper.paper_id, paper).abstract
+                source_text = _resolve_source_text(cfg, paper_map.get(paper.paper_id, paper), store)
 
-                # Group by batch_group_id so multi-question groups are reformatted together
                 groups: dict[str, list[dict]] = {}
                 for row in rows:
                     raw_resp = json.loads(row["payload"]["raw_response"])
@@ -967,7 +969,6 @@ async def reformat_pipeline(
                         total_failed += len(group_rows)
                         return
 
-                    # Sort questions by original pipeline order so the format prompt is stable
                     questions_in_group = sorted(
                         [question_map[r["version_id"]] for r in group_rows if r["version_id"] in question_map],
                         key=lambda q: question_order.get(q.version_id, 0),
@@ -1025,9 +1026,10 @@ async def reformat_pipeline(
                             new_raw["p2_raw"] = result["p2_raw"]
                         question = question_map[row["version_id"]]
                         parsed = result["parse_result"]
-                        new_payload = build_llm_answer(
-                            run_id=row["run_id"],
+                        new_payload = build_resolution(
+                            arbiter_run_id=row["arbiter_run_id"],
                             paper_id=row["paper_id"],
+                            dispute_item_id=row["dispute_item_id"],
                             question=question,
                             value=parsed.get("value"),
                             comment=parsed.get("comment", ""),
@@ -1048,7 +1050,9 @@ async def reformat_pipeline(
                             fmt_cost=result["fmt_cost"],
                             confidence=parsed.get("confidence"),
                         )
-                        store.update_reformatted(row["run_id"], row["paper_id"], row["version_id"], new_payload)
+                        store.update_reformatted_resolution(
+                            row["arbiter_run_id"], row["dispute_item_id"], new_payload
+                        )
                         total_done += 1
 
                 await asyncio.gather(*[_do_group(gid, grows) for gid, grows in groups.items()])
@@ -1057,5 +1061,5 @@ async def reformat_pipeline(
 
             progress.advance(run_task)
 
-    logger.info("Reformat complete: %d updated, %d failed", total_done, total_failed)
+    logger.info("Arbitration reformat complete: %d updated, %d failed", total_done, total_failed)
     return total_done, total_failed

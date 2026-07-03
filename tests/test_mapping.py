@@ -3,7 +3,13 @@
 from decimal import Decimal
 import pytest
 from seer_annotator.config import Question, QuestionOption
-from seer_annotator.mapping import build_llm_answer, build_error_answer, _map_value
+from seer_annotator.mapping import (
+    build_llm_answer,
+    build_error_answer,
+    build_resolution,
+    build_error_resolution,
+    _map_value,
+)
 
 
 def make_q(qt, allow_multiple=False, options=None):
@@ -140,3 +146,63 @@ def test_build_llm_answer_cited_text_verified():
         tokens_total=0, tokens_input=0, tokens_output=0, tokens_cached=0, cost=None,
     )
     assert payload_false["cited_text_verified"] is False
+
+
+def test_build_resolution_shape():
+    q = make_q("categorical", options=OPTS)
+    payload = build_resolution(
+        arbiter_run_id=21, paper_id=42, dispute_item_id=501, question=q,
+        value="rct", comment="c", cited_text="span", raw_response={}, latency_ms=100,
+        tokens_total=10, tokens_input=8, tokens_output=2, tokens_cached=0,
+        cost=Decimal("0.001"), confidence=18,
+    )
+    assert payload["arbiter_run"] == 21
+    assert payload["paper"] == 42
+    assert payload["dispute_item"] == 501
+    assert payload["question_version"] == q.version_id
+    assert payload["value_categorical"] == "rct"
+    assert payload["resolution_status"] == "ok"
+    assert payload["resolution_detail"] == ""
+    assert payload["confidence"] == 18
+    assert payload["cost"] == "0.001"
+    # Resolution write API has no cited_text_verified field — computed locally only.
+    assert "cited_text_verified" in payload
+    assert payload["cited_text_verified"] is None
+
+
+def test_build_resolution_invalid_value():
+    q = make_q("categorical", options=OPTS)
+    payload = build_resolution(
+        arbiter_run_id=21, paper_id=42, dispute_item_id=501, question=q,
+        value="not_a_valid_option", comment="", cited_text="", raw_response={},
+        latency_ms=0, tokens_total=0, tokens_input=0, tokens_output=0, tokens_cached=0, cost=None,
+    )
+    assert payload["resolution_status"] == "invalid"
+    assert payload["resolution_detail"] == "not_a_valid_option"
+    assert payload["value_categorical"] is None
+
+
+def test_build_resolution_null_value_is_abstention_not_error():
+    """A null value is a legitimate abstention (matches LLMAnswer's convention),
+    not an error — resolution_status stays 'ok' with an explanatory detail."""
+    q = make_q("categorical", options=OPTS)
+    payload = build_resolution(
+        arbiter_run_id=21, paper_id=42, dispute_item_id=501, question=q,
+        value=None, comment="", cited_text="", raw_response={},
+        latency_ms=0, tokens_total=0, tokens_input=0, tokens_output=0, tokens_cached=0, cost=None,
+    )
+    assert payload["resolution_status"] == "ok"
+    assert payload["resolution_detail"] == "LLM answered: non-determinable"
+    assert payload["value_categorical"] is None
+
+
+def test_build_error_resolution():
+    q = make_q("categorical", options=OPTS)
+    payload = build_error_resolution(
+        arbiter_run_id=21, paper_id=42, dispute_item_id=501, question=q,
+        resolution_detail="no_ocr",
+    )
+    assert payload["resolution_status"] == "error"
+    assert payload["resolution_detail"] == "no_ocr"
+    assert payload["value_categorical"] is None
+    assert payload["confidence"] is None

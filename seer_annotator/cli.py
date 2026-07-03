@@ -12,7 +12,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from .config import PipelineConfig, Settings
+from .config import DisputePipelineConfig, PipelineConfig, Settings
 from .orchestrator import pass1_pipeline, pass2_pipeline
 from .store import Store
 
@@ -40,6 +40,17 @@ def cli(verbose: bool) -> None:
 @click.option("--chunk-papers", default=None, type=int, help="Override chunk_papers for all runs")
 @click.option("--concurrency", default=None, type=int, help="Override max concurrency")
 @click.option("--rpm", default=None, type=float, help="Override requests-per-minute limit")
+@click.option(
+    "--progress-url", default=None,
+    help="POST heartbeats here (run start / after each chunk / on completion) — used by SEER-orchestrated runs",
+)
+@click.option("--log-file", "log_file", default="seer-annotate.log", help="Path to write the run log to")
+@click.option(
+    "--reset-runs", default=None,
+    help="Comma-separated run IDs whose cached answers should be cleared from the local store "
+    "before running, forcing fresh re-annotation instead of skipping cells the resume cache "
+    "already thinks are done/posted. Other run IDs sharing the same store are left untouched.",
+)
 def run(
     pipeline_json: str,
     settings_path: str | None,
@@ -49,9 +60,13 @@ def run(
     chunk_papers: int | None,
     concurrency: int | None,
     rpm: float | None,
+    progress_url: str | None,
+    log_file: str,
+    reset_runs: str | None,
 ) -> None:
     """Execute annotation for PIPELINE_JSON."""
     from .orchestrator import run_pipeline
+    from .progress import ProgressReporter
 
     with open(pipeline_json) as f:
         pipeline = PipelineConfig.model_validate(json.load(f))
@@ -61,11 +76,16 @@ def run(
     run_ids = [int(x) for x in runs.split(",")] if runs else None
     paper_ids = [int(x) for x in papers.split(",")] if papers else None
 
+    if reset_runs:
+        reset_ids = [int(x) for x in reset_runs.split(",")]
+        Store(settings.runtime.store_path).reset_runs(reset_ids)
+        console.print(f"[yellow]Cleared cached answers for run(s) {reset_ids}[/]")
+
     if chunk_papers is not None:
         for r in pipeline.runs:
             r.config.chunk_papers = chunk_papers
 
-    log_path = pathlib.Path("seer-annotate.log")
+    log_path = pathlib.Path(log_file)
     root = logging.getLogger()
     root.handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
     fh = logging.FileHandler(log_path, mode="w")
@@ -86,12 +106,20 @@ def run(
                 paper_ids=paper_ids,
                 concurrency=concurrency,
                 rpm=rpm,
+                progress_url=progress_url,
             )
         )
     except Exception as exc:
         logging.getLogger(__name__).exception("Pipeline failed")
         console.print(f"\n[bold red]Error:[/] {exc}")
-        console.print("[dim]Full traceback written to seer-annotate.log[/]")
+        console.print(f"[dim]Full traceback written to {log_path}[/]")
+        if progress_url and pipeline.runs:
+            reporter = ProgressReporter(progress_url, pipeline.api_token, pipeline.runs[0].run_id)
+            asyncio.run(
+                reporter.heartbeat(
+                    status="failed", cells_total=0, cells_done=0, cells_error=0, message=str(exc),
+                )
+            )
         sys.exit(1)
     console.print("[green]Done.[/]")
 
@@ -557,3 +585,339 @@ def ui_cmd(pipeline_json: str, settings_path: str | None, host: str, port: int) 
 
     console.print(f"[green]UI:[/] http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
+# ---------------------------------------------------------------------------
+# Arbitration commands — mirror the annotation commands above, operating on a
+# dispute-set pipeline JSON (DisputePipelineConfig) instead of PipelineConfig.
+# ---------------------------------------------------------------------------
+
+def _load_dispute_pipeline(pipeline_json: str) -> DisputePipelineConfig:
+    with open(pipeline_json) as f:
+        return DisputePipelineConfig.model_validate(json.load(f))
+
+
+@cli.command()
+@click.argument("pipeline_json", type=click.Path(exists=True))
+@click.option("--settings", "settings_path", default=None)
+@click.option("--runs", default=None, help="Comma-separated arbiter run IDs to process")
+@click.option("--disputes", default=None, help="Comma-separated dispute_item IDs to process")
+@click.option("--dry-run", is_flag=True)
+@click.option("--chunk-papers", default=None, type=int, help="Override chunk_papers for all runs")
+@click.option("--concurrency", default=None, type=int, help="Override max concurrency")
+@click.option("--rpm", default=None, type=float, help="Override requests-per-minute limit")
+def arbitrate(
+    pipeline_json: str,
+    settings_path: str | None,
+    runs: str | None,
+    disputes: str | None,
+    dry_run: bool,
+    chunk_papers: int | None,
+    concurrency: int | None,
+    rpm: float | None,
+) -> None:
+    """Adjudicate disputes for DISPUTE_PIPELINE_JSON (Pass-1 + Pass-2 + post, chunked)."""
+    from .arbitrate_orchestrator import run_arbitration_pipeline
+
+    pipeline = _load_dispute_pipeline(pipeline_json)
+    settings = Settings.load(settings_path)
+
+    run_ids = [int(x) for x in runs.split(",")] if runs else None
+    dispute_item_ids = [int(x) for x in disputes.split(",")] if disputes else None
+
+    if chunk_papers is not None:
+        for r in pipeline.runs:
+            r.config.chunk_papers = chunk_papers
+
+    if dry_run:
+        console.print("[yellow]Dry-run mode — LLM calls use dummy provider, posts are printed[/]")
+
+    try:
+        asyncio.run(
+            run_arbitration_pipeline(
+                pipeline,
+                settings,
+                dry_run=dry_run,
+                run_ids=run_ids,
+                dispute_item_ids=dispute_item_ids,
+                concurrency=concurrency,
+                rpm=rpm,
+            )
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Arbitration pipeline failed")
+        console.print(f"\n[bold red]Error:[/] {exc}")
+        sys.exit(1)
+    console.print("[green]Done.[/]")
+
+
+@cli.command(name="arbitrate-status")
+@click.argument("pipeline_json", type=click.Path(exists=True))
+@click.option("--settings", "settings_path", default=None)
+def arbitrate_status(pipeline_json: str, settings_path: str | None) -> None:
+    """Show local store progress for a dispute-set pipeline."""
+    pipeline = _load_dispute_pipeline(pipeline_json)
+    settings = Settings.load(settings_path)
+    store = Store(settings.runtime.store_path)
+
+    console.print(f"[bold]Resolution counts by status:[/] {store.resolution_stats()}")
+
+    cost_rows = store.resolution_cost_summary()
+    if cost_rows:
+        run_map = {r.run_id: r.name for r in pipeline.runs}
+        table = Table(title="Token / Cost Summary")
+        table.add_column("Run", style="cyan")
+        table.add_column("Resolutions", justify="right")
+        table.add_column("Tokens (total)", justify="right")
+        table.add_column("Cached", justify="right")
+        table.add_column("Cost (USD)", justify="right")
+        for row in cost_rows:
+            table.add_row(
+                run_map.get(row["run_id"], str(row["run_id"])),
+                str(row["answers"]),
+                f"{row['tokens_total']:,}",
+                f"{row['tokens_cached']:,}",
+                f"${row['cost_usd']:.4f}",
+            )
+        console.print(table)
+
+
+@cli.command(name="arbitrate-repost")
+@click.argument("pipeline_json", type=click.Path(exists=True))
+@click.option("--settings", "settings_path", default=None)
+@click.option("--runs", default=None, help="Comma-separated arbiter run IDs to repost")
+@click.option("--dry-run", is_flag=True)
+def arbitrate_repost(
+    pipeline_json: str,
+    settings_path: str | None,
+    runs: str | None,
+    dry_run: bool,
+) -> None:
+    """Re-post stored resolutions to the server (e.g. after a DB reset)."""
+    from .seer_client import SeerClient, DryRunSeerClient
+    from .arbitrate_orchestrator import _papers_from_disputes
+
+    pipeline = _load_dispute_pipeline(pipeline_json)
+    settings = Settings.load(settings_path)
+    store = Store(settings.runtime.store_path)
+    client = (
+        DryRunSeerClient(pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions)
+        if dry_run
+        else SeerClient(pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions)
+    )
+
+    run_ids = [int(x) for x in runs.split(",")] if runs else None
+    runs_to_process = [r for r in pipeline.runs if run_ids is None or r.run_id in run_ids]
+    all_papers = _papers_from_disputes(pipeline.disputes)
+
+    if dry_run:
+        console.print("[yellow]Dry-run mode — posts are printed[/]")
+
+    total = 0
+
+    async def _do() -> None:
+        nonlocal total
+        for run in runs_to_process:
+            for paper in all_papers:
+                resolutions = store.get_postable_resolutions(run.run_id, paper.paper_id)
+                if not resolutions:
+                    continue
+                await client.post_resolutions_bulk(resolutions)
+                if not dry_run:
+                    dispute_ids = [r["dispute_item"] for r in resolutions]
+                    store.mark_resolutions_posted(run.run_id, dispute_ids)
+                total += len(resolutions)
+
+    try:
+        asyncio.run(_do())
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Repost failed")
+        console.print(f"\n[bold red]Error:[/] {exc}")
+        sys.exit(1)
+
+    console.print(f"[green]Re-posted {total} resolutions.[/]")
+
+
+@cli.command(name="arbitrate-reformat")
+@click.argument("pipeline_json", type=click.Path(exists=True))
+@click.option("--format-model", default=None, help="Override the format model (e.g. gpt-4o-mini)")
+@click.option("--format-model-provider", default=None, help="Override the format model provider")
+@click.option("--settings", "settings_path", default=None)
+@click.option("--runs", default=None, help="Comma-separated arbiter run IDs to reformat")
+@click.option("--disputes", default=None, help="Comma-separated dispute_item IDs to reformat")
+@click.option("--dry-run", is_flag=True)
+def arbitrate_reformat(
+    pipeline_json: str,
+    format_model: str | None,
+    format_model_provider: str | None,
+    settings_path: str | None,
+    runs: str | None,
+    disputes: str | None,
+    dry_run: bool,
+) -> None:
+    """Re-run pass-2 formatting on stored resolutions without re-adjudicating.
+
+    After reformatting, resolutions are reset to status 'done' and can be reposted
+    with arbitrate-repost.
+    """
+    from .arbitrate_orchestrator import reformat_arbitration_pipeline
+
+    pipeline = _load_dispute_pipeline(pipeline_json)
+    settings = Settings.load(settings_path)
+
+    run_ids = [int(x) for x in runs.split(",")] if runs else None
+    dispute_item_ids = [int(x) for x in disputes.split(",")] if disputes else None
+
+    if dry_run:
+        console.print("[yellow]Dry-run mode — LLM calls use dummy provider[/]")
+
+    effective_model = format_model or settings.arbiter_run_defaults.format_model
+    console.print(f"[dim]Format model: {effective_model}[/]")
+
+    try:
+        n_done, n_failed = asyncio.run(
+            reformat_arbitration_pipeline(
+                pipeline,
+                settings,
+                format_model=format_model,
+                format_model_provider=format_model_provider,
+                dry_run=dry_run,
+                run_ids=run_ids,
+                dispute_item_ids=dispute_item_ids,
+            )
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Arbitration reformat failed")
+        console.print(f"\n[bold red]Error:[/] {exc}")
+        sys.exit(1)
+
+    if n_failed:
+        console.print(f"[yellow]Reformat done: {n_done} updated, {n_failed} failed (see logs)[/]")
+    else:
+        console.print(f"[green]Reformat done: {n_done} resolutions updated.[/]")
+    if n_done and not dry_run:
+        console.print("[dim]Run 'seer-annotate arbitrate-repost' to push the updated resolutions to SEER.[/]")
+
+
+@cli.command(name="arbitrate-pass1")
+@click.argument("pipeline_json", type=click.Path(exists=True))
+@click.option("--settings", "settings_path", default=None)
+@click.option("--runs", default=None, help="Comma-separated arbiter run IDs to process")
+@click.option("--disputes", default=None, help="Comma-separated dispute_item IDs to process")
+@click.option("--dry-run", is_flag=True)
+@click.option("--concurrency", default=None, type=int, help="Override max concurrency")
+@click.option("--rpm", default=None, type=float, help="Override requests-per-minute limit")
+def arbitrate_pass1(
+    pipeline_json: str,
+    settings_path: str | None,
+    runs: str | None,
+    disputes: str | None,
+    dry_run: bool,
+    concurrency: int | None,
+    rpm: float | None,
+) -> None:
+    """Run only Pass-1 (adjudication reasoning) and store results as pass1_done.
+
+    Run 'seer-annotate arbitrate-pass2' afterwards to format and post results.
+    """
+    from .arbitrate_orchestrator import arbitration_pass1_pipeline
+
+    pipeline = _load_dispute_pipeline(pipeline_json)
+    settings = Settings.load(settings_path)
+
+    run_ids = [int(x) for x in runs.split(",")] if runs else None
+    dispute_item_ids = [int(x) for x in disputes.split(",")] if disputes else None
+
+    if dry_run:
+        console.print("[yellow]Dry-run mode — LLM calls use dummy provider[/]")
+
+    try:
+        n_done, n_failed = asyncio.run(
+            arbitration_pass1_pipeline(
+                pipeline,
+                settings,
+                dry_run=dry_run,
+                run_ids=run_ids,
+                dispute_item_ids=dispute_item_ids,
+                concurrency=concurrency,
+                rpm=rpm,
+            )
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Arbitration Pass 1 failed")
+        console.print(f"\n[bold red]Error:[/] {exc}")
+        sys.exit(1)
+
+    if n_failed:
+        console.print(f"[yellow]Pass 1 complete: {n_done} cells, {n_failed} failed (see logs)[/]")
+    else:
+        console.print(f"[green]Pass 1 complete: {n_done} cells, {n_failed} failed.[/]")
+
+
+@cli.command(name="arbitrate-pass2")
+@click.argument("pipeline_json", type=click.Path(exists=True))
+@click.option("--format-model", default=None, help="Override the format model (e.g. gpt-4o-mini)")
+@click.option("--format-model-provider", default=None, help="Override the format model provider")
+@click.option("--settings", "settings_path", default=None)
+@click.option("--runs", default=None, help="Comma-separated arbiter run IDs to process")
+@click.option("--disputes", default=None, help="Comma-separated dispute_item IDs to process")
+@click.option("--dry-run", is_flag=True)
+@click.option("--concurrency", default=None, type=int, help="Override max concurrency")
+@click.option("--rpm", default=None, type=float, help="Override requests-per-minute limit")
+@click.option("--no-post", is_flag=True, help="Skip posting resolutions to SEER (leave as 'done')")
+def arbitrate_pass2(
+    pipeline_json: str,
+    format_model: str | None,
+    format_model_provider: str | None,
+    settings_path: str | None,
+    runs: str | None,
+    disputes: str | None,
+    dry_run: bool,
+    concurrency: int | None,
+    rpm: float | None,
+    no_post: bool,
+) -> None:
+    """Pick up pass1_done disputes, run Pass-2 (formatting), and post resolutions.
+
+    Use --no-post followed by 'seer-annotate arbitrate-repost' to post later.
+    """
+    from .arbitrate_orchestrator import arbitration_pass2_pipeline
+
+    pipeline = _load_dispute_pipeline(pipeline_json)
+    settings = Settings.load(settings_path)
+
+    run_ids = [int(x) for x in runs.split(",")] if runs else None
+    dispute_item_ids = [int(x) for x in disputes.split(",")] if disputes else None
+
+    if dry_run:
+        console.print("[yellow]Dry-run mode — LLM calls use dummy provider[/]")
+
+    effective_model = format_model or settings.arbiter_run_defaults.format_model
+    console.print(f"[dim]Format model: {effective_model}[/]")
+
+    try:
+        n_done, n_failed = asyncio.run(
+            arbitration_pass2_pipeline(
+                pipeline,
+                settings,
+                format_model=format_model,
+                format_model_provider=format_model_provider,
+                dry_run=dry_run,
+                run_ids=run_ids,
+                dispute_item_ids=dispute_item_ids,
+                concurrency=concurrency,
+                rpm=rpm,
+                post=not no_post,
+            )
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).exception("Arbitration Pass 2 failed")
+        console.print(f"\n[bold red]Error:[/] {exc}")
+        sys.exit(1)
+
+    if n_failed:
+        console.print(f"[yellow]Pass 2 complete: {n_done} cells, {n_failed} failed (see logs)[/]")
+    else:
+        console.print(f"[green]Pass 2 complete: {n_done} cells, {n_failed} failed.[/]")
+    if n_done and not dry_run and no_post:
+        console.print("[dim]Run 'seer-annotate arbitrate-repost' to push the resolutions to SEER.[/]")

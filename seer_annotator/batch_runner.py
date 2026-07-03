@@ -405,11 +405,29 @@ async def _execute_pass1_with_groups(
     limiter=None,
     on_cell_done: "Callable[[], None] | None" = None,
     on_total_known: "Callable[[int], None] | None" = None,
+    build_p1_messages: "Callable[[str, list, int], list[dict]] | None" = None,
+    should_skip_cell: "Callable[[int, int, int], bool] | None" = None,
 ) -> "tuple[dict, dict, str | None]":
-    """Internal implementation of _execute_pass1 that also receives groups_def."""
+    """Internal implementation of _execute_pass1 that also receives groups_def.
+
+    ``groups_def`` is either a single ``list[list[Question]]`` applied to every
+    paper (annotation's fixed question grouping), or a ``dict[paper_id, list[list[Question]]]``
+    for callers whose groups vary per paper (e.g. arbitration, where each paper
+    only has its own disputed questions).
+
+    ``build_p1_messages``, when given, replaces the default ``build_messages(...)``
+    call for constructing the Pass-1 messages — ``(source_text, group, paper_id) -> messages``. ``paper_id`` lets callers whose
+    extra context varies per paper (e.g. arbitration's candidates) look it up without
+    needing a separate closure per paper.
+
+    ``should_skip_cell``, when given, replaces ``store.should_skip_cell`` for the
+    dedup/resume check — ``(run_id, paper_id, version_id) -> bool``. Annotation's
+    default checks the ``answers`` table; arbitration passes a checker over the
+    ``resolutions`` table instead.
+    """
     from .config import ProviderSettings
     from .caching import apply_cache
-    from .annotate.prompt import build_messages
+    from .annotate.prompt import build_messages as _default_build_messages
     from .llm import complete as llm_complete, dummy_complete
 
     _base_complete = dummy_complete if dry_run else llm_complete
@@ -420,6 +438,18 @@ async def _execute_pass1_with_groups(
 
     effective_system = cfg.system_prompt
     batch_p1 = cfg.batch_p1
+    _skip_cell = should_skip_cell if should_skip_cell is not None else store.should_skip_cell
+
+    def _build_messages(source: str, group: list, paper_id: int) -> list[dict]:
+        if build_p1_messages is not None:
+            return build_p1_messages(source, group, paper_id)
+        return _default_build_messages(
+            source,
+            group,
+            text_source=cfg.text_source,
+            system_prompt=effective_system,
+            cache_first=cfg.cache_first,
+        )
 
     # Build pending_cells in-place (unified path — replaces the duplicate blocks
     # that previously existed in the batch_p1 and online branches).
@@ -427,9 +457,10 @@ async def _execute_pass1_with_groups(
     for paper in papers:
         if paper.paper_id not in source_texts:
             continue
-        for group_idx, group in enumerate(groups_def):
+        paper_groups = groups_def.get(paper.paper_id, []) if isinstance(groups_def, dict) else groups_def
+        for group_idx, group in enumerate(paper_groups):
             cells = [(run.run_id, paper.paper_id, q.version_id) for q in group]
-            if all(store.should_skip_cell(*c) for c in cells):
+            if all(_skip_cell(*c) for c in cells):
                 continue
             cid = f"{run.run_id}-{paper.paper_id}-{group_idx}"
             pending_cells[cid] = (paper, group, group_idx)
@@ -449,13 +480,7 @@ async def _execute_pass1_with_groups(
                 p1_requests = []
                 for cid, (paper, group, _) in pending_cells.items():
                     source = source_texts[paper.paper_id]
-                    messages = build_messages(
-                        source,
-                        group,
-                        text_source=cfg.text_source,
-                        system_prompt=effective_system,
-                        cache_first=cfg.cache_first,
-                    )
+                    messages = _build_messages(source, group, paper.paper_id)
                     messages = apply_cache(run.model_provider, messages, cfg.cache, ttl=cfg.cache_ttl)
                     p1_requests.append(build_p1_request(
                         custom_id=cid,
@@ -507,13 +532,7 @@ async def _execute_pass1_with_groups(
 
             async def _run_p1(cid=cid, paper=paper, group=group, source=source):
                 try:
-                    messages = build_messages(
-                        source,
-                        group,
-                        text_source=cfg.text_source,
-                        system_prompt=effective_system,
-                        cache_first=cfg.cache_first,
-                    )
+                    messages = _build_messages(source, group, paper.paper_id)
                     messages = apply_cache(run.model_provider, messages, cfg.cache, ttl=cfg.cache_ttl)
                     p1_kwargs: dict = {"temperature": cfg.temperature}
                     if cfg.reasoning_effort:
@@ -591,6 +610,8 @@ async def _execute_pass1(
     limiter=None,
     on_cell_done: "Callable[[], None] | None" = None,
     on_total_known: "Callable[[int], None] | None" = None,
+    build_p1_messages: "Callable[[str, list, int], list[dict]] | None" = None,
+    should_skip_cell: "Callable[[int, int, int], bool] | None" = None,
 ) -> "tuple[dict, dict, str | None]":
     """Run the Pass-1 phase. Returns ({custom_id: p1_text}, {custom_id: usage_stats}, error_or_None).
 
@@ -599,20 +620,29 @@ async def _execute_pass1(
     Both batch and online sub-modes share this single build path; the caller sees
     the same map regardless of which sub-mode ran.
 
-    ``groups_def`` (keyword-only) is the pre-resolved list of question groups for
-    this run, obtained via ``resolve_groups(cfg, pipeline.questions)``.  Callers
-    resolve it before passing it here.
+    ``groups_def`` (keyword-only) is the pre-resolved question groups for this run:
+    either a single ``list[list[Question]]`` applied to every paper (obtained via
+    ``resolve_groups(cfg, pipeline.questions)``), or a ``dict[paper_id, list[list[Question]]]``
+    when groups vary per paper (e.g. arbitration's per-paper disputed questions).
 
     ``sem`` and ``limiter`` are optional concurrency/rate-limit guards applied to
     the online path only.  When both are None, behavior is unchanged.
 
     ``on_total_known`` is called once after pending_cells is built, with the total count.
     ``on_cell_done`` is called after each cell completes (success or failure).
+
+    ``build_p1_messages``, when given, replaces the default annotation message
+    builder for constructing Pass-1 messages: ``(source_text, group, paper_id) -> messages``.
+
+    ``should_skip_cell``, when given, replaces ``store.should_skip_cell`` for the
+    dedup/resume check: ``(run_id, paper_id, version_id) -> bool``.
     """
     return await _execute_pass1_with_groups(
         run, cfg, papers, source_texts, pending_cells, store, settings, dry_run, groups_def,
         sem=sem, limiter=limiter,
         on_cell_done=on_cell_done, on_total_known=on_total_known,
+        build_p1_messages=build_p1_messages,
+        should_skip_cell=should_skip_cell,
     )
 
 
@@ -639,7 +669,7 @@ async def _execute_pass2(
     """
     from .config import ProviderSettings
     from .annotate.prompt import build_format_messages
-    from .annotate.engine import _RESPONSE_FORMAT
+    from .annotate.parse import _RESPONSE_FORMAT
     from .llm import complete as llm_complete, dummy_complete
 
     _base_complete = dummy_complete if dry_run else llm_complete

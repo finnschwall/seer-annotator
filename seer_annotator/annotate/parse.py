@@ -14,6 +14,45 @@ _VALUE_RE = re.compile(r'"value"\s*:\s*(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+
 
 _PRIMITIVE_MAP = {"true": True, "false": False, "null": None}
 
+# Structured-output JSON schema for Pass-2 (formatting). Shared by annotation and
+# arbitration engines — both restructure free-form Pass-1 text into the same
+# {key, value, cited_text, comment, confidence} shape per question/dispute.
+_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "annotation_results",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "key":        {"type": "string"},
+                            "value":      {"anyOf": [
+                                {"type": "boolean"},
+                                {"type": "number"},
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}},
+                                {"type": "null"},
+                            ]},
+                            "cited_text": {"anyOf": [
+                                {"type": "string"},
+                                {"type": "array", "items": {"type": "string"}},
+                            ]},
+                            "comment":    {"type": "string"},
+                            "confidence": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                        },
+                        "required": ["key", "value", "cited_text", "comment", "confidence"],
+                    },
+                },
+            },
+            "required": ["results"],
+        },
+    },
+}
+
 
 def _parse_raw_value(raw: str) -> object:
     """Convert a regex-captured primitive token to a Python value."""
