@@ -4,7 +4,10 @@ Mirrors orchestrator.py's structure function-for-function, reusing the same
 _execute_pass1/_execute_pass2 engine (batch_runner.py) and Pass-2 machinery
 (annotate.parse/annotate.verify/annotate.engine.reformat_group) — only Pass-1
 message construction (arbitrate.prompt) and the tail payload builder
-(mapping.build_resolution) are arbitration-specific.
+(mapping.build_resolution) are arbitration-specific. This includes the
+--progress-url heartbeat wiring in run_arbitration_pipeline, which mirrors
+run_pipeline's (see orchestrator.py) with one cell == one dispute item instead
+of one paper x question.
 """
 
 from __future__ import annotations
@@ -12,7 +15,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from decimal import Decimal
+from typing import Callable
 
 from rich.console import Console
 from rich.progress import (
@@ -39,6 +44,7 @@ from .config import (
     Settings,
     effective_arbiter_config,
 )
+from .progress import ProgressReporter
 from .rate_limiter import PerProviderRateLimiter
 from .seer_client import SeerClient
 from .store import Store
@@ -137,8 +143,14 @@ def _parse_save_post_tail_resolutions(
     store: Store,
     dispute_by_paper_version: dict[tuple[int, int], DisputeItem],
     fail_fast: bool,
+    on_payload_saved: "Callable[[dict], None] | None" = None,
 ) -> "ExtractionError | None":
-    """Parse/verify/save resolutions from p2_texts. Returns first ExtractionError if any."""
+    """Parse/verify/save resolutions from p2_texts. Returns first ExtractionError if any.
+
+    ``on_payload_saved``, when given, is called once per built payload right after
+    it's persisted — used by the progress heartbeat to track cells_done/cells_error
+    without a separate store query (mirrors _parse_save_post_tail in orchestrator.py).
+    """
     first_extraction_error: ExtractionError | None = None
 
     for cid in p2_texts:
@@ -178,13 +190,15 @@ def _parse_save_post_tail_resolutions(
                 d = dispute_by_paper_version.get((paper.paper_id, q.version_id))
                 if d is None:
                     continue
-                store.save_resolution(
-                    run.run_id, d.dispute_item_id, paper.paper_id, q.version_id,
-                    build_error_resolution(
-                        arbiter_run_id=run.run_id, paper_id=paper.paper_id,
-                        dispute_item_id=d.dispute_item_id, question=q, resolution_detail=str(err),
-                    ),
+                error_payload = build_error_resolution(
+                    arbiter_run_id=run.run_id, paper_id=paper.paper_id,
+                    dispute_item_id=d.dispute_item_id, question=q, resolution_detail=str(err),
                 )
+                store.save_resolution(
+                    run.run_id, d.dispute_item_id, paper.paper_id, q.version_id, error_payload,
+                )
+                if on_payload_saved is not None:
+                    on_payload_saved(error_payload)
             if fail_fast and first_extraction_error is None:
                 first_extraction_error = err
             continue
@@ -240,6 +254,8 @@ def _parse_save_post_tail_resolutions(
                 confidence=result.get("confidence"),
             )
             store.save_resolution(run.run_id, d.dispute_item_id, paper.paper_id, question.version_id, payload, cid)
+            if on_payload_saved is not None:
+                on_payload_saved(payload)
 
     return first_extraction_error
 
@@ -255,6 +271,7 @@ async def run_arbitration_pipeline(
     dispute_item_ids: list[int] | None = None,
     concurrency: int | None = None,
     rpm: float | None = None,
+    progress_url: str | None = None,
 ) -> None:
     from .seer_client import DryRunSeerClient
 
@@ -299,6 +316,7 @@ async def run_arbitration_pipeline(
 
     all_run_errors: list[str] = []
     first_error: list[ExtractionError] = []
+    any_run_failed = False
 
     with progress:
         run_task = progress.add_task("Arbiter runs", total=len(runs))
@@ -306,7 +324,7 @@ async def run_arbitration_pipeline(
         cell_task = progress.add_task("    Cells", total=0, visible=False)
         p2_task = progress.add_task("    Pass 2", total=0, visible=False)
 
-        for run in runs:
+        for run_idx, run in enumerate(runs):
             progress.update(
                 run_task,
                 description=f"Run {run.run_id} [cyan]({run.name})[/cyan]",
@@ -325,6 +343,51 @@ async def run_arbitration_pipeline(
 
             first_error = []
             run_cell_errors = 0
+            run_had_fatal_error = False
+
+            reporter = ProgressReporter(progress_url, pipeline.api_token, run.run_id)
+            # A "cell" for arbitration is one dispute item (one paper x question dispute),
+            # not one paper x question the way annotation's run_pipeline counts it — disputes
+            # are already the flattened per-question unit, so cells_total is simply len(disputes).
+            cells_total = len(disputes)
+            cell_counters = {"done": 0, "error": 0}
+
+            # Multi-run pipelines share this same --progress-url across every run, so the
+            # message is the only signal that tells the poller which run is active.
+            def _progress_message(suffix: str, _idx=run_idx, _run=run) -> str:
+                if len(runs) <= 1:
+                    return suffix
+                return f"run {_idx + 1}/{len(runs)} ({_run.name}): {suffix}"
+
+            # Fire-and-forget per-cell heartbeats, throttled — supplements the guaranteed
+            # start/chunk-boundary/end heartbeats below with something closer to real-time
+            # progress (mirrors orchestrator.run_pipeline's _maybe_heartbeat).
+            _heartbeat_tasks: set = set()
+            _last_heartbeat_ts = [0.0]
+
+            def _maybe_heartbeat(min_interval: float = 1.5) -> None:
+                now = time.monotonic()
+                if now - _last_heartbeat_ts[0] < min_interval:
+                    return
+                _last_heartbeat_ts[0] = now
+                task = asyncio.create_task(reporter.heartbeat(
+                    status="running", cells_total=cells_total,
+                    cells_done=cell_counters["done"], cells_error=cell_counters["error"],
+                    message=_progress_message(f"{cell_counters['done']}/{cells_total} cells done"),
+                ))
+                _heartbeat_tasks.add(task)
+                task.add_done_callback(_heartbeat_tasks.discard)
+
+            def _count_payload(payload: dict, _c=cell_counters) -> None:
+                _c["done"] += 1
+                if payload.get("extraction_status") == "error":
+                    _c["error"] += 1
+                _maybe_heartbeat()
+
+            await reporter.heartbeat(
+                status="running", cells_total=cells_total, cells_done=0, cells_error=0,
+                message=_progress_message("starting"),
+            )
 
             for chunk_i, chunk_papers in enumerate(chunks):
                 progress.update(chunk_task, description=f"  Chunk {chunk_i + 1}/{len(chunks)}")
@@ -354,14 +417,16 @@ async def run_arbitration_pipeline(
                                 q = question_by_key.get(d.question_key)
                                 if q is None:
                                     continue
+                                no_ocr_payload = build_error_resolution(
+                                    arbiter_run_id=run.run_id, paper_id=paper.paper_id,
+                                    dispute_item_id=d.dispute_item_id, question=q,
+                                    resolution_detail="no_ocr",
+                                )
                                 store.save_resolution(
                                     run.run_id, d.dispute_item_id, paper.paper_id, d.version_id,
-                                    build_error_resolution(
-                                        arbiter_run_id=run.run_id, paper_id=paper.paper_id,
-                                        dispute_item_id=d.dispute_item_id, question=q,
-                                        resolution_detail="no_ocr",
-                                    ),
+                                    no_ocr_payload,
                                 )
+                                _count_payload(no_ocr_payload)
                         else:
                             source_texts[paper.paper_id] = source
                     else:
@@ -386,6 +451,11 @@ async def run_arbitration_pipeline(
                     msg = f"Run {run.run_id} ({run.name}): {p1_error}"
                     all_run_errors.append(msg)
                     logger.error("P1 aborted — %s", msg)
+                    # p1_error signals a fatal, run-aborting failure (bad model name/API key,
+                    # etc.) rather than a per-cell parsing issue — mirrors run_pipeline's
+                    # run_had_fatal_error handling so a totally broken run is reported as
+                    # failed instead of silently completing 0/N cells as "succeeded".
+                    run_had_fatal_error = True
                 elif chunk_failed > 0:
                     logger.warning(
                         "Run %d: %d/%d cells failed in chunk %d",
@@ -421,6 +491,7 @@ async def run_arbitration_pipeline(
                     store=store,
                     dispute_by_paper_version=dispute_by_paper_version,
                     fail_fast=cfg.fail_fast,
+                    on_payload_saved=_count_payload,
                 )
                 if err is not None:
                     first_error.append(err)
@@ -439,7 +510,15 @@ async def run_arbitration_pipeline(
 
                 progress.advance(chunk_task)
 
-                if first_error and cfg.fail_fast:
+                await reporter.heartbeat(
+                    status="running",
+                    cells_total=cells_total,
+                    cells_done=cell_counters["done"],
+                    cells_error=cell_counters["error"],
+                    message=_progress_message(f"chunk {chunk_i + 1}/{len(chunks)}"),
+                )
+
+                if (first_error or run_had_fatal_error) and cfg.fail_fast:
                     break
 
             progress.update(chunk_task, visible=False)
@@ -460,7 +539,40 @@ async def run_arbitration_pipeline(
             progress.advance(run_task)
             logger.debug("Arbiter run %d complete", run.run_id)
 
-            if first_error and cfg.fail_fast:
+            run_failed = (bool(first_error) or run_had_fatal_error) and cfg.fail_fast
+            any_run_failed = any_run_failed or run_failed
+            will_continue = (run_idx < len(runs) - 1) and not run_failed
+
+            # Let any still-in-flight per-cell heartbeats land before this run's own
+            # terminal signal, so a late one can never race past it and revert the
+            # job's reported status.
+            if _heartbeat_tasks:
+                await asyncio.gather(*_heartbeat_tasks, return_exceptions=True)
+
+            # Multi-run pipelines share one --progress-url/AnnotationJob across every run
+            # they process: only the LAST run actually processed (either the literal last
+            # one, or the run a fail_fast abort stops on) may report a terminal
+            # "succeeded"/"failed" status. An earlier run finishing successfully must still
+            # report "running", or SEER's poller would think the whole job is done after
+            # run 1 of N and stop watching before the rest even start.
+            if will_continue:
+                await reporter.heartbeat(
+                    status="running",
+                    cells_total=cells_total,
+                    cells_done=cell_counters["done"],
+                    cells_error=cell_counters["error"],
+                    message=_progress_message("done, moving to next run"),
+                )
+            else:
+                await reporter.heartbeat(
+                    status="failed" if run_failed else "succeeded",
+                    cells_total=cells_total,
+                    cells_done=cell_counters["done"],
+                    cells_error=cell_counters["error"],
+                    message=_progress_message("failed" if run_failed else "succeeded"),
+                )
+
+            if run_failed:
                 break
 
     if all_run_errors:
@@ -470,6 +582,8 @@ async def run_arbitration_pipeline(
 
     if first_error:
         raise first_error[0]
+    if any_run_failed:
+        raise RuntimeError("One or more arbiter runs failed — see errors above.")
 
 
 async def arbitration_pass1_pipeline(

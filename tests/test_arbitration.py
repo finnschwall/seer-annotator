@@ -171,6 +171,62 @@ def test_anonymize_raters_hides_rater_key():
     assert "user:3" in attributed_text and "run:10" in attributed_text
 
 
+@pytest.mark.asyncio
+@respx.mock
+async def test_run_arbitration_pipeline_sends_start_and_terminal_heartbeats(pipeline, settings):
+    """Mirrors test_progress.py's test_run_pipeline_sends_start_and_terminal_heartbeats,
+    but for arbitrate's --progress-url wiring (one cell == one dispute item)."""
+    respx.get("https://seer.test/api/papers/42/ocr/").mock(
+        return_value=httpx.Response(200, json={"markdown": "Full text of the paper"})
+    )
+    respx.post("https://seer.test/api/arbiter-runs/21/resolutions/bulk/").mock(
+        return_value=httpx.Response(200, json={"created": 2, "updated": 0, "errors": []})
+    )
+
+    heartbeats = []
+
+    def capture(request):
+        heartbeats.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    respx.post("https://seer.test/api/arbitration-jobs/7/progress/").mock(side_effect=capture)
+
+    store = Store(settings.runtime.store_path)
+    client = SeerClient(pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions)
+
+    await run_arbitration_pipeline(
+        pipeline, settings, store=store, client=client, dry_run=True,
+        progress_url="https://seer.test/api/arbitration-jobs/7/progress/",
+    )
+
+    assert len(heartbeats) >= 2
+    assert heartbeats[0]["status"] == "running"
+    assert heartbeats[0]["cells_done"] == 0
+    assert heartbeats[0]["cells_total"] == 2  # one cell per dispute item, not paper x question
+    assert heartbeats[-1]["status"] == "succeeded"
+    assert heartbeats[-1]["cells_done"] == 2
+    assert heartbeats[-1]["cells_error"] == 0
+
+
+@pytest.mark.asyncio
+async def test_run_arbitration_pipeline_without_progress_url_makes_no_heartbeat_calls(pipeline, settings):
+    """progress_url=None (the default) must not attempt any HTTP calls for heartbeats."""
+    store = Store(settings.runtime.store_path)
+
+    class NoHeartbeatClient(SeerClient):
+        async def post_resolutions_bulk(self, resolutions):
+            return None
+
+    client = NoHeartbeatClient(pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions)
+
+    for run in pipeline.runs:
+        run.config.text_source = "candidates_only"
+
+    # No respx.mock active at all — any stray HTTP call (including a heartbeat)
+    # would raise since httpx has no transport configured for this host in tests.
+    await run_arbitration_pipeline(pipeline, settings, store=store, client=client, dry_run=True)
+
+
 def test_candidates_only_omits_paper_text():
     from seer_annotator.config import Candidate, Question
 

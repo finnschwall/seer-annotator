@@ -606,6 +606,18 @@ def _load_dispute_pipeline(pipeline_json: str) -> DisputePipelineConfig:
 @click.option("--chunk-papers", default=None, type=int, help="Override chunk_papers for all runs")
 @click.option("--concurrency", default=None, type=int, help="Override max concurrency")
 @click.option("--rpm", default=None, type=float, help="Override requests-per-minute limit")
+@click.option(
+    "--progress-url", default=None,
+    help="POST heartbeats here (run start / after each chunk / on completion) — used by SEER-orchestrated runs",
+)
+@click.option("--log-file", "log_file", default="seer-annotate.log", help="Path to write the run log to")
+@click.option(
+    "--reset-runs", default=None,
+    help="Comma-separated arbiter run IDs whose cached resolutions should be cleared from the local "
+    "store before running, forcing fresh re-adjudication instead of skipping disputes the resume "
+    "cache already thinks are done/posted. Other arbiter run IDs sharing the same store are left "
+    "untouched.",
+)
 def arbitrate(
     pipeline_json: str,
     settings_path: str | None,
@@ -615,9 +627,13 @@ def arbitrate(
     chunk_papers: int | None,
     concurrency: int | None,
     rpm: float | None,
+    progress_url: str | None,
+    log_file: str,
+    reset_runs: str | None,
 ) -> None:
     """Adjudicate disputes for DISPUTE_PIPELINE_JSON (Pass-1 + Pass-2 + post, chunked)."""
     from .arbitrate_orchestrator import run_arbitration_pipeline
+    from .progress import ProgressReporter
 
     pipeline = _load_dispute_pipeline(pipeline_json)
     settings = Settings.load(settings_path)
@@ -625,9 +641,22 @@ def arbitrate(
     run_ids = [int(x) for x in runs.split(",")] if runs else None
     dispute_item_ids = [int(x) for x in disputes.split(",")] if disputes else None
 
+    if reset_runs:
+        reset_ids = [int(x) for x in reset_runs.split(",")]
+        Store(settings.runtime.store_path).reset_arbiter_runs(reset_ids)
+        console.print(f"[yellow]Cleared cached resolutions for arbiter run(s) {reset_ids}[/]")
+
     if chunk_papers is not None:
         for r in pipeline.runs:
             r.config.chunk_papers = chunk_papers
+
+    log_path = pathlib.Path(log_file)
+    root = logging.getLogger()
+    root.handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+    fh = logging.FileHandler(log_path, mode="w")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(fh)
+    console.print(f"[dim]Logging to {log_path}[/]")
 
     if dry_run:
         console.print("[yellow]Dry-run mode — LLM calls use dummy provider, posts are printed[/]")
@@ -642,11 +671,20 @@ def arbitrate(
                 dispute_item_ids=dispute_item_ids,
                 concurrency=concurrency,
                 rpm=rpm,
+                progress_url=progress_url,
             )
         )
     except Exception as exc:
         logging.getLogger(__name__).exception("Arbitration pipeline failed")
         console.print(f"\n[bold red]Error:[/] {exc}")
+        console.print(f"[dim]Full traceback written to {log_path}[/]")
+        if progress_url and pipeline.runs:
+            reporter = ProgressReporter(progress_url, pipeline.api_token, pipeline.runs[0].run_id)
+            asyncio.run(
+                reporter.heartbeat(
+                    status="failed", cells_total=0, cells_done=0, cells_error=0, message=str(exc),
+                )
+            )
         sys.exit(1)
     console.print("[green]Done.[/]")
 

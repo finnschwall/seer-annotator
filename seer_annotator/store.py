@@ -327,6 +327,19 @@ class Store:
                 [(_now(), arbiter_run_id, did) for did in dispute_item_ids],
             )
 
+    def reset_arbiter_runs(self, arbiter_run_ids: list[int]) -> None:
+        """Delete all cached resolution rows for these arbiter run ids, forcing fresh
+        re-adjudication on the next run without disturbing other runs' cached state in
+        a shared store. Mirrors reset_runs above, but targets the resolutions table
+        (keyed by arbiter_run_id) since reset_runs is hardcoded to the answers table."""
+        if not arbiter_run_ids:
+            return
+        with self._tx() as con:
+            placeholders = ",".join("?" * len(arbiter_run_ids))
+            con.execute(
+                f"DELETE FROM resolutions WHERE arbiter_run_id IN ({placeholders})", arbiter_run_ids
+            )
+
     def get_unposted_resolutions(self, arbiter_run_id: int, paper_id: int) -> list[dict]:
         with self._connect() as con:
             rows = con.execute(

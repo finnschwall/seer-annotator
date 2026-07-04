@@ -535,10 +535,11 @@ Resolutions POST to `arbiter-runs/{run_id}/resolutions/bulk/`, identified by `di
 
 ## Progress / heartbeat contract
 
-When SEER launches `seer-annotate run` as a background subprocess (SEER-orchestrated mode), it passes `--progress-url` and `--log-file`, and expects heartbeat POSTs so the run-detail page can show live progress. This section is the authoritative reference for that contract.
+When SEER launches `seer-annotate run` or `seer-annotate arbitrate` as a background subprocess (SEER-orchestrated mode), it passes `--progress-url` and `--log-file`, and expects heartbeat POSTs so the run-detail page can show live progress. This section is the authoritative reference for that contract, which both commands implement identically.
 
 ```bash
 seer-annotate run pipeline.json --progress-url https://seer.example.org/api/v1/annotation-jobs/10/progress/ --log-file /var/log/job-10.log
+seer-annotate arbitrate dispute_pipeline.json --progress-url https://seer.example.org/api/v1/arbitration-jobs/7/progress/ --log-file /var/log/arb-7.log
 ```
 
 Manual/pull-mode users (running `seer-annotate` themselves against a downloaded pipeline JSON) can ignore both flags entirely — they default to no heartbeats and a local `seer-annotate.log`.
@@ -558,14 +559,16 @@ Heartbeats are POSTed with `Authorization: Token <api_token>` (the pipeline JSON
 
 | Field | Type | Notes |
 |---|---|---|
-| `run_id` | int | The `ExperimentRun` this run belongs to (`runs[0].run_id` in the pipeline JSON). |
+| `run_id` | int | The `ExperimentRun` (or, for `arbitrate`, the arbiter `ExperimentRun`) this run belongs to (`runs[0].run_id` in the pipeline JSON). |
 | `status` | string | `running` \| `succeeded` \| `failed`. |
-| `cells_total` | int | `len(papers) × len(questions)` for the run's filtered scope, computed once at run start. |
-| `cells_done` | int | Cumulative count of built answer payloads (including error payloads) across all chunks so far. |
+| `cells_total` | int | For `run`: `len(papers) × len(questions)` for the run's filtered scope. For `arbitrate`: `len(disputes)` (one cell = one dispute item, not paper×question). Computed once at run start. |
+| `cells_done` | int | Cumulative count of built answer/resolution payloads (including error payloads) across all chunks so far. |
 | `cells_error` | int | Cumulative count of those payloads with `extraction_status == "error"`. |
 | `message` | string, optional | Human-readable progress line (e.g. `"starting"`, `"chunk 2/8"`). Empty/absent never clobbers a previously-set message server-side. |
 
-A broken or unreachable `--progress-url` is logged and otherwise ignored — it never fails the underlying annotation run.
+A broken or unreachable `--progress-url` is logged and otherwise ignored — it never fails the underlying annotation/arbitration run.
+
+`--reset-runs` also exists for both commands: for `run` it clears cached answers (`Store.reset_runs`), for `arbitrate` it clears cached resolutions (`Store.reset_arbiter_runs`) — the two are separate tables so a run ID reset for one command never touches the other's cache.
 
 ---
 
