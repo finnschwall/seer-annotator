@@ -33,11 +33,30 @@ class ProgressReporter:
         cells_done: int,
         cells_error: int,
         message: str = "",
+        chunk_index: int | None = None,
+        chunk_total: int | None = None,
+        phase: str | None = None,
+        phase_done: int | None = None,
+        phase_total: int | None = None,
     ) -> None:
         """POST a heartbeat. No-ops when no progress_url was configured.
 
         Best-effort: logs and swallows any failure rather than raising, since a
         broken progress callback must never abort the underlying run.
+
+        ``chunk_index``/``chunk_total``/``phase``/``phase_done``/``phase_total``
+        are optional fields that convey which chunk and which pass
+        (``"pass1"``/``"pass2"``) is currently in flight, and progress within
+        it. Guaranteed heartbeats (run start, chunk boundary, terminal) leave
+        these ``None`` — that signals "no phase in flight right now" rather
+        than "unknown," so the server can tell the difference between a
+        mid-chunk update and one that should leave prior phase state alone
+        (SEER's progress endpoint clears phase fields only on terminal status).
+        A ``None`` here is omitted from the POSTed JSON entirely rather than
+        sent as a literal ``null`` — the receiver treats "key absent" as
+        "no update," but treats a present ``null`` the same as any other
+        value, so sending an explicit ``null`` would clobber the last known
+        phase/chunk state instead of leaving it alone.
         """
         if not self._url:
             return
@@ -50,6 +69,21 @@ class ProgressReporter:
             "cells_error": cells_error,
             "message": message,
         }
+        # Omit rather than null these out when not in flight — the receiver
+        # distinguishes "no update to this dimension" (key absent) from an
+        # explicit clear, and treats a present `null` the same as any other
+        # value. Sending `null` here would actively clobber the last known
+        # phase/chunk state on every guaranteed heartbeat instead of leaving
+        # it alone as intended.
+        for key, value in (
+            ("chunk_index", chunk_index),
+            ("chunk_total", chunk_total),
+            ("phase", phase),
+            ("phase_done", phase_done),
+            ("phase_total", phase_total),
+        ):
+            if value is not None:
+                payload[key] = value
         try:
             async with httpx.AsyncClient(headers=self._headers, timeout=10) as client:
                 resp = await client.post(self._url, json=payload)

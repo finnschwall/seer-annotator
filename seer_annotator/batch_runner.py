@@ -30,6 +30,40 @@ from rich.status import Status
 logger = logging.getLogger(__name__)
 _console = Console()
 
+
+def _format_llm_error(exc: BaseException) -> str:
+    """Render an LLM-call exception with everything LiteLLM/httpx tucked away on it.
+
+    LiteLLM's mapped exceptions (APIError, RateLimitError, ...) often carry an
+    empty ``str(exc)`` — the useful detail lives in ``litellm_debug_info``, the
+    wrapped HTTP response body, or ``__cause__`` instead. Without pulling those
+    out, the log line just says e.g. "APIError: litellm.APIError: AzureException
+    APIError - " with nothing after the dash.
+    """
+    parts = [f"{type(exc).__name__}: {exc}"]
+
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        parts.append(f"status_code={status_code}")
+
+    debug_info = getattr(exc, "litellm_debug_info", None)
+    if debug_info:
+        parts.append(f"debug_info={debug_info}")
+
+    response = getattr(exc, "response", None)
+    body = getattr(exc, "body", None)
+    for label, obj in (("response", response), ("body", body)):
+        if obj is None:
+            continue
+        text = getattr(obj, "text", None)
+        parts.append(f"{label}={text if text is not None else obj}")
+
+    cause = exc.__cause__
+    if cause is not None and str(cause):
+        parts.append(f"caused by {type(cause).__name__}: {cause}")
+
+    return " | ".join(parts)
+
 _DEFAULT_MAX_TOKENS_P1 = 4096
 _DEFAULT_MAX_TOKENS_P2 = 1024
 _POLL_START = 10    # seconds
@@ -573,10 +607,10 @@ async def _execute_pass1_with_groups(
             try:
                 first = await p1_tasks[0]
             except Exception as exc:
-                logger.error("P1 online error on first call — aborting: %s: %s", type(exc).__name__, exc)
+                logger.error("P1 online error on first call — aborting: %s", _format_llm_error(exc), exc_info=True)
                 for coro in p1_tasks[1:]:
                     coro.close()
-                return {}, {}, f"{type(exc).__name__}: {exc}"
+                return {}, {}, _format_llm_error(exc)
             cid, text, usage = first
             p1_texts[cid] = text
             p1_usage[cid] = usage
@@ -586,7 +620,7 @@ async def _execute_pass1_with_groups(
             results_list = await asyncio.gather(*p1_tasks, return_exceptions=True)
             for item in results_list:
                 if isinstance(item, Exception):
-                    logger.error("P1 online error: %s: %s", type(item).__name__, item)
+                    logger.error("P1 online error: %s", _format_llm_error(item))
                 else:
                     cid, text, usage = item
                     p1_texts[cid] = text
@@ -776,10 +810,10 @@ async def _execute_pass2(
                         p2_results.append(await p2_tasks[0])
                     except Exception as exc:
                         _console.print(
-                            f"[bold red]LLM call failed[/] — {type(exc).__name__}: {exc}\n"
+                            f"[bold red]LLM call failed[/] — {_format_llm_error(exc)}\n"
                             "[dim]Aborting remaining P2 calls.[/]"
                         )
-                        logger.error("P2 online error on first call — aborting: %s: %s", type(exc).__name__, exc)
+                        logger.error("P2 online error on first call — aborting: %s", _format_llm_error(exc), exc_info=True)
                         for coro in p2_tasks[1:]:
                             coro.close()
                         return {}, {}
@@ -793,8 +827,8 @@ async def _execute_pass2(
 
             for item in p2_results:
                 if isinstance(item, Exception):
-                    logger.error("P2 online error: %s: %s", type(item).__name__, item)
-                    _console.print(f"[yellow]P2 error (skipping cell):[/] {type(item).__name__}: {item}")
+                    logger.error("P2 online error: %s", _format_llm_error(item))
+                    _console.print(f"[yellow]P2 error (skipping cell):[/] {_format_llm_error(item)}")
                 else:
                     cid, text, usage = item
                     p2_texts[cid] = text

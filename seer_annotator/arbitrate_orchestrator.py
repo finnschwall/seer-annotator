@@ -352,6 +352,11 @@ async def run_arbitration_pipeline(
             cells_total = len(disputes)
             cell_counters = {"done": 0, "error": 0}
 
+            # Tracks progress within whichever pass is currently in flight for the
+            # active chunk (mirrors orchestrator.run_pipeline's phase_state) — reset
+            # per chunk and again at the pass1->pass2 handoff.
+            phase_state = {"phase": None, "done": 0, "total": 0}
+
             # Multi-run pipelines share this same --progress-url across every run, so the
             # message is the only signal that tells the poller which run is active.
             def _progress_message(suffix: str, _idx=run_idx, _run=run) -> str:
@@ -374,6 +379,9 @@ async def run_arbitration_pipeline(
                     status="running", cells_total=cells_total,
                     cells_done=cell_counters["done"], cells_error=cell_counters["error"],
                     message=_progress_message(f"{cell_counters['done']}/{cells_total} cells done"),
+                    chunk_index=chunk_i, chunk_total=len(chunks),
+                    phase=phase_state["phase"], phase_done=phase_state["done"],
+                    phase_total=phase_state["total"],
                 ))
                 _heartbeat_tasks.add(task)
                 task.add_done_callback(_heartbeat_tasks.discard)
@@ -392,12 +400,20 @@ async def run_arbitration_pipeline(
             for chunk_i, chunk_papers in enumerate(chunks):
                 progress.update(chunk_task, description=f"  Chunk {chunk_i + 1}/{len(chunks)}")
                 progress.reset(cell_task, total=None, visible=False)
+                phase_state["phase"] = None
+                phase_state["done"] = 0
+                phase_state["total"] = 0
 
                 def _on_total(n, _t=cell_task):
                     progress.update(_t, total=n, visible=n > 0)
+                    phase_state["phase"] = "pass1"
+                    phase_state["done"] = 0
+                    phase_state["total"] = n
 
                 def _on_cell_done(_t=cell_task):
                     progress.advance(_t)
+                    phase_state["done"] += 1
+                    _maybe_heartbeat()
 
                 source_texts: dict[int, str] = {}
                 for paper in chunk_papers:
@@ -467,9 +483,14 @@ async def run_arbitration_pipeline(
                 def _on_p2_start(n: int, desc: str, _t=p2_task) -> None:
                     progress.reset(_t, total=n, visible=n > 0)
                     progress.update(_t, description=f"    {desc}")
+                    phase_state["phase"] = "pass2"
+                    phase_state["done"] = 0
+                    phase_state["total"] = n
 
                 def _on_p2_advance(_t=p2_task) -> None:
                     progress.advance(_t)
+                    phase_state["done"] += 1
+                    _maybe_heartbeat()
 
                 p2_texts, p2_usage = await _execute_pass2(
                     run, cfg, pending_p1, pending_cells,

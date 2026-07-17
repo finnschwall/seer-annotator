@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Literal, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +54,7 @@ class RunConfig(BaseModel):
     citation_max_error_rate: float = 0.05
     citation_max_ellipsis_gap: int = 600
     text_source: Literal["full_text", "abstract"] = "full_text"
-    batching: BatchingConfig = "per_question"
+    batching: BatchingConfig = "all"
     temperature: float = 0.0
     reasoning_effort: str | None = None
     format_model: str | None = None
@@ -63,7 +63,7 @@ class RunConfig(BaseModel):
     format_structured_output: bool = True
     model_params: dict[str, Any] = Field(default_factory=dict)
     cache: bool = False
-    cache_first: Literal["text", "questions"] = "text"
+    cache_first: Literal["text", "questions"] = "questions"
     cache_ttl: Literal["5m", "1h"] = "1h"
     system_prompt: str | None = None
     chunk_papers: int = 10
@@ -195,6 +195,8 @@ class ProviderSettings(BaseModel):
 
 
 class RuntimeSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     store_path: str = "./.seer_state.db"
     p1_dump_dir: str = "./tmp"
 
@@ -210,6 +212,8 @@ class RunDefaults(BaseModel):
     Hierarchy (least → most specific):
       RunConfig code defaults → settings.toml [run_defaults] → pipeline JSON runs[*].config
     """
+    model_config = ConfigDict(extra="forbid")
+
     concurrency: int | None = None
     per_provider_rpm: float | None = None
     drop_params: bool | None = None
@@ -250,6 +254,8 @@ class ArbiterRunDefaults(BaseModel):
 
     Same three-level hierarchy as RunDefaults/RunConfig, applied to arbitration runs.
     """
+    model_config = ConfigDict(extra="forbid")
+
     concurrency: int | None = None
     per_provider_rpm: float | None = None
     drop_params: bool | None = None

@@ -544,7 +544,7 @@ seer-annotate arbitrate dispute_pipeline.json --progress-url https://seer.exampl
 
 Manual/pull-mode users (running `seer-annotate` themselves against a downloaded pipeline JSON) can ignore both flags entirely — they default to no heartbeats and a local `seer-annotate.log`.
 
-Heartbeats are POSTed with `Authorization: Token <api_token>` (the pipeline JSON's own `api_token`) at three points: run start, after each chunk, and on completion (success or failure). Shape:
+Heartbeats are POSTed with `Authorization: Token <api_token>` (the pipeline JSON's own `api_token`) at three guaranteed points — run start, after each chunk, and on completion (success or failure) — plus additional throttled (min 1.5s apart) heartbeats fired as individual pass-1/pass-2 calls complete within a chunk, so progress isn't frozen until the whole chunk (both passes, every paper) finishes. Shape:
 
 ```json
 {
@@ -553,7 +553,12 @@ Heartbeats are POSTed with `Authorization: Token <api_token>` (the pipeline JSON
   "cells_total": 240,
   "cells_done": 60,
   "cells_error": 1,
-  "message": "chunk 2/8"
+  "message": "chunk 2/8",
+  "chunk_index": 1,
+  "chunk_total": 8,
+  "phase": "pass2",
+  "phase_done": 4,
+  "phase_total": 10
 }
 ```
 
@@ -565,6 +570,15 @@ Heartbeats are POSTed with `Authorization: Token <api_token>` (the pipeline JSON
 | `cells_done` | int | Cumulative count of built answer/resolution payloads (including error payloads) across all chunks so far. |
 | `cells_error` | int | Cumulative count of those payloads with `extraction_status == "error"`. |
 | `message` | string, optional | Human-readable progress line (e.g. `"starting"`, `"chunk 2/8"`). Empty/absent never clobbers a previously-set message server-side. |
+| `chunk_index` | int, optional | 0-based index of the chunk currently being processed. Only present on the throttled per-pass heartbeats described above; **omitted** (key not sent at all) on the three guaranteed heartbeats. |
+| `chunk_total` | int, optional | Total chunks for this run. Same presence rule as `chunk_index`. |
+| `phase` | string, optional | `"pass1"` \| `"pass2"` — which pass is currently in flight for the active chunk. **Omitted** when no phase is in flight (including on the three guaranteed heartbeats). |
+| `phase_done` | int, optional | Cells completed within the current chunk+phase. Resets to 0 at the start of each chunk and again at the pass1→pass2 handoff. |
+| `phase_total` | int, optional | Cells expected within the current chunk+phase. |
+
+The five `chunk_*`/`phase_*` fields are purely additive and optional: an older seer-annotate build that never sends them, or a server that ignores unknown fields, both continue to work — they only add finer-grained detail for a UI that chooses to render it. A receiver must treat a field's *absence* as "no update to this dimension" (i.e. not clobber previously-known chunk/phase state), except that a terminal `succeeded`/`failed` heartbeat should be treated as clearing any in-flight phase display regardless of whether these fields were sent.
+
+**These fields are never sent as an explicit JSON `null`** — when a given heartbeat has no chunk/phase update to report, `seer-annotate` omits the key entirely rather than sending `"phase": null`. This matters because a receiver that keys its "leave unchanged" logic off presence (`"phase" in payload`) rather than truthiness (per the `phase_done=0`/`chunk_index=0` caveat above) cannot otherwise tell "no update" apart from "clear this field" — a literal `null` would read as the latter and wipe the last known progress every time a guaranteed heartbeat lands, which is exactly the bug this contract is designed to avoid. `ProgressReporter.heartbeat` (`seer_annotator/progress.py`) enforces this by construction: any of `chunk_index`/`chunk_total`/`phase`/`phase_done`/`phase_total` passed as `None` is dropped from the outgoing payload rather than serialized as `null`.
 
 A broken or unreachable `--progress-url` is logged and otherwise ignored — it never fails the underlying annotation/arbitration run.
 
