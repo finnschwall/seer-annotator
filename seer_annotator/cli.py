@@ -88,7 +88,11 @@ def run(
     log_path = pathlib.Path(log_file)
     root = logging.getLogger()
     root.handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
-    fh = logging.FileHandler(log_path, mode="w")
+    # Append, not truncate: batch_p1/batch_p2 runs now resume via a SEPARATE CLI
+    # invocation per poll (single-shot BatchPendingError model — see
+    # batch_runner.py's submit_and_poll), so mode="w" would wipe the log from the
+    # original submission on every resume attempt.
+    fh = logging.FileHandler(log_path, mode="a")
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root.addHandler(fh)
     console.print(f"[dim]Logging to {log_path}[/]")
@@ -653,7 +657,11 @@ def arbitrate(
     log_path = pathlib.Path(log_file)
     root = logging.getLogger()
     root.handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
-    fh = logging.FileHandler(log_path, mode="w")
+    # Append, not truncate: batch_p1/batch_p2 runs now resume via a SEPARATE CLI
+    # invocation per poll (single-shot BatchPendingError model — see
+    # batch_runner.py's submit_and_poll), so mode="w" would wipe the log from the
+    # original submission on every resume attempt.
+    fh = logging.FileHandler(log_path, mode="a")
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root.addHandler(fh)
     console.print(f"[dim]Logging to {log_path}[/]")

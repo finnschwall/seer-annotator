@@ -9,10 +9,10 @@ Each pass is independently toggleable via batch_p1 / batch_p2 in settings.toml [
 from __future__ import annotations
 
 import asyncio
+import copy
 import io
 import json
 import logging
-import time
 from decimal import Decimal
 from typing import Callable, Protocol, runtime_checkable
 
@@ -25,7 +25,6 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from rich.status import Status
 
 logger = logging.getLogger(__name__)
 _console = Console()
@@ -66,8 +65,79 @@ def _format_llm_error(exc: BaseException) -> str:
 
 _DEFAULT_MAX_TOKENS_P1 = 4096
 _DEFAULT_MAX_TOKENS_P2 = 1024
-_POLL_START = 10    # seconds
-_POLL_CAP = 120     # seconds
+
+
+class BatchPendingError(Exception):
+    """Raised when a submitted batch has been polled once and is not yet terminal.
+
+    Batch mode is observable-by-design: submission and polling are decoupled so a
+    single poll check never blocks a worker for the up-to-24h a provider batch SLA
+    allows. Whoever drives the pipeline (e.g. ``experiments/llm_runner.py`` on the
+    SEER side) is expected to catch this, persist/update an observable record keyed
+    on ``batch_id``, and re-invoke the pipeline later (e.g. from a
+    ``poll_llm_batches`` scheduled command) — thanks to the kv-based resumability in
+    ``submit_and_poll`` (``store.get_batch_id``/``save_batch_id``), re-entering the
+    pipeline from scratch re-submits nothing and simply polls once more.
+    """
+
+    def __init__(
+        self,
+        batch_id: str,
+        label: str,
+        status: str,
+        *,
+        pass_name: str | None = None,
+        request_count: int | None = None,
+    ) -> None:
+        self.batch_id = batch_id
+        self.label = label
+        self.status = status
+        self.pass_name = pass_name
+        self.request_count = request_count
+        super().__init__(f"Batch {batch_id} ({label}) not yet done: status={status}")
+
+
+# ---------------------------------------------------------------------------
+# Batch cost calculation
+# ---------------------------------------------------------------------------
+#
+# Batch collectors only ever get token counts back from the provider — the
+# Anthropic/OpenAI batch APIs don't return a dollar cost the way a sync
+# completion response's usage block can be fed straight into
+# litellm.completion_cost() (see llm.py). This mirrors that sync-path
+# calculation but works from a plain {model, usage} dict instead of a real
+# response object, and forces litellm's batch-discounted pricing branch via
+# call_type="retrieve_batch" (batch APIs are typically ~50% off standard
+# per-token pricing).
+
+def _batch_item_cost(provider: str, model: str, usage: dict) -> Decimal | None:
+    """Compute one collected batch item's cost from its token counts, or None."""
+    import litellm
+
+    litellm_usage = {
+        "prompt_tokens": usage.get("input_tokens", 0),
+        "completion_tokens": usage.get("output_tokens", 0),
+        "cache_creation_input_tokens": usage.get("cache_write_tokens", 0),
+        "cache_read_input_tokens": usage.get("cache_read_tokens", 0),
+    }
+    try:
+        cost_float = litellm.completion_cost(
+            completion_response={"model": f"{provider}/{model}", "usage": litellm_usage},
+            call_type="retrieve_batch",
+        )
+    except Exception:
+        return None
+    if cost_float is None:
+        return None
+    return Decimal(str(cost_float))
+
+
+def _add_batch_costs(usage_by_cid: dict[str, dict], provider: str, model: str) -> None:
+    """Add a "cost" key to each usage dict in place, best-effort."""
+    for usage in usage_by_cid.values():
+        cost = _batch_item_cost(provider, model, usage)
+        if cost is not None:
+            usage["cost"] = cost
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +148,14 @@ _POLL_CAP = 120     # seconds
 class BatchProvider(Protocol):
     def submit(self, requests: list[dict]) -> str: ...
     def poll(self, batch_id: str) -> str: ...  # "running" | "done" | "failed"
-    def collect(self, batch_id: str) -> tuple[dict[str, str], dict[str, dict]]:
-        """Return ({cid: text}, {cid: usage_stats})."""
+    def collect(self, batch_id: str) -> tuple[dict[str, str], dict[str, dict], dict[str, str]]:
+        """Return ({cid: text}, {cid: usage_stats}, {cid: error_detail}).
+
+        ``error_detail`` is populated only for custom_ids that did NOT succeed
+        (canceled/errored/expired items) — such cids are intentionally absent from
+        the first two dicts so callers can't mistake a failure for an empty-string
+        success.
+        """
         ...
 
 
@@ -102,17 +178,59 @@ class AnthropicBatchProvider:
             raise
         return batch.id
 
+    def prewarm(self, params: dict) -> None:
+        """Send a ``max_tokens=0`` cache pre-warm request as a plain synchronous call.
+
+        This deliberately bypasses submit()/poll()/collect() — i.e. the Message
+        Batches API — entirely. Anthropic's documented pre-warming pattern
+        (https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pre-warming-the-cache)
+        requires ``max_tokens: 0`` so the API reads the prefix, writes the cache,
+        and returns immediately without generating output. But the same docs list
+        Message Batches as one of the contexts where ``max_tokens: 0`` is
+        *rejected* (alongside streaming, extended thinking, structured outputs,
+        and forced tool_choice) — a batch item still needs ``max_tokens >= 1``
+        like any other request.
+
+        Concretely: submitting a pre-warm item through ``submit()`` gets the
+        batch accepted, but that one item comes back from ``collect()`` as
+        ``result.type == "errored"`` with ``invalid_request_error: max_tokens:
+        must be greater than or equal to 1`` — silently defeating the pre-warm
+        (its result is discarded either way, so nothing crashes, but the cache
+        is never actually warmed). Only a direct, non-batch ``messages.create()``
+        call — what this method does — accepts ``max_tokens: 0``.
+
+        Best-effort: failures are logged and swallowed rather than raised, since
+        a failed pre-warm just means the main batch proceeds without a warm
+        cache (see the caller in ``_execute_pass1_with_groups``), not a reason
+        to abort the run.
+        """
+        try:
+            self._client.messages.create(**params)
+        except Exception as exc:
+            logger.warning(
+                "Anthropic cache pre-warm request failed (continuing without a "
+                "warm cache): %s",
+                _format_llm_error(exc),
+            )
+
     def poll(self, batch_id: str) -> str:
         batch = self._client.beta.messages.batches.retrieve(batch_id)
+        # processing_status is one of "in_progress" | "canceling" | "ended" (see
+        # anthropic.types.beta.messages.beta_message_batch.BetaMessageBatch). Only
+        # "ended" is terminal — "canceling" means a cancellation was requested but
+        # in-flight requests may still complete, so the batch is NOT done yet.
+        # There is no batch-level "failed" status at all: once "ended", per-item
+        # outcomes (succeeded/errored/canceled/expired) are read in collect(), not
+        # here — request_counts.canceled/.errored > 0 on an "ended" batch is normal,
+        # not a reason to treat the batch itself as failed.
         if batch.processing_status == "ended":
             return "done"
-        if batch.processing_status == "canceling":
-            return "failed"
         return "running"
 
-    def collect(self, batch_id: str) -> tuple[dict[str, str], dict[str, dict]]:
+    def collect(self, batch_id: str) -> tuple[dict[str, str], dict[str, dict], dict[str, str]]:
         results: dict[str, str] = {}
         usage_by_cid: dict[str, dict] = {}
+        errors_by_cid: dict[str, str] = {}
         total_input = 0
         total_output = 0
         cache_create = 0
@@ -146,8 +264,21 @@ class AnthropicBatchProvider:
                         "cache_read_tokens": cr,
                     }
             else:
-                logger.warning("Batch item %s: result type=%s", cid, item.result.type)
-                results[cid] = ""
+                # Non-succeeded item.result.type is one of "errored" | "canceled" |
+                # "expired" (see beta_message_batch_result.py). Do NOT write an
+                # empty-string sentinel into `results` — that would look like a
+                # succeeded-but-empty response to callers. Surface the real detail
+                # instead so it can be posted as a proper error answer/resolution.
+                if item.result.type == "errored":
+                    err_resp = getattr(item.result, "error", None)
+                    beta_error = getattr(err_resp, "error", None)
+                    err_type = getattr(beta_error, "type", None)
+                    err_msg = getattr(beta_error, "message", None)
+                    detail = f"{err_type}: {err_msg}" if err_msg else (str(err_resp) if err_resp else "batch item errored")
+                else:
+                    detail = f"batch item {item.result.type}"
+                errors_by_cid[cid] = detail
+                logger.warning("Batch item %s: result type=%s — %s", cid, item.result.type, detail)
                 n_failed += 1
 
         cache_total = cache_create + cache_read
@@ -160,7 +291,7 @@ class AnthropicBatchProvider:
             cache_create, cache_read,
             100.0 * cache_read / max(cache_total, 1),
         )
-        return results, usage_by_cid
+        return results, usage_by_cid, errors_by_cid
 
 
 # ---------------------------------------------------------------------------
@@ -198,40 +329,80 @@ class OpenAIBatchProvider:
 
     def poll(self, batch_id: str) -> str:
         batch = self._client.batches.retrieve(batch_id)
-        if batch.status in ("completed", "finalizing"):
+        # status is one of "validating" | "failed" | "in_progress" | "finalizing" |
+        # "completed" | "expired" | "cancelling" | "cancelled" (see
+        # openai.types.batch.Batch — note both "cancelling"/"cancelled" are spelled
+        # with a double "l"). Only "completed" means results are ready: "finalizing"
+        # is still writing the output file (output_file_id may not be populated
+        # yet — treating it as done risked collect() reading an empty/missing
+        # file), and "cancelling" is in-flight cancellation, not yet terminal.
+        if batch.status == "completed":
             return "done"
-        if batch.status in ("failed", "expired", "cancelled", "cancelling"):
+        if batch.status in ("failed", "expired", "cancelled"):
             return "failed"
         return "running"
 
-    def collect(self, batch_id: str) -> tuple[dict[str, str], dict[str, dict]]:
+    def collect(self, batch_id: str) -> tuple[dict[str, str], dict[str, dict], dict[str, str]]:
         batch = self._client.batches.retrieve(batch_id)
-        output_file_id = batch.output_file_id
-        if not output_file_id:
-            logger.error("Batch %s has no output_file_id", batch_id)
-            return {}, {}
-        raw = self._client.files.content(output_file_id).read().decode()
         results: dict[str, str] = {}
         usage_by_cid: dict[str, dict] = {}
-        for line in raw.splitlines():
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-                cid = obj["custom_id"]
-                text = obj["response"]["body"]["choices"][0]["message"]["content"] or ""
-                results[cid] = text
-                u = obj.get("response", {}).get("body", {}).get("usage", {})
-                if u:
-                    usage_by_cid[cid] = {
-                        "input_tokens": u.get("prompt_tokens", 0) or 0,
-                        "output_tokens": u.get("completion_tokens", 0) or 0,
-                        "cache_write_tokens": 0,
-                        "cache_read_tokens": (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0,
-                    }
-            except (KeyError, IndexError, json.JSONDecodeError) as exc:
-                logger.warning("Could not parse batch output line: %s", exc)
-        return results, usage_by_cid
+        errors_by_cid: dict[str, str] = {}
+
+        output_file_id = batch.output_file_id
+        if output_file_id:
+            raw = self._client.files.content(output_file_id).read().decode()
+            for line in raw.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                    cid = obj["custom_id"]
+                    text = obj["response"]["body"]["choices"][0]["message"]["content"] or ""
+                    results[cid] = text
+                    u = obj.get("response", {}).get("body", {}).get("usage", {})
+                    if u:
+                        usage_by_cid[cid] = {
+                            "input_tokens": u.get("prompt_tokens", 0) or 0,
+                            "output_tokens": u.get("completion_tokens", 0) or 0,
+                            "cache_write_tokens": 0,
+                            "cache_read_tokens": (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0,
+                        }
+                except (KeyError, IndexError, json.JSONDecodeError) as exc:
+                    logger.warning("Could not parse batch output line: %s", exc)
+        else:
+            logger.info("Batch %s has no output_file_id (no successful requests?)", batch_id)
+
+        # Per-request failures land in a SEPARATE file (error_file_id), same JSONL
+        # shape as the output file but with an "error" object instead of "response"
+        # (roughly {"custom_id", "response": null, "error": {"code", "message"}}).
+        # Previously unread entirely — a request that failed and landed only here
+        # never appeared in `results` OR anywhere else the caller iterates, so it
+        # sat "pending forever" from the caller's point of view.
+        error_file_id = getattr(batch, "error_file_id", None)
+        if error_file_id:
+            raw_err = self._client.files.content(error_file_id).read().decode()
+            for line in raw_err.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                    cid = obj["custom_id"]
+                except (KeyError, json.JSONDecodeError) as exc:
+                    logger.warning("Could not parse batch error-file line: %s", exc)
+                    continue
+                err = obj.get("error") or {}
+                resp = obj.get("response") or {}
+                resp_body_error = ((resp.get("body") or {}).get("error") or {}) if resp else {}
+                message = err.get("message") or resp_body_error.get("message")
+                code = err.get("code") or resp_body_error.get("code")
+                detail = f"{code}: {message}" if message else f"batch item error (custom_id={cid})"
+                errors_by_cid[cid] = detail
+                logger.warning("Batch item %s errored: %s", cid, detail)
+
+        if not output_file_id and not error_file_id:
+            logger.error("Batch %s has neither output_file_id nor error_file_id", batch_id)
+
+        return results, usage_by_cid, errors_by_cid
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +446,7 @@ def build_p1_request(
     provider: str,
     model: str,
     messages: list[dict],
-    temperature: float,
+    temperature: float | None,
     model_params: dict,
 ) -> dict:
     p = provider.lower()
@@ -288,9 +459,10 @@ def build_p1_request(
             "model": model,
             "max_tokens": max_tokens,
             "messages": user_messages,
-            "temperature": temperature,
-            **extra,
         }
+        if temperature is not None:
+            params["temperature"] = temperature
+        params.update(extra)
         if system:
             params["system"] = system
         return {"custom_id": custom_id, "params": params}
@@ -299,10 +471,11 @@ def build_p1_request(
     body: dict = {
         "model": model,
         "messages": messages,
-        "temperature": temperature,
         "max_tokens": max_tokens,
-        **extra,
     }
+    if temperature is not None:
+        body["temperature"] = temperature
+    body.update(extra)
     return {"custom_id": custom_id, "method": "POST", "url": "/v1/chat/completions", "body": body}
 
 
@@ -313,6 +486,7 @@ def build_p2_request(
     model: str,
     messages: list[dict],
     model_params: dict,
+    temperature: float | None = None,
     response_format: dict | None = None,
 ) -> dict:
     p = provider.lower()
@@ -326,9 +500,10 @@ def build_p2_request(
             "model": model,
             "max_tokens": max_tokens,
             "messages": user_messages,
-            "temperature": 0.0,
-            **extra,
         }
+        if temperature is not None:
+            params["temperature"] = temperature
+        params.update(extra)
         if system:
             params["system"] = system
         return {"custom_id": custom_id, "params": params}
@@ -336,35 +511,52 @@ def build_p2_request(
     body: dict = {
         "model": model,
         "messages": messages,
-        "temperature": 0.0,
         "max_tokens": max_tokens,
-        **extra,
     }
+    if temperature is not None:
+        body["temperature"] = temperature
+    body.update(extra)
     if response_format is not None:
         body["response_format"] = response_format
     return {"custom_id": custom_id, "method": "POST", "url": "/v1/chat/completions", "body": body}
 
 
 # ---------------------------------------------------------------------------
-# Poll loop
+# Single-shot poll (no loop — see BatchPendingError)
 # ---------------------------------------------------------------------------
 
-async def _poll_until_done(provider: BatchProvider, batch_id: str, label: str = "Batch") -> None:
-    delay = _POLL_START
-    t0 = time.monotonic()
-    short_id = batch_id[:24] + ("…" if len(batch_id) > 24 else "")
-    with Status(f"[bold]{label}[/] {short_id}", console=_console) as spinner:
-        while True:
-            result = provider.poll(batch_id)
-            elapsed = int(time.monotonic() - t0)
-            spinner.update(f"[bold]{label}[/] {short_id} [dim]{result} ({elapsed}s)[/]")
-            logger.info("Batch %s: %s (%ds)", batch_id, result, elapsed)
-            if result == "done":
-                return
-            if result == "failed":
-                raise RuntimeError(f"Batch {batch_id} failed/expired/canceled")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, _POLL_CAP)
+def _poll_once(
+    provider: BatchProvider,
+    batch_id: str,
+    batch_key: str,
+    store,
+    label: str = "Batch",
+    *,
+    pass_name: str | None = None,
+    request_count: int | None = None,
+) -> None:
+    """Check batch status exactly once — no sleep loop.
+
+    A submitted batch may take up to a provider's SLA (typically <=24h) to reach a
+    terminal state; blocking synchronously inside the worker's event loop for that
+    long holds the worker hostage. Instead: check once, and either return (batch
+    done, caller proceeds to collect()), raise RuntimeError (batch failed — kv
+    cleared so it won't be endlessly re-polled), or raise BatchPendingError (still
+    running — kv left in place so the next external call resumes polling the same
+    batch_id, e.g. via a `poll_llm_batches` scheduled command).
+    """
+    result = provider.poll(batch_id)
+    logger.info("Batch %s: %s", batch_id, result)
+    if result == "done":
+        return
+    if result == "failed":
+        # Only cleared on success before this fix — a failed batch's kv entry was
+        # never removed, so it would be re-polled forever on retry.
+        store.delete_batch_id(batch_key)
+        _console.print(f"[bold red]{label}[/] {batch_id} failed/expired/canceled")
+        raise RuntimeError(f"Batch {batch_id} failed/expired/canceled")
+    _console.print(f"[bold]{label}[/] {batch_id} [dim]still {result} — will resume later[/]")
+    raise BatchPendingError(batch_id, label, result, pass_name=pass_name, request_count=request_count)
 
 
 async def submit_and_poll(
@@ -373,10 +565,21 @@ async def submit_and_poll(
     store,
     batch_key: str,
     label: str = "Batch",
-) -> tuple[dict[str, str], dict[str, dict]]:
-    """Submit a batch (or resume an existing one).
+    *,
+    pass_name: str | None = None,
+    provider_name: str | None = None,
+    model: str | None = None,
+) -> tuple[dict[str, str], dict[str, dict], dict[str, str]]:
+    """Submit a batch (or resume an existing one), then poll it exactly once.
 
-    Returns ({custom_id: text}, {custom_id: usage_stats}).
+    Returns ({custom_id: text}, {custom_id: usage_stats}, {custom_id: error_detail}).
+    Raises ``BatchPendingError`` if the batch is submitted but not yet terminal —
+    callers must let this propagate (it is the signal to park the job and resume
+    later) rather than catching it here.
+
+    When ``provider_name``/``model`` are given, each usage dict is annotated
+    with a best-effort "cost" key (see ``_add_batch_costs``); omit them (as the
+    cache pre-warm call does — its result is discarded anyway) to skip this.
     """
     batch_id = store.get_batch_id(batch_key)
     if batch_id:
@@ -388,13 +591,20 @@ async def submit_and_poll(
         _console.print(f"[bold]{label}[/] submitted {len(requests)} request(s) → [dim]{batch_id}[/]")
         logger.info("Submitted batch %s (key=%s, n=%d)", batch_id, batch_key, len(requests))
 
-    await _poll_until_done(provider, batch_id, label=label)
-    results, usage_by_cid = provider.collect(batch_id)
+    _poll_once(
+        provider, batch_id, batch_key, store, label=label,
+        pass_name=pass_name, request_count=len(requests),
+    )
+
+    results, usage_by_cid, errors_by_cid = provider.collect(batch_id)
     store.delete_batch_id(batch_key)
+    if provider_name and model:
+        _add_batch_costs(usage_by_cid, provider_name, model)
     n_ok = len(results)
-    _console.print(f"[bold]{label}[/] [green]✓[/] complete — {n_ok} result(s)")
-    logger.info("Batch %s complete: %d results", batch_id, len(results))
-    return results, usage_by_cid
+    n_err = len(errors_by_cid)
+    _console.print(f"[bold]{label}[/] [green]✓[/] complete — {n_ok} result(s), {n_err} error(s)")
+    logger.info("Batch %s complete: %d results, %d errors", batch_id, n_ok, n_err)
+    return results, usage_by_cid, errors_by_cid
 
 
 # ---------------------------------------------------------------------------
@@ -441,8 +651,15 @@ async def _execute_pass1_with_groups(
     on_total_known: "Callable[[int], None] | None" = None,
     build_p1_messages: "Callable[[str, list, int], list[dict]] | None" = None,
     should_skip_cell: "Callable[[int, int, int], bool] | None" = None,
-) -> "tuple[dict, dict, str | None]":
+) -> "tuple[dict, dict, dict, str | None]":
     """Internal implementation of _execute_pass1 that also receives groups_def.
+
+    Returns ``(p1_texts, p1_usage, p1_errors_by_cid, fatal_error)`` — ``p1_errors_by_cid``
+    is ``{cid: error_detail}`` for cells that failed with an attributable per-item
+    error (batch item errored/canceled/expired, or an online call that raised);
+    such cids are absent from ``p1_texts``. ``fatal_error`` (unchanged from before)
+    signals a whole-run-aborting failure such as a bad model/API key, not a
+    per-cell issue — kept as a separate, rarer signal from ``p1_errors_by_cid``.
 
     ``groups_def`` is either a single ``list[list[Question]]`` applied to every
     paper (annotation's fixed question grouping), or a ``dict[paper_id, list[list[Question]]]``
@@ -459,7 +676,7 @@ async def _execute_pass1_with_groups(
     default checks the ``answers`` table; arbitration passes a checker over the
     ``resolutions`` table instead.
     """
-    from .config import ProviderSettings
+    from .config import DEFAULT_REQUEST_TIMEOUT, ProviderSettings
     from .caching import apply_cache
     from .annotate.prompt import build_messages as _default_build_messages
     from .llm import complete as llm_complete, dummy_complete
@@ -506,16 +723,20 @@ async def _execute_pass1_with_groups(
         # Try loading a saved P1 dump (crash-safe resume without re-billing)
         p1_texts: dict[str, str] = _load_p1_dump(settings.runtime.p1_dump_dir, run.run_id) or {}
         p1_usage: dict[str, dict] = {}  # {cid: usage_stats} — empty when loaded from dump
+        p1_errors: dict[str, str] = {}  # {cid: error_detail} — empty when loaded from dump (no way to know)
 
         if not p1_texts:
             if not pending_cells:
                 logger.info("Run %d: no pending P1 work", run.run_id)
             else:
                 p1_requests = []
+                first_messages: list[dict] | None = None
                 for cid, (paper, group, _) in pending_cells.items():
                     source = source_texts[paper.paper_id]
                     messages = _build_messages(source, group, paper.paper_id)
                     messages = apply_cache(run.model_provider, messages, cfg.cache, ttl=cfg.cache_ttl)
+                    if first_messages is None:
+                        first_messages = messages
                     p1_requests.append(build_p1_request(
                         custom_id=cid,
                         provider=run.model_provider,
@@ -527,39 +748,100 @@ async def _execute_pass1_with_groups(
 
                 provider = make_provider(run.model_provider, p1_api_key, p1_base_url)
 
-                # Cache pre-warm: submit the first request alone so it writes
-                # the shared prefix to the 1h cache before the main batch starts.
-                # All subsequent requests then hit the warm cache instead of racing
-                # to write it in parallel (which caused ~48 writes vs 1 in testing).
-                # Only worthwhile when caching is enabled and there are multiple requests.
-                use_prewarm = cfg.cache and len(p1_requests) > 1
+                # Cache pre-warm: write the shared prefix to the 1h cache before the
+                # main batch starts, so every real request hits a warm cache instead
+                # of racing to write it in parallel (which caused ~48 writes vs 1 in
+                # testing — batch items aren't processed sequentially, so without
+                # this every item in the main batch could race to write the same
+                # cache entry at once). Only useful when there IS a prefix genuinely
+                # shared across every paper's request: `cache_first="questions"`
+                # places the (paper-independent) questions/instructions block first
+                # — the block `caching.py` actually marks with `cache_control` — so
+                # that's what a pre-warm can usefully prime. `cache_first="text"`
+                # marks the paper's own (paper-*specific*) text instead, which a
+                # single once-per-run pre-warm can't help across different papers —
+                # see ISSUE.md for that remaining gap (relevant with per-question/
+                # grouped `batching`, where it could still help *within* one paper).
+                #
+                # Anthropic-only: this is Anthropic's documented explicit
+                # cache_control pre-warm pattern (see AnthropicBatchProvider.prewarm
+                # for the full explanation and why it must NOT go through
+                # submit_and_poll/Message Batches). `apply_cache` is a no-op for
+                # openai/azure (their prefix caching is automatic/server-side), so
+                # building a pre-warm item for those providers would just be a
+                # wasted "warmup" call with nothing to prime.
+                main_key = f"{run.run_id}:p1"
+                use_prewarm = (
+                    cfg.cache
+                    and cfg.cache_first == "questions"
+                    and len(p1_requests) > 1
+                    and run.model_provider.lower() == "anthropic"
+                )
+                if use_prewarm and store.get_batch_id(main_key):
+                    # We're resuming (e.g. via a scheduled poll re-entering this whole
+                    # function after a prior BatchPendingError) and the MAIN batch is
+                    # already submitted/in-flight from that earlier invocation. A cache
+                    # write now couldn't retroactively help requests already queued at
+                    # submission time anyway, so there's nothing useful left to warm —
+                    # skip straight to resuming the main batch below; `store.get_batch_id`
+                    # already has its id, so `submit_and_poll` will just poll/collect it.
+                    use_prewarm = False
                 if use_prewarm:
+                    # A synthetic pre-warm request — NOT a real paper's request — per
+                    # Anthropic's documented cache pre-warming pattern: max_tokens=0,
+                    # a placeholder final (uncached) message, and the same cache_control
+                    # breakpoint a real request would use. The API reads the prefix,
+                    # writes the cache, and returns immediately with empty content and
+                    # no generated output — there is no real answer to lose here, unlike
+                    # the previous design (which spent one real paper's own request on
+                    # this and merged whatever came back into the results — fragile
+                    # across a park/resume cycle, since that merge only happened if
+                    # both the pre-warm and the main batch finished within the same
+                    # call: a resumed run skips re-submitting the pre-warm, per above,
+                    # so that real paper's only answer was silently lost. See the
+                    # commit/changelog for the bug this replaced).
+                    assert first_messages is not None  # pending_cells was non-empty
+                    prewarm_messages = copy.deepcopy(first_messages)
+                    prewarm_messages[-1]["content"] = "warmup"
+                    prewarm_request = build_p1_request(
+                        custom_id=f"{run.run_id}-prewarm",
+                        provider=run.model_provider,
+                        model=run.model_name,
+                        messages=prewarm_messages,
+                        temperature=cfg.temperature,
+                        model_params={**cfg.model_params, "max_tokens": 0},
+                    )
                     logger.info(
-                        "Run %d: submitting prewarm request to warm 1h cache before main batch",
+                        "Run %d: sending synchronous max_tokens=0 pre-warm request "
+                        "(outside the batch API — see AnthropicBatchProvider.prewarm) "
+                        "to warm 1h cache before main batch",
                         run.run_id,
                     )
-                    prewarm_texts, prewarm_usage = await submit_and_poll(
-                        provider, p1_requests[:1], store, f"{run.run_id}:p1_prewarm",
-                        label="Cache warm-up",
-                    )
-                    main_texts, main_usage = await submit_and_poll(
-                        provider, p1_requests[1:], store, f"{run.run_id}:p1",
-                        label="Batch P1",
-                    )
-                    p1_texts = {**prewarm_texts, **main_texts}
-                    p1_usage = {**prewarm_usage, **main_usage}
-                else:
-                    p1_texts, p1_usage = await submit_and_poll(
-                        provider, p1_requests, store, f"{run.run_id}:p1",
-                        label="Batch P1",
-                    )
+                    # NOT submit_and_poll: Message Batches rejects max_tokens=0 outright
+                    # (a batch item still needs max_tokens >= 1), so this must be a
+                    # plain synchronous messages.create() call instead — see
+                    # AnthropicBatchProvider.prewarm's docstring for the full story,
+                    # including the "max_tokens: must be greater than or equal to 1"
+                    # error this replaces. Nothing from the response is ever used —
+                    # it's a cache side effect only — so prewarm() itself discards
+                    # the result; nothing here is merged into p1_texts/p1_usage/p1_errors.
+                    assert isinstance(provider, AnthropicBatchProvider)
+                    provider.prewarm(prewarm_request["params"])
+
+                p1_texts, p1_usage, p1_errors = await submit_and_poll(
+                    provider, p1_requests, store, main_key,
+                    label="Batch P1", pass_name="p1",
+                    provider_name=run.model_provider, model=run.model_name,
+                )
 
                 _save_p1_dump(settings.runtime.p1_dump_dir, run.run_id, p1_texts)
     else:
         # P1 online: gather all papers concurrently
         p1_texts = {}
         p1_usage = {}
+        p1_errors = {}
         p1_tasks = []
+        p1_task_cids: list[str] = []
 
         for cid, (paper, group, group_idx) in pending_cells.items():
             source = source_texts[paper.paper_id]
@@ -568,7 +850,11 @@ async def _execute_pass1_with_groups(
                 try:
                     messages = _build_messages(source, group, paper.paper_id)
                     messages = apply_cache(run.model_provider, messages, cfg.cache, ttl=cfg.cache_ttl)
-                    p1_kwargs: dict = {"temperature": cfg.temperature}
+                    p1_kwargs: dict = {
+                        "timeout": cfg.request_timeout or DEFAULT_REQUEST_TIMEOUT,
+                    }
+                    if cfg.temperature is not None:
+                        p1_kwargs["temperature"] = cfg.temperature
                     if cfg.reasoning_effort:
                         p1_kwargs["reasoning_effort"] = cfg.reasoning_effort
                     p1_kwargs.update(cfg.model_params)
@@ -600,6 +886,7 @@ async def _execute_pass1_with_groups(
                         on_cell_done()
 
             p1_tasks.append(_run_p1())
+            p1_task_cids.append(cid)
 
         # Probe with the first call alone — if it fails immediately, abort before
         # launching hundreds of identical failing requests.
@@ -610,23 +897,26 @@ async def _execute_pass1_with_groups(
                 logger.error("P1 online error on first call — aborting: %s", _format_llm_error(exc), exc_info=True)
                 for coro in p1_tasks[1:]:
                     coro.close()
-                return {}, {}, _format_llm_error(exc)
+                return {}, {}, {}, _format_llm_error(exc)
             cid, text, usage = first
             p1_texts[cid] = text
             p1_usage[cid] = usage
             p1_tasks = p1_tasks[1:]
+            p1_task_cids = p1_task_cids[1:]
 
         if p1_tasks:
             results_list = await asyncio.gather(*p1_tasks, return_exceptions=True)
-            for item in results_list:
+            for task_cid, item in zip(p1_task_cids, results_list):
                 if isinstance(item, Exception):
-                    logger.error("P1 online error: %s", _format_llm_error(item))
+                    err_detail = _format_llm_error(item)
+                    logger.error("P1 online error (cid=%s): %s", task_cid, err_detail)
+                    p1_errors[task_cid] = err_detail
                 else:
                     cid, text, usage = item
                     p1_texts[cid] = text
                     p1_usage[cid] = usage
 
-    return p1_texts, p1_usage, None
+    return p1_texts, p1_usage, p1_errors, None
 
 
 async def _execute_pass1(
@@ -646,8 +936,10 @@ async def _execute_pass1(
     on_total_known: "Callable[[int], None] | None" = None,
     build_p1_messages: "Callable[[str, list, int], list[dict]] | None" = None,
     should_skip_cell: "Callable[[int, int, int], bool] | None" = None,
-) -> "tuple[dict, dict, str | None]":
-    """Run the Pass-1 phase. Returns ({custom_id: p1_text}, {custom_id: usage_stats}, error_or_None).
+) -> "tuple[dict, dict, dict, str | None]":
+    """Run the Pass-1 phase.
+
+    Returns ({custom_id: p1_text}, {custom_id: usage_stats}, {custom_id: error_detail}, fatal_error_or_None).
 
     ``pending_cells`` is mutated in-place: cleared then re-populated with
     ``{cid: (paper, group, group_idx)}`` for every cell that still needs work.
@@ -693,15 +985,23 @@ async def _execute_pass2(
     limiter=None,
     on_p2_start: "Callable[[int, str], None] | None" = None,
     on_p2_advance: "Callable[[], None] | None" = None,
-) -> tuple[dict, dict]:
-    """Run the Pass-2 phase. Returns ({custom_id: p2_text}, {custom_id: usage_stats}).
+) -> tuple[dict, dict, dict]:
+    """Run the Pass-2 phase.
+
+    Returns ({custom_id: p2_text}, {custom_id: usage_stats}, {custom_id: error_detail}).
 
     ``usage_stats`` carries the format-model (Pass-2) usage with keys
     ``input_tokens, output_tokens, cache_read_tokens, cost, latency_ms``.
-    In batch mode, the cost/latency keys may be absent (the batch API does not
-    expose them); callers must read via ``.get(...)`` with sensible defaults.
+    In batch mode, ``cost`` is computed after the fact from token counts (see
+    ``_add_batch_costs``) and may be absent if that computation fails (e.g.
+    unrecognized model); ``latency_ms`` is never available (the batch API does
+    not expose per-item timing). Callers must read both via ``.get(...)`` with
+    sensible defaults.
+
+    ``error_detail`` is populated for cids that failed (batch item error, or an
+    online call that raised); such cids are absent from the first two dicts.
     """
-    from .config import ProviderSettings
+    from .config import DEFAULT_REQUEST_TIMEOUT, ProviderSettings
     from .annotate.prompt import build_format_messages
     from .annotate.parse import _RESPONSE_FORMAT
     from .llm import complete as llm_complete, dummy_complete
@@ -728,22 +1028,26 @@ async def _execute_pass2(
                 model=effective_fmt_model,
                 messages=p2_messages,
                 model_params=cfg.format_model_params,
+                temperature=cfg.format_temperature,
                 response_format=p2_response_format,
             ))
 
         if p2_requests:
             p2_provider = make_provider(effective_fmt_provider, p2_api_key, p2_base_url)
-            p2_texts, p2_usage = await submit_and_poll(
+            p2_texts, p2_usage, p2_errors = await submit_and_poll(
                 p2_provider, p2_requests, store, f"{run.run_id}:p2",
-                label="Batch P2",
+                label="Batch P2", pass_name="p2",
+                provider_name=effective_fmt_provider, model=effective_fmt_model,
             )
         else:
             p2_texts = {}
             p2_usage = {}
+            p2_errors = {}
     else:
         # P2 online — run concurrently
         p2_texts = {}
         p2_usage = {}
+        p2_errors: dict[str, str] = {}
         if pending_p1:
             p2_label = f"Pass 2 ({effective_fmt_model})"
 
@@ -770,7 +1074,11 @@ async def _execute_pass2(
             try:
                 async def _run_p2(cid: str, p1_text: str, paper, group, group_idx: int):
                     p2_messages = build_format_messages(p1_text, group)
-                    p2_kwargs: dict = {"temperature": 0.0}
+                    p2_kwargs: dict = {
+                        "timeout": cfg.request_timeout or DEFAULT_REQUEST_TIMEOUT,
+                    }
+                    if cfg.format_temperature is not None:
+                        p2_kwargs["temperature"] = cfg.format_temperature
                     p2_kwargs.update(cfg.format_model_params)
                     if p2_api_key:
                         p2_kwargs["api_key"] = p2_api_key
@@ -816,7 +1124,7 @@ async def _execute_pass2(
                         logger.error("P2 online error on first call — aborting: %s", _format_llm_error(exc), exc_info=True)
                         for coro in p2_tasks[1:]:
                             coro.close()
-                        return {}, {}
+                        return {}, {}, {}
                     if len(p2_tasks) > 1:
                         p2_results.extend(
                             await asyncio.gather(*p2_tasks[1:], return_exceptions=True)
@@ -825,13 +1133,16 @@ async def _execute_pass2(
                 if _own_progress is not None:
                     _own_progress.stop()
 
-            for item in p2_results:
+            p2_cids = list(pending_p1.keys())
+            for cid, item in zip(p2_cids, p2_results):
                 if isinstance(item, Exception):
-                    logger.error("P2 online error: %s", _format_llm_error(item))
-                    _console.print(f"[yellow]P2 error (skipping cell):[/] {_format_llm_error(item)}")
+                    err_detail = _format_llm_error(item)
+                    logger.error("P2 online error (cid=%s): %s", cid, err_detail)
+                    _console.print(f"[yellow]P2 error (skipping cell):[/] {err_detail}")
+                    p2_errors[cid] = err_detail
                 else:
-                    cid, text, usage = item
-                    p2_texts[cid] = text
-                    p2_usage[cid] = usage
+                    got_cid, text, usage = item
+                    p2_texts[got_cid] = text
+                    p2_usage[got_cid] = usage
 
-    return p2_texts, p2_usage
+    return p2_texts, p2_usage, p2_errors

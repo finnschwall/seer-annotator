@@ -44,7 +44,7 @@ from .config import (
     Settings,
     effective_arbiter_config,
 )
-from .progress import ProgressReporter
+from .progress import ProgressReporter, ProgressReporterProtocol
 from .rate_limiter import PerProviderRateLimiter
 from .seer_client import SeerClient
 from .store import Store
@@ -272,6 +272,8 @@ async def run_arbitration_pipeline(
     concurrency: int | None = None,
     rpm: float | None = None,
     progress_url: str | None = None,
+    reporter_factory: "Callable[[int], ProgressReporterProtocol] | None" = None,
+    should_cancel: "Callable[[], bool] | None" = None,
 ) -> None:
     from .seer_client import DryRunSeerClient
 
@@ -332,6 +334,7 @@ async def run_arbitration_pipeline(
             logger.debug("Arbiter run %d (%s) starting", run.run_id, run.name)
 
             cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
+            _litellm.drop_params = cfg.drop_params
 
             groups_def: dict[int, list[list[Question]]] = {
                 paper_id: resolve_groups(cfg, _questions_for_paper(paper_disputes, question_by_key))
@@ -345,7 +348,11 @@ async def run_arbitration_pipeline(
             run_cell_errors = 0
             run_had_fatal_error = False
 
-            reporter = ProgressReporter(progress_url, pipeline.api_token, run.run_id)
+            reporter = (
+                reporter_factory(run.run_id)
+                if reporter_factory is not None
+                else ProgressReporter(progress_url, pipeline.api_token, run.run_id)
+            )
             # A "cell" for arbitration is one dispute item (one paper x question dispute),
             # not one paper x question the way annotation's run_pipeline counts it — disputes
             # are already the flattened per-question unit, so cells_total is simply len(disputes).
@@ -398,6 +405,20 @@ async def run_arbitration_pipeline(
             )
 
             for chunk_i, chunk_papers in enumerate(chunks):
+                if should_cancel is not None and should_cancel():
+                    # Cooperative cancel: stop processing further chunks/runs. Drain
+                    # any in-flight per-cell heartbeats first so a late one can't
+                    # land after (and overwrite) this terminal "canceled" heartbeat.
+                    if _heartbeat_tasks:
+                        await asyncio.gather(*_heartbeat_tasks, return_exceptions=True)
+                    await reporter.heartbeat(
+                        status="canceled",
+                        cells_total=cells_total,
+                        cells_done=cell_counters["done"],
+                        cells_error=cell_counters["error"],
+                        message=_progress_message("canceled"),
+                    )
+                    return
                 progress.update(chunk_task, description=f"  Chunk {chunk_i + 1}/{len(chunks)}")
                 progress.reset(cell_task, total=None, visible=False)
                 phase_state["phase"] = None
@@ -449,7 +470,7 @@ async def run_arbitration_pipeline(
                         source_texts[paper.paper_id] = paper.abstract
 
                 pending_cells: dict[str, tuple] = {}
-                p1_texts, p1_usage, p1_error = await _execute_pass1(
+                p1_texts, p1_usage, p1_errors, p1_error = await _execute_pass1(
                     run, cfg, chunk_papers, source_texts, pending_cells,
                     store, settings, dry_run, groups_def=groups_def,
                     sem=sem, limiter=limiter,
@@ -478,6 +499,38 @@ async def run_arbitration_pipeline(
                         run.run_id, chunk_failed, n_pending, chunk_i + 1,
                     )
 
+                # Disputes that entered pending_cells but got no Pass-1 output at all
+                # (API error/timeout inside _execute_pass1) would otherwise vanish
+                # silently — mirrors run_pipeline's pass1-drop fix (orchestrator.py).
+                # Phase 2 only iterates pending_p1 (cids WITH p1 text) and the
+                # parse/save tail only iterates p2_texts, so a dropped cid is never
+                # touched again. Post an explicit error resolution for each such
+                # dispute now, mirroring the no-OCR error path above.
+                for cid, (paper, group, group_idx) in pending_cells.items():
+                    if cid in p1_texts:
+                        continue
+                    # Prefer the real per-item error (batch item errored/canceled/
+                    # expired, or an online call exception) when available — mirrors
+                    # orchestrator.py's run_pipeline handling of the same gap.
+                    cell_error_detail = p1_errors.get(
+                        cid, "pass1 failed — no output (API error/timeout); see log"
+                    )
+                    for q in group:
+                        d = dispute_by_paper_version.get((paper.paper_id, q.version_id))
+                        if d is None:
+                            continue
+                        p1_drop_payload = build_error_resolution(
+                            arbiter_run_id=run.run_id, paper_id=paper.paper_id,
+                            dispute_item_id=d.dispute_item_id, question=q,
+                            resolution_detail=cell_error_detail,
+                        )
+                        store.save_resolution(
+                            run.run_id, d.dispute_item_id, paper.paper_id, q.version_id, p1_drop_payload,
+                        )
+                        _count_payload(p1_drop_payload)
+                        if cid in p1_errors:
+                            store.mark_resolution_failed(run.run_id, d.dispute_item_id, cell_error_detail)
+
                 pending_p1 = {cid: t for cid, t in p1_texts.items() if cid in pending_cells}
 
                 def _on_p2_start(n: int, desc: str, _t=p2_task) -> None:
@@ -492,13 +545,34 @@ async def run_arbitration_pipeline(
                     phase_state["done"] += 1
                     _maybe_heartbeat()
 
-                p2_texts, p2_usage = await _execute_pass2(
+                p2_texts, p2_usage, p2_errors = await _execute_pass2(
                     run, cfg, pending_p1, pending_cells,
                     store, settings, dry_run,
                     sem=sem, limiter=limiter,
                     on_p2_start=_on_p2_start,
                     on_p2_advance=_on_p2_advance,
                 )
+
+                # Mirrors orchestrator.py's p2-drop handling: cells with a Pass-1
+                # result that then failed Pass-2 would otherwise vanish silently.
+                for cid, err_detail in p2_errors.items():
+                    if cid not in pending_cells:
+                        continue
+                    paper, group, group_idx = pending_cells[cid]
+                    for q in group:
+                        d = dispute_by_paper_version.get((paper.paper_id, q.version_id))
+                        if d is None:
+                            continue
+                        p2_drop_payload = build_error_resolution(
+                            arbiter_run_id=run.run_id, paper_id=paper.paper_id,
+                            dispute_item_id=d.dispute_item_id, question=q,
+                            resolution_detail=err_detail,
+                        )
+                        store.save_resolution(
+                            run.run_id, d.dispute_item_id, paper.paper_id, q.version_id, p2_drop_payload,
+                        )
+                        _count_payload(p2_drop_payload)
+                        store.mark_resolution_failed(run.run_id, d.dispute_item_id, err_detail)
 
                 err = _parse_save_post_tail_resolutions(
                     p1_texts=p1_texts,
@@ -656,6 +730,7 @@ async def arbitration_pass1_pipeline(
 
     for run in runs:
         cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
+        _litellm.drop_params = cfg.drop_params
         groups_def: dict[int, list[list[Question]]] = {
             paper_id: resolve_groups(cfg, _questions_for_paper(paper_disputes, question_by_key))
             for paper_id, paper_disputes in disputes_by_paper.items()
@@ -677,7 +752,10 @@ async def arbitration_pass1_pipeline(
                 source_texts[paper.paper_id] = paper.abstract
 
         pending_cells: dict[str, tuple] = {}
-        p1_texts, p1_usage, p1_error = await _execute_pass1(
+        # p1_errors unused here — this standalone pass1-only entrypoint already
+        # infers failure from a missing cid in p1_texts; kept for the 4-tuple
+        # return shape shared with run_arbitration_pipeline.
+        p1_texts, p1_usage, p1_errors, p1_error = await _execute_pass1(
             run, cfg, all_papers, source_texts, pending_cells,
             store, settings, dry_run, groups_def=groups_def,
             sem=sem, limiter=limiter,
@@ -807,6 +885,7 @@ async def arbitration_pass2_pipeline(
 
     for run in runs:
         cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
+        _litellm.drop_params = cfg.drop_params
 
         if format_model is not None:
             cfg.format_model = format_model
@@ -862,7 +941,10 @@ async def arbitration_pass2_pipeline(
             if not pending_p1:
                 continue
 
-            p2_texts, p2_usage = await _execute_pass2(
+            # p2_errors unused here — this standalone pass2-only entrypoint
+            # already infers failure from a missing cid in p2_texts; kept for the
+            # 3-tuple return shape shared with run_arbitration_pipeline.
+            p2_texts, p2_usage, p2_errors = await _execute_pass2(
                 run, cfg, pending_p1, pending_cells,
                 store, settings, dry_run,
                 sem=sem, limiter=limiter,
@@ -1049,6 +1131,7 @@ async def reformat_arbitration_pipeline(
             progress.reset(paper_task, total=len(all_papers), visible=True)
 
             cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
+            _litellm.drop_params = cfg.drop_params
             final_model = format_model or cfg.format_model or "gpt-4o-mini"
             final_provider = format_model_provider or cfg.format_model_provider or run.model_provider
 
@@ -1128,6 +1211,7 @@ async def reformat_arbitration_pipeline(
                                 format_model=final_model,
                                 format_model_provider=final_provider,
                                 format_structured_output=cfg.format_structured_output,
+                                format_temperature=cfg.format_temperature,
                                 format_model_params=cfg.format_model_params,
                                 complete_fn=fmt_complete_fn,
                                 citation_max_error_rate=cfg.citation_max_error_rate,

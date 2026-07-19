@@ -8,6 +8,11 @@ from typing import Any, Literal, Union
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+# Generous enough not to cut off legitimate long reasoning calls; the point is
+# to bound the "hangs forever" case when a provider stalls, not to be tight.
+DEFAULT_REQUEST_TIMEOUT = 600.0
+
+
 # ---------------------------------------------------------------------------
 # Pipeline JSON models (produced by SEER — shape is fixed)
 # ---------------------------------------------------------------------------
@@ -55,10 +60,11 @@ class RunConfig(BaseModel):
     citation_max_ellipsis_gap: int = 600
     text_source: Literal["full_text", "abstract"] = "full_text"
     batching: BatchingConfig = "all"
-    temperature: float = 0.0
+    temperature: float | None = None
     reasoning_effort: str | None = None
     format_model: str | None = None
     format_model_provider: str | None = None
+    format_temperature: float | None = None
     format_model_params: dict[str, Any] = Field(default_factory=dict)
     format_structured_output: bool = True
     model_params: dict[str, Any] = Field(default_factory=dict)
@@ -70,6 +76,7 @@ class RunConfig(BaseModel):
     batch_p1: bool = False
     batch_p2: bool = False
     fail_fast: bool = False
+    request_timeout: float | None = None
 
 
 class ExperimentRun(BaseModel):
@@ -136,10 +143,11 @@ class ArbiterRunConfig(BaseModel):
     # every disputed question for a paper in one Pass-1 call.
     batching: BatchingConfig = "all"
     anonymize_raters: bool = True
-    temperature: float = 0.0
+    temperature: float | None = None
     reasoning_effort: str | None = None
     format_model: str | None = None
     format_model_provider: str | None = None
+    format_temperature: float | None = None
     format_model_params: dict[str, Any] = Field(default_factory=dict)
     format_structured_output: bool = True
     model_params: dict[str, Any] = Field(default_factory=dict)
@@ -151,6 +159,7 @@ class ArbiterRunConfig(BaseModel):
     batch_p1: bool = False
     batch_p2: bool = False
     fail_fast: bool = False
+    request_timeout: float | None = None
 
 
 class ArbiterRun(BaseModel):
@@ -225,6 +234,7 @@ class RunDefaults(BaseModel):
     reasoning_effort: str | None = None
     format_model: str | None = None
     format_model_provider: str | None = None
+    format_temperature: float | None = None
     format_model_params: dict[str, Any] | None = None
     format_structured_output: bool | None = None
     model_params: dict[str, Any] | None = None
@@ -236,6 +246,7 @@ class RunDefaults(BaseModel):
     batch_p1: bool | None = None
     batch_p2: bool | None = None
     fail_fast: bool | None = None
+    request_timeout: float | None = None
 
 
 def effective_run_config(run_config: RunConfig, defaults: RunDefaults) -> RunConfig:
@@ -268,6 +279,7 @@ class ArbiterRunDefaults(BaseModel):
     reasoning_effort: str | None = None
     format_model: str | None = None
     format_model_provider: str | None = None
+    format_temperature: float | None = None
     format_model_params: dict[str, Any] | None = None
     format_structured_output: bool | None = None
     model_params: dict[str, Any] | None = None
@@ -279,6 +291,7 @@ class ArbiterRunDefaults(BaseModel):
     batch_p1: bool | None = None
     batch_p2: bool | None = None
     fail_fast: bool | None = None
+    request_timeout: float | None = None
 
 
 def effective_arbiter_config(run_config: ArbiterRunConfig, defaults: ArbiterRunDefaults) -> ArbiterRunConfig:

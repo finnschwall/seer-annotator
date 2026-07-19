@@ -100,18 +100,13 @@ class SeerClient:
 
         return None
 
-    async def post_answers_bulk(self, answers: list[dict]) -> None:
-        """POST answers to /experiment-runs/{run_id}/answers/bulk/.
+    def build_answer_items(self, answers: list[dict]) -> list[dict]:
+        """Build the per-item POST payload for a list of stored answer rows.
 
-        Endpoint is idempotent: re-posting upserts on (run, paper, question_version).
-        All answers in a single call must belong to the same run_id.
+        Reused by both the HTTP `post_answers_bulk` below and any other sink
+        (e.g. an in-process ORM sink) that wants the exact same
+        stored->wire-item transformation without duplicating it.
         """
-        if not answers:
-            return
-
-        run_id = answers[0]["run"]
-        url = f"{self._base}/experiment-runs/{run_id}/answers/bulk/"
-
         payload = []
         for stored in answers:
             version_id = stored.get("question_version")
@@ -142,6 +137,21 @@ class SeerClient:
                 item["cost"] = f"{float(stored['cost']):.6f}"
                 item["cost_currency"] = stored.get("cost_currency") or "USD"
             payload.append(item)
+        return payload
+
+    async def post_answers_bulk(self, answers: list[dict]) -> None:
+        """POST answers to /experiment-runs/{run_id}/answers/bulk/.
+
+        Endpoint is idempotent: re-posting upserts on (run, paper, question_version).
+        All answers in a single call must belong to the same run_id.
+        """
+        if not answers:
+            return
+
+        run_id = answers[0]["run"]
+        url = f"{self._base}/experiment-runs/{run_id}/answers/bulk/"
+
+        payload = self.build_answer_items(answers)
 
         if not payload:
             return
@@ -163,28 +173,31 @@ class SeerClient:
 
                 resp.raise_for_status()
                 result = resp.json()
+                errors = result.get("errors", [])
                 logger.info(
                     "Bulk posted run=%s: created=%s updated=%s errors=%s",
                     run_id,
                     result.get("created", "?"),
                     result.get("updated", "?"),
-                    result.get("errors", []),
+                    len(errors),
                 )
+                if errors:
+                    # Per-item rejections (e.g. bad question_key, validation failure)
+                    # are otherwise silent — a 2xx bulk response with an errors[] body
+                    # still means some rows were dropped. Not raised: the good answers
+                    # in this same batch must still get marked posted below.
+                    for err_item in errors:
+                        logger.error("Bulk answer post rejected item run=%s: %s", run_id, err_item)
                 return
 
 
-    async def post_resolutions_bulk(self, resolutions: list[dict]) -> None:
-        """POST resolutions to /arbiter-runs/{run_id}/resolutions/bulk/.
+    def build_resolution_items(self, resolutions: list[dict]) -> list[dict]:
+        """Build the per-item POST payload for a list of stored resolution rows.
 
-        Endpoint is idempotent: re-posting upserts on (run, paper, question_version).
-        All resolutions in a single call must belong to the same arbiter_run_id.
+        Reused by both the HTTP `post_resolutions_bulk` below and any other sink
+        (e.g. an in-process ORM sink) that wants the exact same
+        stored->wire-item transformation without duplicating it.
         """
-        if not resolutions:
-            return
-
-        run_id = resolutions[0]["arbiter_run"]
-        url = f"{self._base}/arbiter-runs/{run_id}/resolutions/bulk/"
-
         payload = []
         for stored in resolutions:
             version_id = stored.get("question_version")
@@ -212,6 +225,21 @@ class SeerClient:
                 item["cost"] = f"{float(stored['cost']):.6f}"
                 item["cost_currency"] = stored.get("cost_currency") or "USD"
             payload.append(item)
+        return payload
+
+    async def post_resolutions_bulk(self, resolutions: list[dict]) -> None:
+        """POST resolutions to /arbiter-runs/{run_id}/resolutions/bulk/.
+
+        Endpoint is idempotent: re-posting upserts on (run, paper, question_version).
+        All resolutions in a single call must belong to the same arbiter_run_id.
+        """
+        if not resolutions:
+            return
+
+        run_id = resolutions[0]["arbiter_run"]
+        url = f"{self._base}/arbiter-runs/{run_id}/resolutions/bulk/"
+
+        payload = self.build_resolution_items(resolutions)
 
         if not payload:
             return
@@ -233,13 +261,19 @@ class SeerClient:
 
                 resp.raise_for_status()
                 result = resp.json()
+                errors = result.get("errors", [])
                 logger.info(
                     "Bulk resolutions posted run=%s: created=%s updated=%s errors=%s",
                     run_id,
                     result.get("created", "?"),
                     result.get("updated", "?"),
-                    result.get("errors", []),
+                    len(errors),
                 )
+                if errors:
+                    # See post_answers_bulk — per-item rejections must be loud, not
+                    # folded silently into an INFO summary line.
+                    for err_item in errors:
+                        logger.error("Bulk resolution post rejected item run=%s: %s", run_id, err_item)
                 return
 
 

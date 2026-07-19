@@ -354,6 +354,7 @@ async def bench_pipeline(
                                     format_model=model_name,
                                     format_model_provider=final_provider,
                                     format_structured_output=cfg.format_structured_output,
+                                    format_temperature=cfg.format_temperature,
                                     format_model_params=cfg.format_model_params,
                                     complete_fn=complete_fn,
                                     citation_max_error_rate=cfg.citation_max_error_rate,

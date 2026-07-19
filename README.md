@@ -149,6 +149,7 @@ Separating reasoning from extraction lets you point a capable (and expensive) mo
 | `cache` | `false` | Enable prompt caching (Anthropic: adds `cache_control`; OpenAI/Gemini: no-op, handled server-side). |
 | `cache_first` | `"text"` | Which block gets the cache marker — `"text"` or `"questions"`. See [caching](#prompt-caching). |
 | `cache_ttl` | `"1h"` | Cache TTL for Anthropic: `"5m"` or `"1h"`. |
+| `request_timeout` | `600` (seconds) | Per-request timeout passed to the LLM call (`litellm.acompletion(..., timeout=...)`). Applies to both Pass-1 and Pass-2 online calls. Bounds the "hangs forever" case when a provider stalls; the default is generous enough not to cut off legitimate long reasoning calls — lower it for faster failure detection, raise it for very long Pass-1 prompts. |
 
 #### Batching
 
@@ -253,6 +254,8 @@ code defaults  →  settings.toml [run_defaults]  →  pipeline JSON runs[*].con
 
 `[run_defaults]` sets project- or machine-level defaults for any run setting. Values in `runs[*].config` inside the pipeline JSON always win when explicitly present.
 
+This `settings.toml` file (and `Settings.load()`, below) is unchanged and still exactly how standalone CLI use is configured. SEER itself now builds its own `Settings` object from Django-native config for its in-process orchestrated runs (`SEER_PROVIDERS`/`SEER_RUN_DEFAULTS`/etc. in its `settings.ini` — see SEER's `experiments/seer_config.py` if you're working on that side); that's a SEER-side concern and doesn't change anything documented here.
+
 ### Storage paths (`[runtime]`)
 
 The only settings that cannot be changed per run are storage paths, since they locate the database that ties everything together.
@@ -328,6 +331,7 @@ batch_p2                = false
 | `format_structured_output` | `true` | Use `response_format: json_object` for Pass-2 (disable for endpoints that don't support it) |
 | `batch_p2` | `false` | Submit all Pass-2 calls as a single async batch |
 | `fail_fast` | `false` | Stop the pipeline on the first LLM or extraction error and raise; when `false` (default), errors are recorded as `extraction_status: "error"` and posted to SEER so the run continues |
+| `request_timeout` | `600` (seconds) | Per-request timeout for online Pass-1/Pass-2 LLM calls (`null`/omitted uses the built-in 600s default, `seer_annotator.config.DEFAULT_REQUEST_TIMEOUT`) |
 
 ### Provider settings
 
@@ -363,7 +367,7 @@ base_url = "http://localhost:11434/v1"
 
 ### Batch mode
 
-Set `batch_p1 = true` and/or `batch_p2 = true` in `settings.toml` under `[run_defaults]`, or in the pipeline JSON under `runs[*].config`. Anthropic and OpenAI charge 50% less for async batch requests. The CLI submits all requests, polls until done, then processes results.
+Set `batch_p1 = true` and/or `batch_p2 = true` in `settings.toml` under `[run_defaults]`, or in the pipeline JSON under `runs[*].config`. Anthropic and OpenAI charge 50% less for async batch requests.
 
 | Setting | What it batches |
 |---|---|
@@ -372,7 +376,23 @@ Set `batch_p1 = true` and/or `batch_p2 = true` in `settings.toml` under `[run_de
 
 The most common setup is `batch_p1 = true` alone — the reasoning model is the expensive one; Pass 2 with a small format model is cheap enough to run online.
 
-Batch jobs are resumable: if interrupted while polling, re-running the same command picks up the existing batch from the local store.
+**The CLI does not block until the batch finishes.** Submitting a provider batch and waiting for it can take up to the provider's SLA (typically ≤24h), so `run`/`arbitrate`/`pass1`/`pass2` submit the batch (or resume an existing one from the local store), poll its status **exactly once**, and:
+
+- if the batch is done, processing continues immediately (results are collected, formatted, and posted);
+- if the batch is **not yet done**, the command raises and exits non-zero:
+
+  ```
+  $ seer-annotate run pipeline.json
+  ...
+  Batch P1 abc123 still running — will resume later
+
+  Error: Batch abc123 (Batch P1) not yet done: status=running
+  Full traceback written to seer-annotate.log
+  ```
+
+  This is expected, not a failure — the batch was submitted successfully and is still processing on the provider's side. **Re-run the exact same command** (same pipeline JSON, same local store) periodically to check again; thanks to the batch id being cached in the local store, re-running never re-submits the batch — it just polls once more. Repeat until the batch is done and the command completes normally. A cron/systemd timer that re-runs the command every 5–15 minutes works well for unattended use.
+
+Batch jobs are resumable in the same sense across process restarts or crashes: the batch id lives in the local store, so any later invocation of the same command against the same pipeline JSON picks up the existing batch rather than submitting a new one.
 
 **Supported providers:** `anthropic`, `openai`, `azure`.
 
@@ -499,7 +519,7 @@ seer-annotate arbitrate-reformat dispute_pipeline.json --format-model gpt-4o-min
 
 ### Arbitration configuration (`runs[*].config`)
 
-Most fields are the same as annotation's `RunConfig` (`concurrency`, `per_provider_rpm`, `temperature`, `model_params`, `cache`/`cache_first`/`cache_ttl`, `citation_max_error_rate`/`citation_max_ellipsis_gap`, `format_model`/`format_model_provider`, `chunk_papers`, `batch_p1`/`batch_p2`, `fail_fast`). Arbitration-specific fields:
+Most fields are the same as annotation's `RunConfig` (`concurrency`, `per_provider_rpm`, `temperature`, `model_params`, `cache`/`cache_first`/`cache_ttl`, `citation_max_error_rate`/`citation_max_ellipsis_gap`, `format_model`/`format_model_provider`, `chunk_papers`, `batch_p1`/`batch_p2`, `fail_fast`, `request_timeout`). Arbitration-specific fields:
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -535,7 +555,7 @@ Resolutions POST to `arbiter-runs/{run_id}/resolutions/bulk/`, identified by `di
 
 ## Progress / heartbeat contract
 
-When SEER launches `seer-annotate run` or `seer-annotate arbitrate` as a background subprocess (SEER-orchestrated mode), it passes `--progress-url` and `--log-file`, and expects heartbeat POSTs so the run-detail page can show live progress. This section is the authoritative reference for that contract, which both commands implement identically.
+`--progress-url`/`--log-file` are for manual/pull-mode use against a live SEER server: pass a progress-callback URL and `seer-annotate` POSTs heartbeats there as it works, so something watching that endpoint (e.g. SEER's own run-detail page, if you're POSTing back to it, or your own tooling) can show live progress. SEER's own orchestrated runs (importing this library directly rather than shelling out to the CLI) don't use these flags at all — they call the library in-process and receive progress via a direct callback instead of an HTTP POST — but the wire *shape* documented below is unchanged and still what a manual CLI invocation POSTs. This section is the authoritative reference for that heartbeat contract, which both `run` and `arbitrate` implement identically.
 
 ```bash
 seer-annotate run pipeline.json --progress-url https://seer.example.org/api/v1/annotation-jobs/10/progress/ --log-file /var/log/job-10.log

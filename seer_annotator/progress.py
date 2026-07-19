@@ -10,10 +10,33 @@ unreachable progress endpoint must never fail the run itself.
 from __future__ import annotations
 
 import logging
+from typing import Protocol
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+class ProgressReporterProtocol(Protocol):
+    """Structural interface satisfied by ProgressReporter (and any in-process
+    stand-in an embedder wants to inject via ``reporter_factory``) — same keyword
+    signature as ``ProgressReporter.heartbeat``, so orchestrator code can call
+    either without caring which one it got."""
+
+    async def heartbeat(
+        self,
+        *,
+        status: str,
+        cells_total: int,
+        cells_done: int,
+        cells_error: int,
+        message: str = "",
+        chunk_index: int | None = None,
+        chunk_total: int | None = None,
+        phase: str | None = None,
+        phase_done: int | None = None,
+        phase_total: int | None = None,
+    ) -> None: ...
 
 
 class ProgressReporter:

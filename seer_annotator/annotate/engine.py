@@ -12,7 +12,7 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 from ..caching import apply_cache
-from ..config import ExperimentRun, Question
+from ..config import DEFAULT_REQUEST_TIMEOUT, ExperimentRun, Question
 from ..llm import LLMResult, complete as llm_complete, dummy_complete
 from ..mapping import build_llm_answer
 from .prompt import build_messages, build_format_messages
@@ -82,7 +82,11 @@ async def annotate_group(
     )
     messages = apply_cache(run.model_provider, messages, cfg.cache)
 
-    p1_kwargs: dict = {"temperature": cfg.temperature}
+    p1_kwargs: dict = {
+        "timeout": cfg.request_timeout or DEFAULT_REQUEST_TIMEOUT,
+    }
+    if cfg.temperature is not None:
+        p1_kwargs["temperature"] = cfg.temperature
     if cfg.reasoning_effort:
         p1_kwargs["reasoning_effort"] = cfg.reasoning_effort
     p1_kwargs.update(cfg.model_params)
@@ -100,7 +104,11 @@ async def annotate_group(
 
     fmt_messages = build_format_messages(p1.text, questions)
 
-    p2_kwargs: dict = {"temperature": 0.0}
+    p2_kwargs: dict = {
+        "timeout": cfg.request_timeout or DEFAULT_REQUEST_TIMEOUT,
+    }
+    if cfg.format_temperature is not None:
+        p2_kwargs["temperature"] = cfg.format_temperature
     p2_kwargs.update(cfg.format_model_params)
     if cfg.format_structured_output:
         p2_kwargs["response_format"] = _RESPONSE_FORMAT
@@ -208,10 +216,12 @@ async def reformat_group(
     format_model: str,
     format_model_provider: str,
     format_structured_output: bool = True,
+    format_temperature: float | None = None,
     format_model_params: dict | None = None,
     complete_fn: CompleteFn = llm_complete,
     citation_max_error_rate: float = 0.05,
     citation_max_ellipsis_gap: int = 300,
+    request_timeout: float | None = None,
 ) -> list[dict]:
     """Re-run only pass-2 (formatting) on existing pass-1 output.
 
@@ -223,7 +233,11 @@ async def reformat_group(
     """
     fmt_messages = build_format_messages(pass1_text, questions)
 
-    p2_kwargs: dict = {"temperature": 0.0}
+    p2_kwargs: dict = {
+        "timeout": request_timeout or DEFAULT_REQUEST_TIMEOUT,
+    }
+    if format_temperature is not None:
+        p2_kwargs["temperature"] = format_temperature
     if format_model_params:
         p2_kwargs.update(format_model_params)
     if format_structured_output:

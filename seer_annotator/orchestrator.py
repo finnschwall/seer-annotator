@@ -24,7 +24,7 @@ _console = Console()
 from .batching import resolve_groups
 from .batch_runner import _execute_pass1, _execute_pass2
 from .config import PipelineConfig, ProviderSettings, RunConfig, Settings, effective_run_config
-from .progress import ProgressReporter
+from .progress import ProgressReporter, ProgressReporterProtocol
 from .rate_limiter import PerProviderRateLimiter
 from .seer_client import SeerClient
 from .store import Store
@@ -166,6 +166,8 @@ async def run_pipeline(
     concurrency: int | None = None,
     rpm: float | None = None,
     progress_url: str | None = None,
+    reporter_factory: "Callable[[int], ProgressReporterProtocol] | None" = None,
+    should_cancel: "Callable[[], bool] | None" = None,
 ) -> None:
     from .seer_client import DryRunSeerClient
 
@@ -219,6 +221,7 @@ async def run_pipeline(
             logger.debug("Run %d (%s) starting", run.run_id, run.name)
 
             cfg = effective_run_config(run.config, settings.run_defaults)
+            _litellm.drop_params = cfg.drop_params
             groups_def = resolve_groups(cfg, pipeline.questions)
 
             chunks = _chunks(papers, cfg.chunk_papers)
@@ -228,7 +231,11 @@ async def run_pipeline(
             run_cell_errors = 0
             run_had_fatal_error = False
 
-            reporter = ProgressReporter(progress_url, pipeline.api_token, run.run_id)
+            reporter = (
+                reporter_factory(run.run_id)
+                if reporter_factory is not None
+                else ProgressReporter(progress_url, pipeline.api_token, run.run_id)
+            )
             cells_total = len(papers) * len(pipeline.questions)
             cell_counters = {"done": 0, "error": 0}
 
@@ -284,6 +291,20 @@ async def run_pipeline(
             )
 
             for chunk_i, chunk_papers in enumerate(chunks):
+                if should_cancel is not None and should_cancel():
+                    # Cooperative cancel: stop processing further chunks/runs. Drain
+                    # any in-flight per-cell heartbeats first so a late one can't
+                    # land after (and overwrite) this terminal "canceled" heartbeat.
+                    if _heartbeat_tasks:
+                        await asyncio.gather(*_heartbeat_tasks, return_exceptions=True)
+                    await reporter.heartbeat(
+                        status="canceled",
+                        cells_total=cells_total,
+                        cells_done=cell_counters["done"],
+                        cells_error=cell_counters["error"],
+                        message=_progress_message("canceled"),
+                    )
+                    return
                 progress.update(chunk_task, description=f"  Chunk {chunk_i + 1}/{len(chunks)}")
                 progress.reset(cell_task, total=None, visible=False)
                 phase_state["phase"] = None
@@ -325,7 +346,7 @@ async def run_pipeline(
 
                 # Phase 1
                 pending_cells: dict[str, tuple] = {}
-                p1_texts, p1_usage, p1_error = await _execute_pass1(
+                p1_texts, p1_usage, p1_errors, p1_error = await _execute_pass1(
                     run, cfg, chunk_papers, source_texts, pending_cells,
                     store, settings, dry_run, groups_def=groups_def,
                     sem=sem, limiter=limiter,
@@ -351,6 +372,38 @@ async def run_pipeline(
                 elif chunk_failed > 0:
                     logger.warning("Run %d: %d/%d cells failed in chunk %d", run.run_id, chunk_failed, n_pending, chunk_i + 1)
 
+                # Cells that entered pending_cells but got no Pass-1 output at all
+                # (API error/timeout inside _execute_pass1) would otherwise vanish
+                # silently: Phase 2 only iterates pending_p1 (cids WITH p1 text) and
+                # the parse/save tail only iterates p2_texts, so a dropped cid is never
+                # touched again. Post an explicit error answer for each such cell now,
+                # mirroring the no-OCR error path above, so the failure is visible
+                # instead of the paper just quietly missing an answer.
+                for cid, (paper, group, group_idx) in pending_cells.items():
+                    if cid in p1_texts:
+                        continue
+                    # Prefer the real per-item error (batch item errored/canceled/
+                    # expired, or an online call exception) when we have one;
+                    # fall back to the generic message for cids that vanished for
+                    # some other reason (e.g. loaded from a stale p1 dump).
+                    cell_error_detail = p1_errors.get(
+                        cid, "pass1 failed — no output (API error/timeout); see log"
+                    )
+                    for q in group:
+                        p1_drop_payload = build_error_answer(
+                            run_id=run.run_id, paper_id=paper.paper_id, question=q,
+                            extraction_detail=cell_error_detail,
+                        )
+                        store.save_answer(run.run_id, paper.paper_id, q.version_id, p1_drop_payload)
+                        _count_payload(p1_drop_payload)
+                        if cid in p1_errors:
+                            # Flip the store's local status away from 'done' (what
+                            # save_answer always sets) to 'failed' so should_skip_cell
+                            # treats this as retryable on the next run, instead of
+                            # permanently poisoning it the way a deterministic parse
+                            # error is (those legitimately stay 'done').
+                            store.mark_failed(run.run_id, paper.paper_id, q.version_id, cell_error_detail)
+
                 # Phase 2
                 pending_p1 = {cid: t for cid, t in p1_texts.items() if cid in pending_cells}
 
@@ -366,13 +419,31 @@ async def run_pipeline(
                     phase_state["done"] += 1
                     _maybe_heartbeat()
 
-                p2_texts, p2_usage = await _execute_pass2(
+                p2_texts, p2_usage, p2_errors = await _execute_pass2(
                     run, cfg, pending_p1, pending_cells,
                     store, settings, dry_run,
                     sem=sem, limiter=limiter,
                     on_p2_start=_on_p2_start,
                     on_p2_advance=_on_p2_advance,
                 )
+
+                # Cells that had a Pass-1 result but failed Pass-2 (batch item
+                # errored/canceled/expired, or an online P2 call that raised) would
+                # otherwise vanish the same way a dropped Pass-1 cell would — the
+                # parse/save tail below only iterates p2_texts. Mirror the p1-drop
+                # handling above so these are posted as visible error answers too.
+                for cid, err_detail in p2_errors.items():
+                    if cid not in pending_cells:
+                        continue
+                    paper, group, group_idx = pending_cells[cid]
+                    for q in group:
+                        p2_drop_payload = build_error_answer(
+                            run_id=run.run_id, paper_id=paper.paper_id, question=q,
+                            extraction_detail=err_detail,
+                        )
+                        store.save_answer(run.run_id, paper.paper_id, q.version_id, p2_drop_payload)
+                        _count_payload(p2_drop_payload)
+                        store.mark_failed(run.run_id, paper.paper_id, q.version_id, err_detail)
 
                 # Parse / verify / save
                 err = _parse_save_post_tail(
@@ -529,6 +600,7 @@ async def pass1_pipeline(
 
     for run in runs:
         cfg = effective_run_config(run.config, settings.run_defaults)
+        _litellm.drop_params = cfg.drop_params
         groups_def = resolve_groups(cfg, pipeline.questions)
 
         # Resolve source texts for all papers
@@ -555,7 +627,11 @@ async def pass1_pipeline(
         # then remove cells that are pass1_done afterward (before saving).
 
         pending_cells: dict[str, tuple] = {}
-        p1_texts, p1_usage, p1_error = await _execute_pass1(
+        # p1_errors (per-cid detail) isn't wired into this standalone pass1-only
+        # entrypoint's n_failed accounting below (out of scope for this pass — it
+        # already infers failure from a missing cid in p1_texts); kept for the
+        # 4-tuple return shape shared with run_pipeline.
+        p1_texts, p1_usage, p1_errors, p1_error = await _execute_pass1(
             run, cfg, papers, source_texts, pending_cells,
             store, settings, dry_run, groups_def=groups_def,
             sem=sem, limiter=limiter,
@@ -675,6 +751,7 @@ async def pass2_pipeline(
 
     for run in runs:
         cfg = effective_run_config(run.config, settings.run_defaults)
+        _litellm.drop_params = cfg.drop_params
 
         # Apply format model overrides
         if format_model is not None:
@@ -744,8 +821,10 @@ async def pass2_pipeline(
             # source_texts dict for tail logic
             source_texts = {paper.paper_id: source_text}
 
-            # Run pass 2
-            p2_texts, p2_usage = await _execute_pass2(
+            # Run pass 2 (p2_errors unused here — this standalone pass2-only
+            # entrypoint already infers failure from a missing cid in p2_texts;
+            # kept for the 3-tuple return shape shared with run_pipeline)
+            p2_texts, p2_usage, p2_errors = await _execute_pass2(
                 run, cfg, pending_p1, pending_cells,
                 store, settings, dry_run,
                 sem=sem, limiter=limiter,
@@ -927,6 +1006,7 @@ async def reformat_pipeline(
             progress.reset(paper_task, total=len(papers), visible=True)
 
             cfg = effective_run_config(run.config, settings.run_defaults)
+            _litellm.drop_params = cfg.drop_params
             # CLI arg > effective run config (run_defaults merged with per-run) > run's own provider
             final_model = format_model or cfg.format_model or "gpt-4o-mini"
             final_provider = (
@@ -1016,10 +1096,12 @@ async def reformat_pipeline(
                                 format_model=final_model,
                                 format_model_provider=final_provider,
                                 format_structured_output=cfg.format_structured_output,
+                                format_temperature=cfg.format_temperature,
                                 format_model_params=cfg.format_model_params,
                                 complete_fn=fmt_complete_fn,
                                 citation_max_error_rate=cfg.citation_max_error_rate,
                                 citation_max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
+                                request_timeout=cfg.request_timeout,
                             )
                         except ExtractionError as exc:
                             logger.error(
