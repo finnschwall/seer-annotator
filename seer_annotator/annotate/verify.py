@@ -162,3 +162,51 @@ def verify_citation(
         "ok": False,
         "note": f"cited span not found in source (first 80 chars): {cited_text[:80]!r}",
     }
+
+
+def verify_citations(
+    cited_text: Union[str, list, None],
+    source: str,
+    max_error_rate: float = 0.05,
+    max_ellipsis_gap: int = 600,
+) -> list[dict]:
+    """Return one {ok, note} verification result per quote, preserving order.
+
+    Unlike verify_citation() (which collapses a whole cited_text into a single
+    ok/note pair for back-compat), this gives per-quote verification so each
+    citation object on the wire can carry its own `verified` flag. Reuses the
+    same normalization/fuzzy-match/ellipsis-fallback helpers as verify_citation.
+
+    A str input is wrapped as a single-element list so callers always get a
+    list back, regardless of whether the LLM emitted one quote or several.
+    """
+    if not cited_text:
+        return []
+    if isinstance(cited_text, str) and cited_text.strip() in _SENTINELS:
+        return []
+
+    norm_source = _normalize(source)
+    quotes = cited_text if isinstance(cited_text, list) else [cited_text]
+
+    results = []
+    for raw in quotes:
+        if not raw or not str(raw).strip():
+            results.append({"ok": True, "note": "no citation provided"})
+            continue
+
+        # Structural markers / very short fragments are skipped, same threshold
+        # as the list branch of verify_citation.
+        segment = _normalize(_strip_outer_quotes(str(raw)))
+        if len(segment) < 20:
+            results.append({"ok": True, "note": "skipped (too short to verify)"})
+            continue
+
+        ok = _verify_single(segment, norm_source, max_error_rate, max_ellipsis_gap)
+        results.append(
+            {
+                "ok": ok,
+                "note": "" if ok else f"cited span not found in source (first 80 chars): {str(raw)[:80]!r}",
+            }
+        )
+
+    return results

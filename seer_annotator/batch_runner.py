@@ -611,22 +611,22 @@ async def submit_and_poll(
 # Main batch pipeline
 # ---------------------------------------------------------------------------
 
-def _p1_dump_path(dump_dir: str, run_id: int) -> "pathlib.Path":
+def _p1_dump_path(dump_dir: str, run_id: int, chunk_i: int) -> "pathlib.Path":
     import pathlib
-    return pathlib.Path(dump_dir) / f"p1_{run_id}.json"
+    return pathlib.Path(dump_dir) / f"p1_{run_id}_{chunk_i}.json"
 
 
-def _save_p1_dump(dump_dir: str, run_id: int, p1_texts: dict) -> None:
+def _save_p1_dump(dump_dir: str, run_id: int, chunk_i: int, p1_texts: dict) -> None:
     import pathlib, json as _json
-    p = _p1_dump_path(dump_dir, run_id)
+    p = _p1_dump_path(dump_dir, run_id, chunk_i)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(_json.dumps(p1_texts, ensure_ascii=False, indent=2), encoding="utf-8")
     logger.info("P1 results saved to %s (delete after verifying run is complete)", p)
 
 
-def _load_p1_dump(dump_dir: str, run_id: int) -> "dict | None":
+def _load_p1_dump(dump_dir: str, run_id: int, chunk_i: int) -> "dict | None":
     import pathlib, json as _json
-    p = _p1_dump_path(dump_dir, run_id)
+    p = _p1_dump_path(dump_dir, run_id, chunk_i)
     if p.exists():
         data = _json.loads(p.read_text(encoding="utf-8"))
         logger.info("Loaded P1 dump from %s (%d entries) — skipping batch re-submission", p, len(data))
@@ -645,6 +645,7 @@ async def _execute_pass1_with_groups(
     dry_run: bool,
     groups_def,
     *,
+    chunk_i: int = 0,
     sem: "asyncio.Semaphore | None" = None,
     limiter=None,
     on_cell_done: "Callable[[], None] | None" = None,
@@ -653,6 +654,16 @@ async def _execute_pass1_with_groups(
     should_skip_cell: "Callable[[int, int, int], bool] | None" = None,
 ) -> "tuple[dict, dict, dict, str | None]":
     """Internal implementation of _execute_pass1 that also receives groups_def.
+
+    ``chunk_i`` identifies which chunk (of ``run_pipeline``'s outer chunk loop,
+    when the caller chunks papers) this call is for. It scopes the P1 dump file
+    and the batch resumability kv key so that two chunks of the same run never
+    collide — without it, chunk 2's call would find chunk 1's already-submitted
+    batch under the same key/dump and silently reuse chunk 1's results as if
+    they were chunk 2's (every custom_id would mismatch, but the dump load
+    short-circuits before that's ever checked). Callers that don't chunk (e.g.
+    the standalone pass1-only entrypoints) leave this at the default 0 — there's
+    only ever one "chunk" so no collision is possible either way.
 
     Returns ``(p1_texts, p1_usage, p1_errors_by_cid, fatal_error)`` — ``p1_errors_by_cid``
     is ``{cid: error_detail}`` for cells that failed with an attributable per-item
@@ -721,7 +732,7 @@ async def _execute_pass1_with_groups(
 
     if batch_p1 and not dry_run:
         # Try loading a saved P1 dump (crash-safe resume without re-billing)
-        p1_texts: dict[str, str] = _load_p1_dump(settings.runtime.p1_dump_dir, run.run_id) or {}
+        p1_texts: dict[str, str] = _load_p1_dump(settings.runtime.p1_dump_dir, run.run_id, chunk_i) or {}
         p1_usage: dict[str, dict] = {}  # {cid: usage_stats} — empty when loaded from dump
         p1_errors: dict[str, str] = {}  # {cid: error_detail} — empty when loaded from dump (no way to know)
 
@@ -770,7 +781,7 @@ async def _execute_pass1_with_groups(
                 # openai/azure (their prefix caching is automatic/server-side), so
                 # building a pre-warm item for those providers would just be a
                 # wasted "warmup" call with nothing to prime.
-                main_key = f"{run.run_id}:p1"
+                main_key = f"{run.run_id}:p1:{chunk_i}"
                 use_prewarm = (
                     cfg.cache
                     and cfg.cache_first == "questions"
@@ -834,7 +845,7 @@ async def _execute_pass1_with_groups(
                     provider_name=run.model_provider, model=run.model_name,
                 )
 
-                _save_p1_dump(settings.runtime.p1_dump_dir, run.run_id, p1_texts)
+                _save_p1_dump(settings.runtime.p1_dump_dir, run.run_id, chunk_i, p1_texts)
     else:
         # P1 online: gather all papers concurrently
         p1_texts = {}
@@ -930,6 +941,7 @@ async def _execute_pass1(
     dry_run: bool,
     *,
     groups_def,
+    chunk_i: int = 0,
     sem: "asyncio.Semaphore | None" = None,
     limiter=None,
     on_cell_done: "Callable[[], None] | None" = None,
@@ -965,7 +977,7 @@ async def _execute_pass1(
     """
     return await _execute_pass1_with_groups(
         run, cfg, papers, source_texts, pending_cells, store, settings, dry_run, groups_def,
-        sem=sem, limiter=limiter,
+        chunk_i=chunk_i, sem=sem, limiter=limiter,
         on_cell_done=on_cell_done, on_total_known=on_total_known,
         build_p1_messages=build_p1_messages,
         should_skip_cell=should_skip_cell,
@@ -981,12 +993,17 @@ async def _execute_pass2(
     settings,
     dry_run: bool,
     *,
+    chunk_i: int = 0,
     sem: "asyncio.Semaphore | None" = None,
     limiter=None,
     on_p2_start: "Callable[[int, str], None] | None" = None,
     on_p2_advance: "Callable[[], None] | None" = None,
 ) -> tuple[dict, dict, dict]:
     """Run the Pass-2 phase.
+
+    ``chunk_i`` scopes the batch resumability kv key the same way it does in
+    ``_execute_pass1_with_groups`` — see that docstring. Defaults to 0 for
+    callers that don't chunk.
 
     Returns ({custom_id: p2_text}, {custom_id: usage_stats}, {custom_id: error_detail}).
 
@@ -1035,7 +1052,7 @@ async def _execute_pass2(
         if p2_requests:
             p2_provider = make_provider(effective_fmt_provider, p2_api_key, p2_base_url)
             p2_texts, p2_usage, p2_errors = await submit_and_poll(
-                p2_provider, p2_requests, store, f"{run.run_id}:p2",
+                p2_provider, p2_requests, store, f"{run.run_id}:p2:{chunk_i}",
                 label="Batch P2", pass_name="p2",
                 provider_name=effective_fmt_provider, model=effective_fmt_model,
             )

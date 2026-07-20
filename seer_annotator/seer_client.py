@@ -125,6 +125,7 @@ class SeerClient:
                 "comment": stored.get("comment") or "",
                 "cited_text": _coerce_cited_text(stored.get("cited_text")),
                 "cited_text_verified": stored.get("cited_text_verified"),
+                "citations": stored.get("citations") or [],
                 "raw_response": _extract_pass1_text(stored.get("raw_response")),
                 "tokens_total": stored.get("tokens_total") or 0,
                 "tokens_input": stored.get("tokens_input") or 0,

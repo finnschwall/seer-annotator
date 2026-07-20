@@ -473,7 +473,7 @@ async def run_arbitration_pipeline(
                 p1_texts, p1_usage, p1_errors, p1_error = await _execute_pass1(
                     run, cfg, chunk_papers, source_texts, pending_cells,
                     store, settings, dry_run, groups_def=groups_def,
-                    sem=sem, limiter=limiter,
+                    chunk_i=chunk_i, sem=sem, limiter=limiter,
                     on_cell_done=_on_cell_done, on_total_known=_on_total,
                     build_p1_messages=_build_p1_messages_fn(cfg, candidates_by_paper_version),
                     should_skip_cell=_skip_resolution_cell_fn(store),
@@ -548,7 +548,7 @@ async def run_arbitration_pipeline(
                 p2_texts, p2_usage, p2_errors = await _execute_pass2(
                     run, cfg, pending_p1, pending_cells,
                     store, settings, dry_run,
-                    sem=sem, limiter=limiter,
+                    chunk_i=chunk_i, sem=sem, limiter=limiter,
                     on_p2_start=_on_p2_start,
                     on_p2_advance=_on_p2_advance,
                 )

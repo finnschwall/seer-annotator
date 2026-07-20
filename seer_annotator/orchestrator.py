@@ -29,8 +29,9 @@ from .rate_limiter import PerProviderRateLimiter
 from .seer_client import SeerClient
 from .store import Store
 from .mapping import build_error_answer, build_llm_answer
+from .annotate.citation import build_citations
 from .annotate.parse import ExtractionError, parse_structured_output
-from .annotate.verify import verify_citation
+from .annotate.verify import verify_citation, verify_citations
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,15 @@ def _parse_save_post_tail(
                 max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
             )
             cited_text_verified = None if verify.get("note") == "no citation provided" else verify["ok"]
+
+            verify_list = verify_citations(
+                result.get("cited_text", ""),
+                source_texts.get(paper.paper_id, ""),
+                max_error_rate=cfg.citation_max_error_rate,
+                max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
+            )
+            citations = build_citations(result.get("cited_text", ""), verify_list)
+
             raw_response = {
                 "pass1_text": p1_text,
                 "pass2_text": p2_text,
@@ -132,6 +142,7 @@ def _parse_save_post_tail(
                 comment=result.get("comment", ""),
                 cited_text=result.get("cited_text", ""),
                 cited_text_verified=cited_text_verified,
+                citations=citations,
                 raw_response=raw_response,
                 latency_ms=(p1_latency + p2_latency) if i == 0 else 0,
                 tokens_total=tok_input + tok_output + tok_cached if i == 0 else 0,
@@ -349,7 +360,7 @@ async def run_pipeline(
                 p1_texts, p1_usage, p1_errors, p1_error = await _execute_pass1(
                     run, cfg, chunk_papers, source_texts, pending_cells,
                     store, settings, dry_run, groups_def=groups_def,
-                    sem=sem, limiter=limiter,
+                    chunk_i=chunk_i, sem=sem, limiter=limiter,
                     on_cell_done=_on_cell_done, on_total_known=_on_total,
                 )
 
@@ -422,7 +433,7 @@ async def run_pipeline(
                 p2_texts, p2_usage, p2_errors = await _execute_pass2(
                     run, cfg, pending_p1, pending_cells,
                     store, settings, dry_run,
-                    sem=sem, limiter=limiter,
+                    chunk_i=chunk_i, sem=sem, limiter=limiter,
                     on_p2_start=_on_p2_start,
                     on_p2_advance=_on_p2_advance,
                 )
@@ -881,6 +892,14 @@ async def pass2_pipeline(
                     )
                     cited_text_verified = None if verify.get("note") == "no citation provided" else verify["ok"]
 
+                    verify_list = verify_citations(
+                        result.get("cited_text", ""),
+                        source_text,
+                        max_error_rate=cfg.citation_max_error_rate,
+                        max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
+                    )
+                    citations = build_citations(result.get("cited_text", ""), verify_list)
+
                     # Retrieve pass1_text for raw_response from pending_p1
                     p1_text_for_raw = pending_p1.get(cid, "")
 
@@ -903,6 +922,7 @@ async def pass2_pipeline(
                         comment=result.get("comment", ""),
                         cited_text=result.get("cited_text", ""),
                         cited_text_verified=cited_text_verified,
+                        citations=citations,
                         raw_response=raw_response,
                         latency_ms=(p1_latency + p2_latency) if i == 0 else 0,
                         # Carry p1 token/cost from stored pass1 payload (i==0 only)
@@ -1139,6 +1159,7 @@ async def reformat_pipeline(
                             comment=parsed.get("comment", ""),
                             cited_text=parsed.get("cited_text", ""),
                             cited_text_verified=result["cited_text_verified"],
+                            citations=result["citations"],
                             raw_response=new_raw,
                             latency_ms=old_payload.get("latency_ms", 0),
                             tokens_total=old_payload.get("tokens_total", 0),

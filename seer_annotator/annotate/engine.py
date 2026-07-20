@@ -15,9 +15,10 @@ from ..caching import apply_cache
 from ..config import DEFAULT_REQUEST_TIMEOUT, ExperimentRun, Question
 from ..llm import LLMResult, complete as llm_complete, dummy_complete
 from ..mapping import build_llm_answer
+from .citation import build_citations
 from .prompt import build_messages, build_format_messages
 from .parse import ExtractionError, parse_structured_output, _RESPONSE_FORMAT
-from .verify import verify_citation
+from .verify import verify_citation, verify_citations
 
 
 CompleteFn = Callable[..., object]  # async (model, provider, messages, **kw) -> LLMResult
@@ -139,6 +140,14 @@ async def annotate_group(
         )
         cited_text_verified = None if verify.get("note") == "no citation provided" else verify["ok"]
 
+        verify_list = verify_citations(
+            result.get("cited_text", ""),
+            source_text,
+            max_error_rate=citation_max_error_rate,
+            max_ellipsis_gap=citation_max_ellipsis_gap,
+        )
+        citations = build_citations(result.get("cited_text", ""), verify_list)
+
         if i == 0:
             raw_response = {
                 "pass1_text": p1.text,
@@ -188,6 +197,7 @@ async def annotate_group(
             comment=result.get("comment", ""),
             cited_text=result.get("cited_text", ""),
             cited_text_verified=cited_text_verified,
+            citations=citations,
             raw_response=raw_response,
             latency_ms=latency_ms,
             tokens_total=tokens_total,
@@ -226,7 +236,7 @@ async def reformat_group(
     """Re-run only pass-2 (formatting) on existing pass-1 output.
 
     Returns one dict per question (in the same order as *questions*) with keys:
-      parse_result, verify, cited_text_verified, p2_text, p2_raw,
+      parse_result, verify, cited_text_verified, citations, p2_text, p2_raw,
       fmt_tokens_{total,input,output,cached}, fmt_cost.
     Token/cost figures are attributed to index 0 only; the rest get zeros,
     matching the original attribution scheme in annotate_group().
@@ -265,6 +275,15 @@ async def reformat_group(
             max_ellipsis_gap=citation_max_ellipsis_gap,
         )
         cited_text_verified = None if verify.get("note") == "no citation provided" else verify["ok"]
+
+        verify_list = verify_citations(
+            result.get("cited_text", ""),
+            source_text,
+            max_error_rate=citation_max_error_rate,
+            max_ellipsis_gap=citation_max_ellipsis_gap,
+        )
+        citations = build_citations(result.get("cited_text", ""), verify_list)
+
         if i == 0:
             fmt_tokens_total = p2.usage.total_tokens
             fmt_tokens_input = p2.usage.input_tokens
@@ -278,6 +297,7 @@ async def reformat_group(
             "parse_result": result,
             "verify": verify,
             "cited_text_verified": cited_text_verified,
+            "citations": citations,
             "p2_text": p2.text,
             "p2_raw": p2.raw,
             "fmt_tokens_total": fmt_tokens_total,
