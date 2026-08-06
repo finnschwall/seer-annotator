@@ -14,10 +14,11 @@ logger = logging.getLogger(__name__)
 from ..caching import apply_cache
 from ..config import DEFAULT_REQUEST_TIMEOUT, ExperimentRun, Question
 from ..llm import LLMResult, complete as llm_complete, dummy_complete
-from ..mapping import build_llm_answer
+from ..mapping import build_error_answer, build_llm_answer, build_skipped_answer
 from .citation import build_citations
 from .prompt import build_messages, build_format_messages
-from .parse import ExtractionError, parse_structured_output, _RESPONSE_FORMAT
+from .parse import ANNOTATE_RESPONSE_FORMAT, ExtractionError, parse_structured_output, _RESPONSE_FORMAT
+from .scope import apply_scope_and_status
 from .verify import verify_citation, verify_citations
 
 
@@ -80,6 +81,7 @@ async def annotate_group(
         text_source=cfg.text_source,
         system_prompt=system_prompt,
         cache_first=cfg.cache_first,
+        early_exit_on_ic_exclusion=cfg.early_exit_on_ic_exclusion,
     )
     messages = apply_cache(run.model_provider, messages, cfg.cache)
 
@@ -103,7 +105,7 @@ async def annotate_group(
     p2_model = cfg.format_model or format_model
     p2_provider = cfg.format_model_provider or format_model_provider
 
-    fmt_messages = build_format_messages(p1.text, questions)
+    fmt_messages = build_format_messages(p1.text, questions, require_status=True)
 
     p2_kwargs: dict = {
         "timeout": cfg.request_timeout or DEFAULT_REQUEST_TIMEOUT,
@@ -112,7 +114,7 @@ async def annotate_group(
         p2_kwargs["temperature"] = cfg.format_temperature
     p2_kwargs.update(cfg.format_model_params)
     if cfg.format_structured_output:
-        p2_kwargs["response_format"] = _RESPONSE_FORMAT
+        p2_kwargs["response_format"] = ANNOTATE_RESPONSE_FORMAT
 
     p2_fn = format_complete_fn if format_complete_fn is not None else complete_fn
     p2: LLMResult = await p2_fn(  # type: ignore[assignment]
@@ -122,16 +124,43 @@ async def annotate_group(
         **p2_kwargs,
     )
 
-    parsed = parse_structured_output(p2.text, [q.key for q in questions])
+    parsed = parse_structured_output(p2.text, [q.key for q in questions], annotate_mode=True)
+    # Deterministic scope enforcement (see annotate/scope.py) — enabled=False
+    # (early_exit_on_ic_exclusion off) always yields excl_idx=None, so no
+    # question can come out "skipped" unless the run opted in.
+    parsed, _excl_idx = apply_scope_and_status(
+        questions, parsed, enabled=cfg.early_exit_on_ic_exclusion
+    )
 
-    failed = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
-    if failed:
+    if any(r.get("extraction_status") == "absent" for r in parsed):
         _dump_debug(batch_group_id, p1.text, p2.text, parsed, paper_id)
-        raise ExtractionError(failed)
 
     # ---------- Build payloads ----------
     payloads = []
     for i, (question, result) in enumerate(zip(questions, parsed)):
+        status = result.get("extraction_status", "ok")
+
+        if status == "skipped":
+            payloads.append(
+                build_skipped_answer(
+                    run_id=run.run_id, paper_id=paper_id, question=question,
+                    extraction_detail=result.get("extraction_detail", "gated out"),
+                )
+            )
+            continue
+
+        if status == "absent":
+            # Genuine omission (not gated out of scope) — a per-key error, NOT
+            # a whole-group ExtractionError (the A5 parse-tolerance fix: one
+            # missing key must not discard every other question's good answer).
+            payloads.append(
+                build_error_answer(
+                    run_id=run.run_id, paper_id=paper_id, question=question,
+                    extraction_detail=f"key {question.key!r} not found in pass-2 output",
+                )
+            )
+            continue
+
         verify = verify_citation(
             result.get("cited_text", ""),
             source_text,
@@ -175,6 +204,8 @@ async def annotate_group(
             tokens_input = p1.usage.input_tokens
             tokens_output = p1.usage.output_tokens
             tokens_cached = p1.usage.cached_tokens
+            tokens_reasoning = p1.usage.reasoning_tokens
+            reasoning_content = p1.reasoning_content
             cost = p1.cost or Decimal(0)
             fmt_tokens_total = p2.usage.total_tokens
             fmt_tokens_input = p2.usage.input_tokens
@@ -183,11 +214,19 @@ async def annotate_group(
             fmt_cost = p2.cost or Decimal(0)
             latency_ms = p1.latency_ms + p2.latency_ms
         else:
-            tokens_total = tokens_input = tokens_output = tokens_cached = 0
+            tokens_total = tokens_input = tokens_output = tokens_cached = tokens_reasoning = 0
+            reasoning_content = None
             cost = Decimal(0)
             fmt_tokens_total = fmt_tokens_input = fmt_tokens_output = fmt_tokens_cached = 0
             fmt_cost = Decimal(0)
             latency_ms = 0
+
+        status_kwargs: dict = {}
+        if status == "invalid":
+            status_kwargs = {
+                "extraction_status": "invalid",
+                "extraction_detail": f"pass-2 reported unmappable value for {question.key!r}",
+            }
 
         payload = build_llm_answer(
             run_id=run.run_id,
@@ -204,6 +243,8 @@ async def annotate_group(
             tokens_input=tokens_input,
             tokens_output=tokens_output,
             tokens_cached=tokens_cached,
+            tokens_reasoning=tokens_reasoning,
+            reasoning_content=reasoning_content,
             cost=cost if cost else None,
             cost_currency=p1.cost_currency,
             fmt_tokens_total=fmt_tokens_total,
@@ -212,6 +253,7 @@ async def annotate_group(
             fmt_tokens_cached=fmt_tokens_cached,
             fmt_cost=fmt_cost if fmt_cost else None,
             confidence=result.get("confidence"),
+            **status_kwargs,
         )
         payloads.append(payload)
 
@@ -232,6 +274,7 @@ async def reformat_group(
     citation_max_error_rate: float = 0.05,
     citation_max_ellipsis_gap: int = 300,
     request_timeout: float | None = None,
+    require_status: bool = False,
 ) -> list[dict]:
     """Re-run only pass-2 (formatting) on existing pass-1 output.
 
@@ -240,8 +283,19 @@ async def reformat_group(
       fmt_tokens_{total,input,output,cached}, fmt_cost.
     Token/cost figures are attributed to index 0 only; the rest get zeros,
     matching the original attribution scheme in annotate_group().
+
+    ``require_status`` is shared, opt-in-only: this function is reused
+    UNCHANGED by arbitration's reformat entrypoint (see
+    arbitrate_orchestrator.py), which never passes it, so the default False
+    preserves that path's ``_RESPONSE_FORMAT`` / whole-group-failure behavior
+    byte-for-byte. Reformat operates on rows whose scope was already decided
+    at original-annotation time (it only re-runs Pass-2 formatting, not the
+    IC-gate computation) — a missing key is still treated as a hard failure
+    for the whole group either way; ``require_status=True`` only changes which
+    signal that failure is read from (mechanical "absent" status vs. the
+    legacy ``parse_error``), for parity with the main annotate path's schema.
     """
-    fmt_messages = build_format_messages(pass1_text, questions)
+    fmt_messages = build_format_messages(pass1_text, questions, require_status=require_status)
 
     p2_kwargs: dict = {
         "timeout": request_timeout or DEFAULT_REQUEST_TIMEOUT,
@@ -251,7 +305,7 @@ async def reformat_group(
     if format_model_params:
         p2_kwargs.update(format_model_params)
     if format_structured_output:
-        p2_kwargs["response_format"] = _RESPONSE_FORMAT
+        p2_kwargs["response_format"] = ANNOTATE_RESPONSE_FORMAT if require_status else _RESPONSE_FORMAT
 
     p2: LLMResult = await complete_fn(  # type: ignore[assignment]
         format_model,
@@ -260,9 +314,12 @@ async def reformat_group(
         **p2_kwargs,
     )
 
-    parsed = parse_structured_output(p2.text, [q.key for q in questions])
+    parsed = parse_structured_output(p2.text, [q.key for q in questions], annotate_mode=require_status)
 
-    failed = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
+    if require_status:
+        failed = {r["key"]: "not found in pass-2 output" for r in parsed if r.get("status") == "absent"}
+    else:
+        failed = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
     if failed:
         raise ExtractionError(failed)
 

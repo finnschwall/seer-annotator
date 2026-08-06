@@ -366,6 +366,7 @@ class OpenAIBatchProvider:
                             "output_tokens": u.get("completion_tokens", 0) or 0,
                             "cache_write_tokens": 0,
                             "cache_read_tokens": (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0,
+                            "reasoning_tokens": (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0,
                         }
                 except (KeyError, IndexError, json.JSONDecodeError) as exc:
                     logger.warning("Could not parse batch output line: %s", exc)
@@ -711,6 +712,10 @@ async def _execute_pass1_with_groups(
             text_source=cfg.text_source,
             system_prompt=effective_system,
             cache_first=cfg.cache_first,
+            # Arbitration passes its own build_p1_messages (never hits this
+            # branch); annotation's RunConfig is the only thing with this
+            # field, defaulting to False (unchanged prompt) when absent.
+            early_exit_on_ic_exclusion=getattr(cfg, "early_exit_on_ic_exclusion", False),
         )
 
     # Build pending_cells in-place (unified path — replaces the duplicate blocks
@@ -888,6 +893,8 @@ async def _execute_pass1_with_groups(
                         "input_tokens": result.usage.input_tokens,
                         "output_tokens": result.usage.output_tokens,
                         "cache_read_tokens": result.usage.cached_tokens,
+                        "reasoning_tokens": result.usage.reasoning_tokens,
+                        "reasoning_content": result.reasoning_content,
                         "cost": result.cost,
                         "latency_ms": result.latency_ms,
                     }
@@ -998,6 +1005,8 @@ async def _execute_pass2(
     limiter=None,
     on_p2_start: "Callable[[int, str], None] | None" = None,
     on_p2_advance: "Callable[[], None] | None" = None,
+    response_format: "dict | None" = None,
+    require_status: bool = False,
 ) -> tuple[dict, dict, dict]:
     """Run the Pass-2 phase.
 
@@ -1017,6 +1026,14 @@ async def _execute_pass2(
 
     ``error_detail`` is populated for cids that failed (batch item error, or an
     online call that raised); such cids are absent from the first two dicts.
+
+    ``response_format``/``require_status`` are shared, opt-in-only knobs: this
+    function is called by BOTH the annotate orchestrator and the arbitrate
+    orchestrator, so the default (``response_format=None`` -> ``_RESPONSE_FORMAT``,
+    ``require_status=False``) preserves arbitration's behavior byte-for-byte.
+    The annotate orchestrator passes ``response_format=ANNOTATE_RESPONSE_FORMAT,
+    require_status=True`` to get the mechanical ok/absent/unmappable status
+    field (see annotate/parse.py, annotate/scope.py) — arbitration never does.
     """
     from .config import DEFAULT_REQUEST_TIMEOUT, ProviderSettings
     from .annotate.prompt import build_format_messages
@@ -1031,14 +1048,15 @@ async def _execute_pass2(
     p2_api_key = fmt_prov_settings.resolved_api_key()
     p2_base_url = fmt_prov_settings.base_url
 
-    p2_response_format = _RESPONSE_FORMAT if cfg.format_structured_output else None
+    _default_format = response_format if response_format is not None else _RESPONSE_FORMAT
+    p2_response_format = _default_format if cfg.format_structured_output else None
     batch_p2 = cfg.batch_p2
 
     if batch_p2 and not dry_run:
         p2_requests = []
         for cid, p1_text in pending_p1.items():
             paper, group, group_idx = pending_cells[cid]
-            p2_messages = build_format_messages(p1_text, group)
+            p2_messages = build_format_messages(p1_text, group, require_status=require_status)
             p2_requests.append(build_p2_request(
                 custom_id=cid,
                 provider=effective_fmt_provider,
@@ -1090,7 +1108,7 @@ async def _execute_pass2(
 
             try:
                 async def _run_p2(cid: str, p1_text: str, paper, group, group_idx: int):
-                    p2_messages = build_format_messages(p1_text, group)
+                    p2_messages = build_format_messages(p1_text, group, require_status=require_status)
                     p2_kwargs: dict = {
                         "timeout": cfg.request_timeout or DEFAULT_REQUEST_TIMEOUT,
                     }

@@ -525,6 +525,7 @@ def preview_prompt(
                             text_source=cfg.text_source,
                             system_prompt=cfg.system_prompt,
                             cache_first=cfg.cache_first,
+                            early_exit_on_ic_exclusion=cfg.early_exit_on_ic_exclusion,
                         )
                         msgs = apply_cache(
                             exp_run.model_provider,

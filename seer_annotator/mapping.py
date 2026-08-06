@@ -36,6 +36,8 @@ def build_llm_answer(
     tokens_input: int,
     tokens_output: int,
     tokens_cached: int,
+    tokens_reasoning: int = 0,
+    reasoning_content: str | None = None,
     cost: Decimal | None,
     cost_currency: str = "USD",
     fmt_tokens_total: int = 0,
@@ -71,6 +73,8 @@ def build_llm_answer(
             "tokens_input": tokens_input,
             "tokens_output": tokens_output,
             "tokens_cached": tokens_cached,
+            "tokens_reasoning": tokens_reasoning,
+            "reasoning_content": reasoning_content,
             "cost": str(cost) if cost is not None else None,
             "cost_currency": cost_currency,
             "fmt_tokens_total": fmt_tokens_total,
@@ -110,6 +114,8 @@ def build_resolution(
     tokens_input: int,
     tokens_output: int,
     tokens_cached: int,
+    tokens_reasoning: int = 0,
+    reasoning_content: str | None = None,
     cost: Decimal | None,
     cost_currency: str = "USD",
     fmt_tokens_total: int = 0,
@@ -153,6 +159,8 @@ def build_resolution(
             "tokens_input": tokens_input,
             "tokens_output": tokens_output,
             "tokens_cached": tokens_cached,
+            "tokens_reasoning": tokens_reasoning,
+            "reasoning_content": reasoning_content,
             "cost": str(cost) if cost is not None else None,
             "cost_currency": cost_currency,
             "fmt_tokens_total": fmt_tokens_total,
@@ -190,6 +198,42 @@ def build_error_answer(
         tokens_cached=0,
         cost=None,
         extraction_status="error",
+        extraction_detail=extraction_detail,
+    )
+
+
+def build_skipped_answer(
+    *,
+    run_id: int,
+    paper_id: int,
+    question: Question,
+    extraction_detail: str,
+) -> dict:
+    """Build a `skipped` LLMAnswer payload: this question was out of scope
+    because an earlier inclusion-criteria answer (in study-master order)
+    already excluded the paper (see ``annotate/scope.py``).
+
+    Null value, ``extraction_status="skipped"`` — distinct from ``"error"``
+    (a real failure, retryable) and from a genuine answer. ``extraction_detail``
+    should name the excluding question, e.g. "gated out: model_scope=false".
+    """
+    return build_llm_answer(
+        run_id=run_id,
+        paper_id=paper_id,
+        question=question,
+        value=None,
+        comment="",
+        cited_text="",
+        cited_text_verified=None,
+        citations=[],
+        raw_response={},
+        latency_ms=0,
+        tokens_total=0,
+        tokens_input=0,
+        tokens_output=0,
+        tokens_cached=0,
+        cost=None,
+        extraction_status="skipped",
         extraction_detail=extraction_detail,
     )
 

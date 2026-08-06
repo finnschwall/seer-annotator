@@ -131,6 +131,7 @@ class SeerClient:
                 "tokens_input": stored.get("tokens_input") or 0,
                 "tokens_output": stored.get("tokens_output") or 0,
                 "tokens_cached": stored.get("tokens_cached") or 0,
+                "tokens_reasoning": stored.get("tokens_reasoning") or 0,
                 "latency_ms": stored.get("latency_ms") or 0,
             }
             if stored.get("cost"):
@@ -220,6 +221,7 @@ class SeerClient:
                 "tokens_input": stored.get("tokens_input") or 0,
                 "tokens_output": stored.get("tokens_output") or 0,
                 "tokens_cached": stored.get("tokens_cached") or 0,
+                "tokens_reasoning": stored.get("tokens_reasoning") or 0,
                 "latency_ms": stored.get("latency_ms") or 0,
             }
             if stored.get("cost"):

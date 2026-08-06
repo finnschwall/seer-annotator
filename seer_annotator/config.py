@@ -34,6 +34,10 @@ class Question(BaseModel):
     allow_multiple: bool = False
     options: list[QuestionOption] = Field(default_factory=list)
     is_ic: bool = False  # inclusion-criteria flag; only meaningful for dispute questions
+    # Boolean-IC pass condition (the value that means "include"), mirroring
+    # `annotations.ic.ic_answer_passes` on the SEER side. None for non-boolean
+    # question types, or when the question isn't an IC gate.
+    ic_include_when_true: bool | None = None
 
 
 class Paper(BaseModel):
@@ -77,6 +81,13 @@ class RunConfig(BaseModel):
     batch_p2: bool = False
     fail_fast: bool = False
     request_timeout: float | None = None
+    # Stop answering a paper once an inclusion-criteria answer excludes it;
+    # downstream questions (in study-master order) become `skipped` instead of
+    # being sent to the model, saving output tokens (and, in per_question/size
+    # batching, whole calls). On by default — early-exit is the standard
+    # behavior for new runs; set to False per-run to answer every question
+    # regardless of IC gating.
+    early_exit_on_ic_exclusion: bool = True
 
 
 class ExperimentRun(BaseModel):
@@ -89,7 +100,7 @@ class ExperimentRun(BaseModel):
 
 class PipelineConfig(BaseModel):
     review_id: int
-    setup_id: int
+    setup_id: int | None = None
     api_base: str        # ends in /api
     api_token: str
     papers: list[Paper]

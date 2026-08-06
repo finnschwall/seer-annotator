@@ -28,9 +28,10 @@ from .progress import ProgressReporter, ProgressReporterProtocol
 from .rate_limiter import PerProviderRateLimiter
 from .seer_client import SeerClient
 from .store import Store
-from .mapping import build_error_answer, build_llm_answer
+from .mapping import build_error_answer, build_llm_answer, build_skipped_answer
 from .annotate.citation import build_citations
-from .annotate.parse import ExtractionError, parse_structured_output
+from .annotate.parse import ANNOTATE_RESPONSE_FORMAT, ExtractionError, parse_structured_output
+from .annotate.scope import apply_scope_and_status
 from .annotate.verify import verify_citation, verify_citations
 
 logger = logging.getLogger(__name__)
@@ -56,12 +57,19 @@ def _parse_save_post_tail(
     store: Store,
     fail_fast: bool,
     on_payload_saved: "Callable[[dict], None] | None" = None,
+    excluded_papers: "dict[int, str] | None" = None,
 ) -> "ExtractionError | None":
     """Parse/verify/save answers from p2_texts. Returns first ExtractionError if any.
 
     ``on_payload_saved``, when given, is called once per built payload right after
     it's persisted — used by the progress heartbeat to track cells_done/cells_error
     without a separate store query.
+
+    ``excluded_papers``, when given, is mutated in place: whenever a group's
+    scope computation finds an IC exclusion, ``{paper_id: detail}`` is recorded
+    — used by the round-based per_question/size early-exit loop (A7, see
+    ``_run_chunk_with_early_exit``) to carry the exclusion decision forward to
+    later rounds/groups for the same paper without re-deriving it.
     """
     first_extraction_error: ExtractionError | None = None
 
@@ -73,9 +81,11 @@ def _parse_save_post_tail(
         p2_text = p2_texts[cid]
 
         u = p1_usage.get(cid, {})
-        tok_input  = u.get("input_tokens", 0)
-        tok_output = u.get("output_tokens", 0)
-        tok_cached = u.get("cache_read_tokens", 0)
+        tok_input     = u.get("input_tokens", 0)
+        tok_output    = u.get("output_tokens", 0)
+        tok_cached    = u.get("cache_read_tokens", 0)
+        tok_reasoning = u.get("reasoning_tokens", 0) or 0
+        p1_reasoning_content = u.get("reasoning_content")
         p1_cost    = u.get("cost")
         p1_latency = u.get("latency_ms", 0) or 0
 
@@ -87,27 +97,49 @@ def _parse_save_post_tail(
         fmt_cost   = fu.get("cost")
         p2_latency = fu.get("latency_ms", 0) or 0
 
-        parsed = parse_structured_output(p2_text, [q.key for q in group])
-
-        failed_keys = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
-        if failed_keys:
-            err = ExtractionError(failed_keys)
-            logger.error(
-                "EXTRACTION FAILURE — run %d, paper %d, group %d: %s\n"
-                "  Pass-2 output was:\n%s",
-                run.run_id, paper.paper_id, group_idx, err,
-                p2_text[:2000],
-            )
-            for q in group:
-                error_payload = build_error_answer(run_id=run.run_id, paper_id=paper.paper_id, question=q, extraction_detail=str(err))
-                store.save_answer(run.run_id, paper.paper_id, q.version_id, error_payload)
-                if on_payload_saved is not None:
-                    on_payload_saved(error_payload)
-            if fail_fast and first_extraction_error is None:
-                first_extraction_error = err
-            continue
+        parsed = parse_structured_output(p2_text, [q.key for q in group], annotate_mode=True)
+        # Deterministic scope enforcement — authoritative over the model (see
+        # annotate/scope.py). enabled=False (early_exit_on_ic_exclusion off)
+        # short-circuits to excl_idx=None every time, so no cell can ever come
+        # out "skipped" unless the run opted in.
+        parsed, excl_idx = apply_scope_and_status(
+            group, parsed, enabled=cfg.early_exit_on_ic_exclusion
+        )
+        if excl_idx is not None and excluded_papers is not None:
+            excluded_papers[paper.paper_id] = f"gated out: {group[excl_idx].key}=false"
 
         for i, (question, result) in enumerate(zip(group, parsed)):
+            status = result.get("extraction_status", "ok")
+
+            if status == "skipped":
+                payload = build_skipped_answer(
+                    run_id=run.run_id, paper_id=paper.paper_id, question=question,
+                    extraction_detail=result.get("extraction_detail", "gated out"),
+                )
+                store.save_answer(run.run_id, paper.paper_id, question.version_id, payload, cid)
+                if on_payload_saved is not None:
+                    on_payload_saved(payload)
+                continue
+
+            if status == "absent":
+                # Genuine omission (no exclusion moots this key) — per-key error,
+                # NOT a whole-group failure (the A5 parse-tolerance fix).
+                err_detail = f"key {question.key!r} not found in pass-2 output"
+                logger.error(
+                    "EXTRACTION FAILURE — run %d, paper %d, group %d, key %r: %s",
+                    run.run_id, paper.paper_id, group_idx, question.key, err_detail,
+                )
+                error_payload = build_error_answer(
+                    run_id=run.run_id, paper_id=paper.paper_id, question=question,
+                    extraction_detail=err_detail,
+                )
+                store.save_answer(run.run_id, paper.paper_id, question.version_id, error_payload, cid)
+                if on_payload_saved is not None:
+                    on_payload_saved(error_payload)
+                if fail_fast and first_extraction_error is None:
+                    first_extraction_error = ExtractionError({question.key: err_detail})
+                continue
+
             verify = verify_citation(
                 result.get("cited_text", ""),
                 source_texts.get(paper.paper_id, ""),
@@ -134,6 +166,17 @@ def _parse_save_post_tail(
                 "batch_mode": True,
                 "p1_usage": u,
             }
+            # status == "invalid" is Pass-2's own mechanical determination
+            # ("content present but unmappable") — pass it through explicitly
+            # rather than letting build_llm_answer re-derive extraction_status
+            # from _map_value, since that would fall back to "ok" for a value
+            # that happens to coincidentally validate.
+            status_kwargs: dict = {}
+            if status == "invalid":
+                status_kwargs = {
+                    "extraction_status": "invalid",
+                    "extraction_detail": f"pass-2 reported unmappable value for {question.key!r}",
+                }
             payload = build_llm_answer(
                 run_id=run.run_id,
                 paper_id=paper.paper_id,
@@ -149,6 +192,8 @@ def _parse_save_post_tail(
                 tokens_input=tok_input if i == 0 else 0,
                 tokens_output=tok_output if i == 0 else 0,
                 tokens_cached=tok_cached if i == 0 else 0,
+                tokens_reasoning=tok_reasoning if i == 0 else 0,
+                reasoning_content=p1_reasoning_content if i == 0 else None,
                 cost=p1_cost if i == 0 else None,
                 cost_currency="USD",
                 fmt_tokens_total=fmt_total if i == 0 else 0,
@@ -157,12 +202,170 @@ def _parse_save_post_tail(
                 fmt_tokens_cached=fmt_cached if i == 0 else 0,
                 fmt_cost=fmt_cost if i == 0 else None,
                 confidence=result.get("confidence"),
+                **status_kwargs,
             )
             store.save_answer(run.run_id, paper.paper_id, question.version_id, payload, cid)
             if on_payload_saved is not None:
                 on_payload_saved(payload)
 
     return first_extraction_error
+
+
+async def _run_rounds_with_early_exit(
+    *,
+    run,
+    cfg,
+    chunk_papers: list,
+    source_texts: dict,
+    groups_def: list,
+    store: Store,
+    settings,
+    dry_run: bool,
+    chunk_i: int,
+    sem,
+    limiter,
+    on_cell_done,
+    on_total_known,
+    on_p2_start,
+    on_p2_advance,
+    on_payload_saved,
+) -> tuple[int, bool, list[ExtractionError]]:
+    """True early-exit for per_question/size batching (A7/A8) — one ROUND per
+    group in ``groups_def``, instead of building every paper's every group up
+    front (which would issue every LLM call regardless of exclusion — the
+    behavior this replaces, and the only reason it's a separate code path
+    from the normal single-shot chunk processing below).
+
+    Round r processes ``groups_def[r]`` for every paper still "active": has a
+    resolved ``source_texts`` entry, and hasn't already been marked excluded
+    by an earlier round. The moment a paper's group resolves to an IC
+    exclusion (via ``apply_scope_and_status`` inside ``_parse_save_post_tail``,
+    threaded through via the ``excluded_papers`` out-param), it drops out of
+    all LATER rounds — no further LLM calls are issued for it, and each later
+    round emits a ``skipped`` LLMAnswer for that paper's questions directly
+    (A6/A8: these count as done/terminal cells, same as any other payload,
+    via ``on_payload_saved``).
+
+    Not used for ``"all"`` batching (``len(groups_def) == 1``, one atomic
+    group — there's no "later round" to skip; its savings come from truncated
+    Pass-1/Pass-2 *output* once the model obeys the stop instruction, see
+    prompt.py, plus this module's own per-key relabeling either way).
+
+    Returns ``(chunk_failed_count, run_had_fatal_error, extraction_errors)``,
+    mirroring the accounting the non-early-exit path keeps inline in
+    ``run_pipeline`` (``run_cell_errors`` / ``run_had_fatal_error`` /
+    ``first_error``).
+    """
+    excluded_papers: dict[int, str] = {}
+    chunk_failed = 0
+    run_had_fatal_error = False
+    extraction_errors: list[ExtractionError] = []
+
+    eligible_paper_ids = {p.paper_id for p in chunk_papers if p.paper_id in source_texts}
+
+    for round_idx, group in enumerate(groups_def):
+        # Papers already excluded by an earlier round: emit `skipped` rows for
+        # this round's questions directly — no LLM call, this IS the saving.
+        for paper in chunk_papers:
+            if paper.paper_id not in eligible_paper_ids:
+                continue
+            detail = excluded_papers.get(paper.paper_id)
+            if detail is None:
+                continue
+            for q in group:
+                skip_payload = build_skipped_answer(
+                    run_id=run.run_id, paper_id=paper.paper_id, question=q,
+                    extraction_detail=detail,
+                )
+                store.save_answer(run.run_id, paper.paper_id, q.version_id, skip_payload)
+                if on_payload_saved is not None:
+                    on_payload_saved(skip_payload)
+
+        round_papers = [
+            p for p in chunk_papers
+            if p.paper_id in eligible_paper_ids and p.paper_id not in excluded_papers
+        ]
+        if not round_papers:
+            continue
+
+        # A distinct kv/dump-file scope per round (see _execute_pass1_with_groups's
+        # chunk_i docstring for why this matters) — a plain string is fine, it's
+        # only ever used inside f-strings/filenames, never compared as an int.
+        round_key = f"{chunk_i}-r{round_idx}"
+
+        round_pending: dict[str, tuple] = {}
+        p1_texts, p1_usage, p1_errors, p1_error = await _execute_pass1(
+            run, cfg, round_papers, source_texts, round_pending,
+            store, settings, dry_run, groups_def=[group],
+            chunk_i=round_key, sem=sem, limiter=limiter,
+            on_cell_done=on_cell_done, on_total_known=on_total_known,
+        )
+
+        chunk_failed += len(round_pending) - len(p1_texts)
+
+        if p1_error:
+            logger.error("P1 aborted (round %d) — %s", round_idx, p1_error)
+            run_had_fatal_error = True
+            break  # mirrors the non-round path: a fatal P1 error aborts the run
+
+        for cid, (paper, grp, group_idx) in round_pending.items():
+            if cid in p1_texts:
+                continue
+            cell_error_detail = p1_errors.get(
+                cid, "pass1 failed — no output (API error/timeout); see log"
+            )
+            for q in grp:
+                p1_drop_payload = build_error_answer(
+                    run_id=run.run_id, paper_id=paper.paper_id, question=q,
+                    extraction_detail=cell_error_detail,
+                )
+                store.save_answer(run.run_id, paper.paper_id, q.version_id, p1_drop_payload)
+                if on_payload_saved is not None:
+                    on_payload_saved(p1_drop_payload)
+                if cid in p1_errors:
+                    store.mark_failed(run.run_id, paper.paper_id, q.version_id, cell_error_detail)
+
+        round_pending_p1 = {cid: t for cid, t in p1_texts.items() if cid in round_pending}
+        p2_texts, p2_usage, p2_errors = await _execute_pass2(
+            run, cfg, round_pending_p1, round_pending,
+            store, settings, dry_run,
+            chunk_i=round_key, sem=sem, limiter=limiter,
+            on_p2_start=on_p2_start, on_p2_advance=on_p2_advance,
+            response_format=ANNOTATE_RESPONSE_FORMAT, require_status=True,
+        )
+
+        for cid, err_detail in p2_errors.items():
+            if cid not in round_pending:
+                continue
+            paper, grp, group_idx = round_pending[cid]
+            for q in grp:
+                p2_drop_payload = build_error_answer(
+                    run_id=run.run_id, paper_id=paper.paper_id, question=q,
+                    extraction_detail=err_detail,
+                )
+                store.save_answer(run.run_id, paper.paper_id, q.version_id, p2_drop_payload)
+                if on_payload_saved is not None:
+                    on_payload_saved(p2_drop_payload)
+                store.mark_failed(run.run_id, paper.paper_id, q.version_id, err_detail)
+
+        err = _parse_save_post_tail(
+            p1_texts=p1_texts,
+            p1_usage=p1_usage,
+            p2_texts=p2_texts,
+            p2_usage=p2_usage,
+            pending_cells=round_pending,
+            source_texts=source_texts,
+            run=run,
+            cfg=cfg,
+            store=store,
+            fail_fast=cfg.fail_fast,
+            on_payload_saved=on_payload_saved,
+            excluded_papers=excluded_papers,
+        )
+        if err is not None:
+            extraction_errors.append(err)
+
+    return chunk_failed, run_had_fatal_error, extraction_errors
 
 
 async def run_pipeline(
@@ -355,69 +558,6 @@ async def run_pipeline(
                     else:
                         source_texts[paper.paper_id] = paper.abstract
 
-                # Phase 1
-                pending_cells: dict[str, tuple] = {}
-                p1_texts, p1_usage, p1_errors, p1_error = await _execute_pass1(
-                    run, cfg, chunk_papers, source_texts, pending_cells,
-                    store, settings, dry_run, groups_def=groups_def,
-                    chunk_i=chunk_i, sem=sem, limiter=limiter,
-                    on_cell_done=_on_cell_done, on_total_known=_on_total,
-                )
-
-                n_pending = len(pending_cells)
-                n_got_p1 = len(p1_texts)
-                chunk_failed = n_pending - n_got_p1
-                run_cell_errors += chunk_failed
-
-                if p1_error:
-                    msg = f"Run {run.run_id} ({run.name}): {p1_error}"
-                    all_run_errors.append(msg)
-                    logger.error("P1 aborted — %s", msg)
-                    # p1_error signals a fatal, run-aborting failure (e.g. bad model name/API
-                    # key — the "probe first call" path in _execute_pass1_with_groups), not a
-                    # per-cell parsing issue. Treat it like first_error for fail_fast purposes
-                    # so a totally broken run is actually reported as failed (and stops a
-                    # multi-run "Run all" pipeline) instead of silently completing 0/N cells
-                    # and reporting "succeeded".
-                    run_had_fatal_error = True
-                elif chunk_failed > 0:
-                    logger.warning("Run %d: %d/%d cells failed in chunk %d", run.run_id, chunk_failed, n_pending, chunk_i + 1)
-
-                # Cells that entered pending_cells but got no Pass-1 output at all
-                # (API error/timeout inside _execute_pass1) would otherwise vanish
-                # silently: Phase 2 only iterates pending_p1 (cids WITH p1 text) and
-                # the parse/save tail only iterates p2_texts, so a dropped cid is never
-                # touched again. Post an explicit error answer for each such cell now,
-                # mirroring the no-OCR error path above, so the failure is visible
-                # instead of the paper just quietly missing an answer.
-                for cid, (paper, group, group_idx) in pending_cells.items():
-                    if cid in p1_texts:
-                        continue
-                    # Prefer the real per-item error (batch item errored/canceled/
-                    # expired, or an online call exception) when we have one;
-                    # fall back to the generic message for cids that vanished for
-                    # some other reason (e.g. loaded from a stale p1 dump).
-                    cell_error_detail = p1_errors.get(
-                        cid, "pass1 failed — no output (API error/timeout); see log"
-                    )
-                    for q in group:
-                        p1_drop_payload = build_error_answer(
-                            run_id=run.run_id, paper_id=paper.paper_id, question=q,
-                            extraction_detail=cell_error_detail,
-                        )
-                        store.save_answer(run.run_id, paper.paper_id, q.version_id, p1_drop_payload)
-                        _count_payload(p1_drop_payload)
-                        if cid in p1_errors:
-                            # Flip the store's local status away from 'done' (what
-                            # save_answer always sets) to 'failed' so should_skip_cell
-                            # treats this as retryable on the next run, instead of
-                            # permanently poisoning it the way a deterministic parse
-                            # error is (those legitimately stay 'done').
-                            store.mark_failed(run.run_id, paper.paper_id, q.version_id, cell_error_detail)
-
-                # Phase 2
-                pending_p1 = {cid: t for cid, t in p1_texts.items() if cid in pending_cells}
-
                 def _on_p2_start(n: int, desc: str, _t=p2_task) -> None:
                     progress.reset(_t, total=n, visible=n > 0)
                     progress.update(_t, description=f"    {desc}")
@@ -430,48 +570,138 @@ async def run_pipeline(
                     phase_state["done"] += 1
                     _maybe_heartbeat()
 
-                p2_texts, p2_usage, p2_errors = await _execute_pass2(
-                    run, cfg, pending_p1, pending_cells,
-                    store, settings, dry_run,
-                    chunk_i=chunk_i, sem=sem, limiter=limiter,
-                    on_p2_start=_on_p2_start,
-                    on_p2_advance=_on_p2_advance,
-                )
+                # A7: per_question/size batching with early_exit_on_ic_exclusion
+                # gets a true round-based early exit — groups_def has >1 group,
+                # and the round loop skips issuing LLM calls entirely for any
+                # paper already excluded by an earlier round (see
+                # _run_rounds_with_early_exit). "all" batching (one atomic
+                # group, len(groups_def) == 1) and/or the flag being off both
+                # fall through to the original single-shot path below,
+                # unchanged.
+                if cfg.early_exit_on_ic_exclusion and len(groups_def) > 1:
+                    chunk_failed, fatal, round_errors = await _run_rounds_with_early_exit(
+                        run=run, cfg=cfg, chunk_papers=chunk_papers,
+                        source_texts=source_texts, groups_def=groups_def,
+                        store=store, settings=settings, dry_run=dry_run,
+                        chunk_i=chunk_i, sem=sem, limiter=limiter,
+                        on_cell_done=_on_cell_done, on_total_known=_on_total,
+                        on_p2_start=_on_p2_start, on_p2_advance=_on_p2_advance,
+                        on_payload_saved=_count_payload,
+                    )
+                    run_cell_errors += chunk_failed
+                    if fatal:
+                        msg = f"Run {run.run_id} ({run.name}): pass-1 aborted during early-exit round"
+                        all_run_errors.append(msg)
+                        run_had_fatal_error = True
+                    first_error.extend(round_errors)
+                else:
+                    # Phase 1
+                    pending_cells: dict[str, tuple] = {}
+                    p1_texts, p1_usage, p1_errors, p1_error = await _execute_pass1(
+                        run, cfg, chunk_papers, source_texts, pending_cells,
+                        store, settings, dry_run, groups_def=groups_def,
+                        chunk_i=chunk_i, sem=sem, limiter=limiter,
+                        on_cell_done=_on_cell_done, on_total_known=_on_total,
+                    )
 
-                # Cells that had a Pass-1 result but failed Pass-2 (batch item
-                # errored/canceled/expired, or an online P2 call that raised) would
-                # otherwise vanish the same way a dropped Pass-1 cell would — the
-                # parse/save tail below only iterates p2_texts. Mirror the p1-drop
-                # handling above so these are posted as visible error answers too.
-                for cid, err_detail in p2_errors.items():
-                    if cid not in pending_cells:
-                        continue
-                    paper, group, group_idx = pending_cells[cid]
-                    for q in group:
-                        p2_drop_payload = build_error_answer(
-                            run_id=run.run_id, paper_id=paper.paper_id, question=q,
-                            extraction_detail=err_detail,
+                    n_pending = len(pending_cells)
+                    n_got_p1 = len(p1_texts)
+                    chunk_failed = n_pending - n_got_p1
+                    run_cell_errors += chunk_failed
+
+                    if p1_error:
+                        msg = f"Run {run.run_id} ({run.name}): {p1_error}"
+                        all_run_errors.append(msg)
+                        logger.error("P1 aborted — %s", msg)
+                        # p1_error signals a fatal, run-aborting failure (e.g. bad model name/API
+                        # key — the "probe first call" path in _execute_pass1_with_groups), not a
+                        # per-cell parsing issue. Treat it like first_error for fail_fast purposes
+                        # so a totally broken run is actually reported as failed (and stops a
+                        # multi-run "Run all" pipeline) instead of silently completing 0/N cells
+                        # and reporting "succeeded".
+                        run_had_fatal_error = True
+                    elif chunk_failed > 0:
+                        logger.warning("Run %d: %d/%d cells failed in chunk %d", run.run_id, chunk_failed, n_pending, chunk_i + 1)
+
+                    # Cells that entered pending_cells but got no Pass-1 output at all
+                    # (API error/timeout inside _execute_pass1) would otherwise vanish
+                    # silently: Phase 2 only iterates pending_p1 (cids WITH p1 text) and
+                    # the parse/save tail only iterates p2_texts, so a dropped cid is never
+                    # touched again. Post an explicit error answer for each such cell now,
+                    # mirroring the no-OCR error path above, so the failure is visible
+                    # instead of the paper just quietly missing an answer.
+                    for cid, (paper, group, group_idx) in pending_cells.items():
+                        if cid in p1_texts:
+                            continue
+                        # Prefer the real per-item error (batch item errored/canceled/
+                        # expired, or an online call exception) when we have one;
+                        # fall back to the generic message for cids that vanished for
+                        # some other reason (e.g. loaded from a stale p1 dump).
+                        cell_error_detail = p1_errors.get(
+                            cid, "pass1 failed — no output (API error/timeout); see log"
                         )
-                        store.save_answer(run.run_id, paper.paper_id, q.version_id, p2_drop_payload)
-                        _count_payload(p2_drop_payload)
-                        store.mark_failed(run.run_id, paper.paper_id, q.version_id, err_detail)
+                        for q in group:
+                            p1_drop_payload = build_error_answer(
+                                run_id=run.run_id, paper_id=paper.paper_id, question=q,
+                                extraction_detail=cell_error_detail,
+                            )
+                            store.save_answer(run.run_id, paper.paper_id, q.version_id, p1_drop_payload)
+                            _count_payload(p1_drop_payload)
+                            if cid in p1_errors:
+                                # Flip the store's local status away from 'done' (what
+                                # save_answer always sets) to 'failed' so should_skip_cell
+                                # treats this as retryable on the next run, instead of
+                                # permanently poisoning it the way a deterministic parse
+                                # error is (those legitimately stay 'done').
+                                store.mark_failed(run.run_id, paper.paper_id, q.version_id, cell_error_detail)
 
-                # Parse / verify / save
-                err = _parse_save_post_tail(
-                    p1_texts=p1_texts,
-                    p1_usage=p1_usage,
-                    p2_texts=p2_texts,
-                    p2_usage=p2_usage,
-                    pending_cells=pending_cells,
-                    source_texts=source_texts,
-                    run=run,
-                    cfg=cfg,
-                    store=store,
-                    fail_fast=cfg.fail_fast,
-                    on_payload_saved=_count_payload,
-                )
-                if err is not None:
-                    first_error.append(err)
+                    # Phase 2
+                    pending_p1 = {cid: t for cid, t in p1_texts.items() if cid in pending_cells}
+
+                    p2_texts, p2_usage, p2_errors = await _execute_pass2(
+                        run, cfg, pending_p1, pending_cells,
+                        store, settings, dry_run,
+                        chunk_i=chunk_i, sem=sem, limiter=limiter,
+                        on_p2_start=_on_p2_start,
+                        on_p2_advance=_on_p2_advance,
+                        response_format=ANNOTATE_RESPONSE_FORMAT,
+                        require_status=True,
+                    )
+
+                    # Cells that had a Pass-1 result but failed Pass-2 (batch item
+                    # errored/canceled/expired, or an online P2 call that raised) would
+                    # otherwise vanish the same way a dropped Pass-1 cell would — the
+                    # parse/save tail below only iterates p2_texts. Mirror the p1-drop
+                    # handling above so these are posted as visible error answers too.
+                    for cid, err_detail in p2_errors.items():
+                        if cid not in pending_cells:
+                            continue
+                        paper, group, group_idx = pending_cells[cid]
+                        for q in group:
+                            p2_drop_payload = build_error_answer(
+                                run_id=run.run_id, paper_id=paper.paper_id, question=q,
+                                extraction_detail=err_detail,
+                            )
+                            store.save_answer(run.run_id, paper.paper_id, q.version_id, p2_drop_payload)
+                            _count_payload(p2_drop_payload)
+                            store.mark_failed(run.run_id, paper.paper_id, q.version_id, err_detail)
+
+                    # Parse / verify / save
+                    err = _parse_save_post_tail(
+                        p1_texts=p1_texts,
+                        p1_usage=p1_usage,
+                        p2_texts=p2_texts,
+                        p2_usage=p2_usage,
+                        pending_cells=pending_cells,
+                        source_texts=source_texts,
+                        run=run,
+                        cfg=cfg,
+                        store=store,
+                        fail_fast=cfg.fail_fast,
+                        on_payload_saved=_count_payload,
+                    )
+                    if err is not None:
+                        first_error.append(err)
 
                 # Post per paper in chunk (includes no-OCR error records)
                 for paper in chunk_papers:
@@ -839,6 +1069,8 @@ async def pass2_pipeline(
                 run, cfg, pending_p1, pending_cells,
                 store, settings, dry_run,
                 sem=sem, limiter=limiter,
+                response_format=ANNOTATE_RESPONSE_FORMAT,
+                require_status=True,
             )
 
             # Parse / verify / save with p1 token carry-over
@@ -867,23 +1099,40 @@ async def pass2_pipeline(
                 fmt_cost   = fu.get("cost")
                 p2_latency = fu.get("latency_ms", 0) or 0
 
-                parsed = parse_structured_output(p2_text, [q.key for q in group])
-                failed_keys = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
-                if failed_keys:
-                    err = ExtractionError(failed_keys)
-                    logger.error(
-                        "EXTRACTION FAILURE (pass2) — run %d, paper %d, group %s: %s",
-                        run.run_id, paper_cell.paper_id, cid, err,
-                    )
-                    for q in group:
-                        store.save_answer(
-                            run.run_id, paper_cell.paper_id, q.version_id,
-                            build_error_answer(run_id=run.run_id, paper_id=paper_cell.paper_id, question=q, extraction_detail=str(err)),
-                        )
-                    n_failed += len(group)
-                    continue
+                parsed = parse_structured_output(p2_text, [q.key for q in group], annotate_mode=True)
+                parsed, _excl_idx = apply_scope_and_status(
+                    group, parsed, enabled=cfg.early_exit_on_ic_exclusion
+                )
 
                 for i, (question, result) in enumerate(zip(group, parsed)):
+                    status = result.get("extraction_status", "ok")
+
+                    if status == "skipped":
+                        store.save_answer(
+                            run.run_id, paper_cell.paper_id, question.version_id,
+                            build_skipped_answer(
+                                run_id=run.run_id, paper_id=paper_cell.paper_id, question=question,
+                                extraction_detail=result.get("extraction_detail", "gated out"),
+                            ),
+                            cid,
+                        )
+                        n_done += 1
+                        continue
+
+                    if status == "absent":
+                        err_detail = f"key {question.key!r} not found in pass-2 output"
+                        logger.error(
+                            "EXTRACTION FAILURE (pass2) — run %d, paper %d, group %s, key %r: %s",
+                            run.run_id, paper_cell.paper_id, cid, question.key, err_detail,
+                        )
+                        store.save_answer(
+                            run.run_id, paper_cell.paper_id, question.version_id,
+                            build_error_answer(run_id=run.run_id, paper_id=paper_cell.paper_id, question=question, extraction_detail=err_detail),
+                            cid,
+                        )
+                        n_failed += 1
+                        continue
+
                     verify = verify_citation(
                         result.get("cited_text", ""),
                         source_text,
@@ -914,6 +1163,13 @@ async def pass2_pipeline(
                         "p1_usage": u,
                     }
 
+                    status_kwargs: dict = {}
+                    if status == "invalid":
+                        status_kwargs = {
+                            "extraction_status": "invalid",
+                            "extraction_detail": f"pass-2 reported unmappable value for {question.key!r}",
+                        }
+
                     payload = build_llm_answer(
                         run_id=run.run_id,
                         paper_id=paper_cell.paper_id,
@@ -939,6 +1195,7 @@ async def pass2_pipeline(
                         fmt_tokens_cached=fmt_cached if i == 0 else 0,
                         fmt_cost=fmt_cost if i == 0 else None,
                         confidence=result.get("confidence"),
+                        **status_kwargs,
                     )
                     store.save_answer(run.run_id, paper_cell.paper_id, question.version_id, payload, cid)
                     n_done += 1

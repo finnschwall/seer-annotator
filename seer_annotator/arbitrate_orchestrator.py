@@ -164,6 +164,8 @@ def _parse_save_post_tail_resolutions(
         tok_input = u.get("input_tokens", 0)
         tok_output = u.get("output_tokens", 0)
         tok_cached = u.get("cache_read_tokens", 0)
+        tok_reasoning = u.get("reasoning_tokens", 0) or 0
+        p1_reasoning_content = u.get("reasoning_content")
         p1_cost = u.get("cost")
         p1_latency = u.get("latency_ms", 0) or 0
 
@@ -244,6 +246,8 @@ def _parse_save_post_tail_resolutions(
                 tokens_input=tok_input if i == 0 else 0,
                 tokens_output=tok_output if i == 0 else 0,
                 tokens_cached=tok_cached if i == 0 else 0,
+                tokens_reasoning=tok_reasoning if i == 0 else 0,
+                reasoning_content=p1_reasoning_content if i == 0 else None,
                 cost=p1_cost if i == 0 else None,
                 cost_currency="USD",
                 fmt_tokens_total=fmt_total if i == 0 else 0,
@@ -961,6 +965,8 @@ async def arbitration_pass2_pipeline(
                 p1_tok_output = p1_payload_row0.get("tokens_output", 0) or 0
                 p1_tok_cached = p1_payload_row0.get("tokens_cached", 0) or 0
                 p1_tok_total = p1_payload_row0.get("tokens_total", 0) or 0
+                p1_tok_reasoning = p1_payload_row0.get("tokens_reasoning", 0) or 0
+                p1_reasoning_content = p1_payload_row0.get("reasoning_content")
                 p1_cost_str = p1_payload_row0.get("cost")
                 p1_cost = Decimal(p1_cost_str) if p1_cost_str else None
                 p1_latency = p1_payload_row0.get("latency_ms", 0) or 0
@@ -1036,6 +1042,8 @@ async def arbitration_pass2_pipeline(
                         tokens_input=p1_tok_input if i == 0 else 0,
                         tokens_output=p1_tok_output if i == 0 else 0,
                         tokens_cached=p1_tok_cached if i == 0 else 0,
+                        tokens_reasoning=p1_tok_reasoning if i == 0 else 0,
+                        reasoning_content=p1_reasoning_content if i == 0 else None,
                         cost=p1_cost if i == 0 else None,
                         cost_currency="USD",
                         fmt_tokens_total=fmt_total if i == 0 else 0,

@@ -14,6 +14,16 @@ _VALUE_RE = re.compile(r'"value"\s*:\s*(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+
 
 _PRIMITIVE_MAP = {"true": True, "false": False, "null": None}
 
+# Mechanical per-entry status Pass-2 can report (annotate path only — see
+# ANNOTATE_RESPONSE_FORMAT below). Purely about what's present in the text:
+#   "ok"         — a value (possibly null for genuinely not-determinable) was
+#                  extracted from the question's block.
+#   "absent"     — no answer/block for this question is present in the text at all.
+#   "unmappable" — content is present but cannot be expressed as a valid value
+#                  for the type/options.
+# Never IC/scope-aware — that judgment belongs to the worker (see annotate/scope.py).
+_STATUS_VALUES = {"ok", "absent", "unmappable"}
+
 # Structured-output JSON schema for Pass-2 (formatting). Shared by annotation and
 # arbitration engines — both restructure free-form Pass-1 text into the same
 # {key, value, cited_text, comment, confidence} shape per question/dispute.
@@ -52,6 +62,31 @@ _RESPONSE_FORMAT = {
         },
     },
 }
+
+
+def _build_annotate_response_format() -> dict:
+    """Extended Pass-2 schema variant used ONLY by the annotate path.
+
+    Adds a required per-entry ``status`` (ok/absent/unmappable — see
+    _STATUS_VALUES) to the shared ``_RESPONSE_FORMAT`` shape. Built as a deep
+    copy so the shared constant (also imported by ``arbitrate/prompt.py``) is
+    never mutated — arbitration keeps using ``_RESPONSE_FORMAT`` unchanged.
+    """
+    import copy
+
+    fmt = copy.deepcopy(_RESPONSE_FORMAT)
+    item_schema = fmt["json_schema"]["schema"]["properties"]["results"]["items"]
+    item_schema["properties"]["status"] = {
+        "type": "string",
+        "enum": sorted(_STATUS_VALUES),
+    }
+    item_schema["required"].append("status")
+    fmt["json_schema"]["name"] = "annotation_results_with_status"
+    return fmt
+
+
+# Built once at import time — the annotate path's Pass-2 response_format.
+ANNOTATE_RESPONSE_FORMAT = _build_annotate_response_format()
 
 
 def _parse_raw_value(raw: str) -> object:
@@ -152,21 +187,58 @@ def _normalize_cited_text(raw: object) -> str | list | None:
 
 
 def _extract_result(obj: dict) -> dict:
-    """Pull the standard fields out of a parsed JSON object."""
+    """Pull the standard fields out of a parsed JSON object.
+
+    ``status`` is read defensively: older prompts/schemas (arbitration, or the
+    annotate path before this field existed) never send it, and a model can in
+    principle emit a stray value outside _STATUS_VALUES — either way this
+    defaults to "ok" (a value was present), matching pre-existing behavior for
+    every caller that doesn't look at ``status`` at all.
+    """
+    status = obj.get("status")
+    if status not in _STATUS_VALUES:
+        status = "ok"
     return {
         "key": obj.get("key"),
         "value": obj.get("value"),
         "cited_text": _normalize_cited_text(obj.get("cited_text")),
         "comment": obj.get("comment") or "",
         "confidence": obj.get("confidence"),
+        "status": status,
     }
 
 
-def _fill_missing(results: dict[str, dict], question_keys: list[str]) -> list[dict]:
+def _fill_missing(
+    results: dict[str, dict], question_keys: list[str], *, annotate_mode: bool = False
+) -> list[dict]:
+    """Fill in an entry for every question key P2 didn't return.
+
+    ``annotate_mode=False`` (default — arbitration and any other non-annotate
+    caller): unchanged legacy behavior — a missing key gets a ``parse_error``,
+    which is how those callers' whole-group ExtractionError detection works.
+
+    ``annotate_mode=True`` (the annotate path only): a missing key gets
+    ``status="absent"`` instead of a ``parse_error`` — the mechanical "no
+    answer/block present in the text" signal that annotate/scope.py's
+    exclusion-point + per-key tolerance logic consumes. No ``parse_error`` is
+    set, so this key alone never trips the legacy whole-group ExtractionError
+    path for annotate call sites (see orchestrator.py's per-key handling).
+    """
     out = []
     for k in question_keys:
         if k in results:
             out.append(results[k])
+        elif annotate_mode:
+            out.append(
+                {
+                    "key": k,
+                    "value": None,
+                    "cited_text": "",
+                    "comment": "",
+                    "confidence": None,
+                    "status": "absent",
+                }
+            )
         else:
             out.append(
                 {
@@ -193,13 +265,19 @@ def _strip_code_fence(text: str) -> str:
     return text
 
 
-def parse_structured_output(text: str, question_keys: list[str]) -> list[dict]:
+def parse_structured_output(
+    text: str, question_keys: list[str], *, annotate_mode: bool = False
+) -> list[dict]:
     """Parse pass-2 output when response_format=json_object was used.
 
     Expects {"results": [...]} or a bare [...] as the top-level JSON value.
     Falls back to parse_format_output() if the response is not valid JSON or
     does not match the expected shape (e.g. when drop_params silently removed
     response_format).
+
+    ``annotate_mode`` is forwarded to ``_fill_missing`` — see its docstring.
+    Default False preserves legacy behavior for every existing caller
+    (arbitration, and annotate call sites that haven't opted in yet).
     """
     text = _strip_code_fence(text)
     try:
@@ -209,7 +287,7 @@ def parse_structured_output(text: str, question_keys: list[str]) -> list[dict]:
             "parse_structured_output: response is not valid JSON — falling back to "
             "line-by-line parser. First 200 chars: %.200r", text
         )
-        return parse_format_output(text, question_keys)
+        return parse_format_output(text, question_keys, annotate_mode=annotate_mode)
 
     if isinstance(obj, dict) and "results" in obj:
         items = obj["results"]
@@ -220,7 +298,7 @@ def parse_structured_output(text: str, question_keys: list[str]) -> list[dict]:
             "parse_structured_output: unexpected JSON shape — falling back to "
             "line-by-line parser. type=%s", type(obj).__name__
         )
-        return parse_format_output(text, question_keys)
+        return parse_format_output(text, question_keys, annotate_mode=annotate_mode)
 
     results: dict[str, dict] = {}
     for item in items:
@@ -228,14 +306,17 @@ def parse_structured_output(text: str, question_keys: list[str]) -> list[dict]:
             r = _extract_result(item)
             results[r["key"]] = r
 
-    return _fill_missing(results, question_keys)
+    return _fill_missing(results, question_keys, annotate_mode=annotate_mode)
 
 
-def parse_format_output(text: str, question_keys: list[str]) -> list[dict]:
+def parse_format_output(
+    text: str, question_keys: list[str], *, annotate_mode: bool = False
+) -> list[dict]:
     """Extract one dict per question from pass-2 JSON-lines output (repair/opt-out path).
 
-    Returns list of {key, value, cited_text, comment, confidence} dicts.
-    Missing/malformed keys get value=None with a parse_error note.
+    Returns list of {key, value, cited_text, comment, confidence, status} dicts.
+    Missing/malformed keys get value=None with either a parse_error note
+    (default) or status="absent" (``annotate_mode=True`` — see _fill_missing).
     """
     results: dict[str, dict] = {}
 
@@ -262,4 +343,4 @@ def parse_format_output(text: str, question_keys: list[str]) -> list[dict]:
             r = _extract_result(obj)
             results[key] = r
 
-    return _fill_missing(results, question_keys)
+    return _fill_missing(results, question_keys, annotate_mode=annotate_mode)

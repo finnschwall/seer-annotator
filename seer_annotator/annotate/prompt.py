@@ -54,7 +54,21 @@ _QUESTION_BLOCK_TEMPLATE = """\
 --- QUESTION: {key} ---
 Label: {label}
 {help_section}
-{options_section}"""
+{options_section}{ic_section}"""
+
+# Standing instruction added to the questions message only when
+# RunConfig.early_exit_on_ic_exclusion is on. Short and placed once (not
+# per-question) since it's a cached prefix — negligible added input cost. The
+# savings this buys are truncated Pass-1 (and downstream Pass-2) *output*;
+# correctness never depends on the model actually obeying it — the worker
+# recomputes the exclusion point deterministically after Pass-2 (see
+# annotate/scope.py) and discards/relabels anything answered past it anyway.
+_EARLY_EXIT_INSTRUCTION = """\
+IMPORTANT — answer the questions below IN THE EXACT ORDER GIVEN. Some are \
+marked as inclusion-criteria (IC) gates above. The moment your answer to an IC \
+question EXCLUDES the paper (see that question's "Excludes if" line), STOP \
+immediately — do not answer any further questions after it.
+"""
 
 
 def _format_options(question: Question) -> str:
@@ -68,6 +82,33 @@ def _format_options(question: Question) -> str:
     return "\n".join(lines)
 
 
+def _format_ic_section(question: Question) -> str:
+    """Render which value(s) mean "excludes the paper" for an IC question.
+
+    Purely descriptive — always shown for is_ic questions regardless of
+    early_exit_on_ic_exclusion, so the model has the semantics in front of it
+    even when the worker isn't asking it to stop early. Uses ic_passes
+    (categorical) / ic_include_when_true (boolean), mirroring
+    annotations.ic.ic_answer_passes on the SEER side.
+    """
+    if not question.is_ic:
+        return ""
+    if question.question_type == "boolean":
+        if question.ic_include_when_true is None:
+            return ""
+        excluding = not question.ic_include_when_true
+        return f"\nThis is an INCLUSION-CRITERIA question. Excludes if: {excluding!s}"
+    if question.question_type == "categorical":
+        excluding = [opt.value for opt in question.options if opt.ic_passes is not None and not opt.ic_passes]
+        if not excluding:
+            return ""
+        return (
+            "\nThis is an INCLUSION-CRITERIA question. Excludes if the answer is: "
+            + ", ".join(repr(v) for v in excluding)
+        )
+    return ""
+
+
 def build_messages(
     source_text: str,
     questions: list[Question],
@@ -75,11 +116,19 @@ def build_messages(
     text_source: str = "full_text",
     system_prompt: str | None = None,
     cache_first: str = "text",
+    early_exit_on_ic_exclusion: bool = False,
 ) -> list[dict]:
     """Return messages=[system, user_prefix, user_questions].
 
     The prefix message is kept separate so caching.py can mark it.
     Callers should concatenate or pass the full list.
+
+    ``early_exit_on_ic_exclusion`` mirrors ``RunConfig.early_exit_on_ic_exclusion``
+    (default False, i.e. unchanged prompt): when True, adds the standing
+    "stop at the first IC exclusion" instruction. The per-question IC
+    exclusion semantics (``_format_ic_section``) are rendered unconditionally
+    for ``is_ic`` questions — that's just descriptive context, not a behavior
+    change either way.
     """
     source_label = "Full paper text (OCR)" if text_source == "full_text" else "Abstract"
     prefix_content = (
@@ -90,17 +139,20 @@ def build_messages(
     for q in questions:
         help_section = f"Help: {q.help_text}" if q.help_text else ""
         options_section = _format_options(q)
+        ic_section = _format_ic_section(q)
         q_blocks.append(
             _QUESTION_BLOCK_TEMPLATE.format(
                 key=q.key,
                 label=q.label,
                 help_section=help_section,
                 options_section=options_section,
+                ic_section=ic_section,
             )
         )
 
     question_content = (
         "Answer each question below for the paper text provided above.\n\n"
+        + ("\n" + _EARLY_EXIT_INSTRUCTION + "\n" if early_exit_on_ic_exclusion else "")
         + "\n\n".join(q_blocks)
     )
 
@@ -116,9 +168,40 @@ def build_messages(
     ]
 
 
+_STATUS_SCHEMA_LINE = (
+    '  {"key": "<key>", "value": <typed_value>, "cited_text": "<verbatim quote or empty>", '
+    '"comment": "<verbatim reasoning>", "confidence": <0-20 or null>, "status": "<ok|absent|unmappable>"},'
+)
+
+_NO_STATUS_SCHEMA_LINE = (
+    '  {"key": "<key>", "value": <typed_value>, "cited_text": "<verbatim quote or empty>", '
+    '"comment": "<verbatim reasoning>", "confidence": <0-20 or null>},'
+)
+
+# Purely mechanical — this is Pass-2's ONE job beyond restructuring: report
+# whether each question's block is present in the text at all, by inspecting
+# the text only. It must NEVER reason about inclusion criteria/scope (that's
+# the worker's job, see annotate/scope.py) and NEVER guess a value or explain
+# *why* something is absent.
+_STATUS_RULE = """\
+- status: purely mechanical, based only on what's present in the annotation text above —
+    * "ok"         — the question's block is present and you extracted a value from it
+                      (a null value for a genuinely not-determinable answer still counts as "ok").
+    * "absent"     — there is NO "--- ANSWER: <key> ---" block for this question anywhere
+                      in the text above.
+    * "unmappable" — the block IS present, but its content cannot be expressed as a valid
+                      value for this question's type/options (e.g. free text where a
+                      categorical value was required).
+  Never guess a value to avoid "absent"/"unmappable", and never explain *why* a value is
+  absent or unmappable — just report which of the three applies.
+"""
+
+
 def build_format_messages(
     pass1_text: str,
     questions: list[Question],
+    *,
+    require_status: bool = False,
 ) -> list[dict]:
     """Pass-2 messages: restructure pass-1 output into typed JSON.
 
@@ -126,6 +209,14 @@ def build_format_messages(
     response_format=json_object, the API enforces valid JSON; otherwise the
     model is still guided toward the same structure and parse_structured_output
     falls back gracefully if needed.
+
+    ``require_status`` adds the mechanical ok/absent/unmappable per-entry
+    status to the prompt's JSON contract (paired with
+    ``annotate.parse.ANNOTATE_RESPONSE_FORMAT`` for structured-output mode).
+    Default False keeps the prompt text byte-for-byte identical to before —
+    this function is also reused unchanged by arbitration (see
+    ``arbitrate/prompt.py``'s module docstring), which must NOT gain the
+    status field.
     """
     q_specs = []
     for q in questions:
@@ -135,6 +226,9 @@ def build_format_messages(
             spec += f" allow_multiple={q.allow_multiple} valid_values={vals!r}"
         q_specs.append(spec)
 
+    schema_line = _STATUS_SCHEMA_LINE if require_status else _NO_STATUS_SCHEMA_LINE
+    status_rule = _STATUS_RULE if require_status else ""
+
     content = f"""\
 Below is a free-form annotation output. Your only job is to faithfully restructure it into JSON.
 Do NOT rephrase, shorten, or summarise anything — copy text verbatim.
@@ -143,7 +237,7 @@ Do NOT rephrase, shorten, or summarise anything — copy text verbatim.
 
 Return a JSON object with a single "results" key containing one entry per question:
 {{"results": [
-  {{"key": "<key>", "value": <typed_value>, "cited_text": "<verbatim quote or empty>", "comment": "<verbatim reasoning>", "confidence": <0-20 or null>}},
+{schema_line}
   ...
 ]}}
 
@@ -161,6 +255,6 @@ Rules:
   If the Quotes section is "[NO DIRECT QUOTE]" (or otherwise contains no verbatim quote), also just copy that!
 - comment: copy VERBATIM from the annotation — do not rephrase, shorten, or paraphrase.
 - confidence: copy the integer (0–20) exactly as written. If not given or not determinable, null.
-Output entries in the same order as the questions listed above.
+{status_rule}Output entries in the same order as the questions listed above.
 """
     return [{"role": "user", "content": content}]

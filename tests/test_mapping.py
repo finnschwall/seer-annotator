@@ -6,6 +6,7 @@ from seer_annotator.config import Question, QuestionOption
 from seer_annotator.mapping import (
     build_llm_answer,
     build_error_answer,
+    build_skipped_answer,
     build_resolution,
     build_error_resolution,
     _map_value,
@@ -194,6 +195,27 @@ def test_build_resolution_null_value_is_abstention_not_error():
     assert payload["resolution_status"] == "ok"
     assert payload["resolution_detail"] == "LLM answered: non-determinable"
     assert payload["value_categorical"] is None
+
+
+def test_build_skipped_answer():
+    q = make_q("categorical", options=OPTS)
+    payload = build_skipped_answer(
+        run_id=1, paper_id=2, question=q,
+        extraction_detail="gated out: model_scope=false",
+    )
+    assert payload["extraction_status"] == "skipped"
+    assert payload["extraction_detail"] == "gated out: model_scope=false"
+    assert payload["value_categorical"] is None
+    assert payload["confidence"] is None
+    assert payload["tokens_total"] == 0
+    assert payload["cost"] is None
+
+
+def test_build_skipped_answer_boolean_null_value():
+    q = make_q("boolean")
+    payload = build_skipped_answer(run_id=1, paper_id=2, question=q, extraction_detail="gated out: a=false")
+    assert payload["value_boolean"] is None
+    assert payload["extraction_status"] == "skipped"
 
 
 def test_build_error_resolution():
