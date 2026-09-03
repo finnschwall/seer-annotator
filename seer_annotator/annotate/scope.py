@@ -16,7 +16,12 @@ into a scope decision.
 
 from __future__ import annotations
 
+import logging
+
 from ..config import Question
+from .parse import pass1_block_present
+
+logger = logging.getLogger(__name__)
 
 
 def option_ic_passes(question: Question, value: object) -> bool | None:
@@ -101,6 +106,7 @@ def apply_scope_and_status(
     parsed: list[dict],
     *,
     enabled: bool,
+    pass1_text: str | None = None,
 ) -> tuple[list[dict], int | None]:
     """Combine Pass-2's mechanical per-entry ``status`` with the worker's own
     exclusion-point computation into one final ``extraction_status`` per
@@ -133,18 +139,80 @@ def apply_scope_and_status(
     excluding question. ``excl_idx`` is the exclusion index (or None) so
     callers doing multi-round/early-exit batching can carry the decision
     forward to later groups/cells for the same paper.
+
+    ``pass1_text``, when not ``None``, enables a DEMOTE-ONLY correctness
+    guarantee: a Pass-2 entry may only keep a status that claims its answer
+    block exists ("ok" or "unmappable") if Pass-1's free-form text actually
+    contains an answer block for that question — either an
+    ``--- ANSWER: <key> ---`` header, or a ``--- QUESTION: <key> ---`` header
+    over a block that holds an ``Answer:`` field (see
+    ``parse.pass1_block_present`` for why the second shape counts). This defends against a Pass-2 model that
+    fabricates a value for a question Pass-1 never answered (observed: a weak
+    local model copying another question's quotes/comment and stamping
+    confidence 20 on them). Code can never promote "absent" -> "ok" — it has
+    no way to invent a value that isn't in the text — so this only ever
+    demotes a fabricated "ok"/"unmappable" down to "absent". The default
+    ``None`` performs no check at all, which is what keeps every existing
+    caller/test byte-for-byte unchanged, and is also what guarantees
+    arbitration (whose Pass-1 text has no such answer blocks) is never
+    affected — arbitration call sites simply never pass this parameter.
     """
     assert len(questions) == len(parsed), "questions/parsed must be aligned 1:1"
 
+    if pass1_text is not None:
+        # Enforce BEFORE the values_by_key loop below, which feeds
+        # compute_exclusion_index: a fabricated "ok" must never be allowed to
+        # move the IC exclusion point, even transiently.
+        demoted: list[dict] = []
+        for r in parsed:
+            key = r.get("key")
+            status = r.get("status", "ok")
+            if status in ("ok", "unmappable") and not pass1_block_present(pass1_text, key):
+                logger.warning(
+                    "Pass-2 claimed status=%r for key=%r but pass-1 has no answer "
+                    "block for it — demoting to 'absent'",
+                    status, key,
+                )
+                r = dict(r)
+                r["status"] = "absent"
+                r["value"] = None
+                r["cited_text"] = ""
+                r["comment"] = ""
+                r["confidence"] = None
+                r["extraction_detail"] = f"pass-1 has no answer block for {key!r}"
+            demoted.append(r)
+        parsed = demoted
+
+    def condition_matches(value: object, required: str, negate: bool) -> bool:
+        if required == "":
+            matched = value is not None and value != "" and value != []
+        elif isinstance(value, bool):
+            matched = str(value).lower() == required.lower()
+        elif isinstance(value, list):
+            matched = required in {str(v) for v in value}
+        else:
+            matched = str(value) == required
+        return not matched if negate else matched
+
+    values_by_key: dict[str, object] = {}
+    condition_inactive: set[int] = set()
+    for i, (q, r) in enumerate(zip(questions, parsed)):
+        inactive = q.conditions and any(
+            cond.get("depends_on") in values_by_key
+            and not condition_matches(
+                values_by_key[cond.get("depends_on")], cond.get("required_value", ""),
+                bool(cond.get("negate")),
+            )
+            for cond in q.conditions
+        )
+        if inactive:
+            condition_inactive.add(i)
+        elif r.get("status", "ok") == "ok":
+            values_by_key[q.key] = r.get("value")
+
     excl_idx: int | None = None
     if enabled:
-        values = {
-            r["key"]: r.get("value")
-            for r in parsed
-            if r.get("status", "ok") == "ok"
-        }
-        excl_idx = compute_exclusion_index(questions, values)
-
+        excl_idx = compute_exclusion_index(questions, values_by_key)
     excluding_key = questions[excl_idx].key if excl_idx is not None else None
 
     out: list[dict] = []
@@ -154,6 +222,10 @@ def apply_scope_and_status(
             r["value"] = None
             r["extraction_status"] = "skipped"
             r["extraction_detail"] = f"gated out: {excluding_key}=false"
+        elif i in condition_inactive:
+            r["value"] = None
+            r["extraction_status"] = "skipped"
+            r["extraction_detail"] = "condition not met"
         else:
             p2_status = r.get("status", "ok")
             if p2_status == "unmappable":

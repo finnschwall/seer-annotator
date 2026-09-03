@@ -31,6 +31,132 @@ def cli(verbose: bool) -> None:
             logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+# ---------------------------------------------------------------------------
+# Offline Phase-2 formatting benchmark
+#
+# Kept as a nested command group so these commands cannot be confused with the
+# production annotation commands.  ``source`` is imported lazily: inventory
+# and snapshot are the only commands that may initialize a SEER checkout.
+# ---------------------------------------------------------------------------
+@cli.group(name="benchmark")
+def benchmark() -> None:
+    """Create, run, and evaluate SQLite-only Phase-2 benchmarks."""
+
+
+@benchmark.command(name="list-db-runs")
+@click.option("--seer-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=pathlib.Path))
+def benchmark_list_db_runs(seer_root: pathlib.Path) -> None:
+    """List source database experiment runs and their eligibility."""
+    from .benchmarking.source import DjangoSource
+    source = DjangoSource(seer_root)
+    rows = source.list_runs()
+    table = Table(title=f"Source database runs ({seer_root})")
+    for column in ("Run", "Name", "Model", "Provider", "Usable papers", "Reason"):
+        table.add_column(column)
+    for row in rows:
+        table.add_row(str(row.run_id), row.name, row.model_name, row.model_provider, str(row.usable_papers), row.reason)
+    console.print(table)
+    console.print("[green]Source PostgreSQL read-only mode verified.[/]")
+
+
+def _benchmark_run_spec(value: str) -> tuple[int, int | None]:
+    try:
+        run_id, count = value.split(":", 1)
+        parsed_count = int(count)
+        if parsed_count < 0:
+            raise ValueError
+        return int(run_id), parsed_count
+    except (TypeError, ValueError):
+        raise click.BadParameter("must be RUN_ID:COUNT, for example 36:200")
+
+
+@benchmark.command(name="import-db")
+@click.option("--seer-root", required=True, type=click.Path(exists=True, file_okay=False, path_type=pathlib.Path))
+@click.option("--benchmark-db", required=True, type=click.Path(path_type=pathlib.Path))
+@click.option("--dataset", required=True)
+@click.option("--run", "run_specs", required=True, multiple=True, callback=lambda ctx, param, values: tuple(_benchmark_run_spec(v) for v in values))
+@click.option("--seed", required=True, type=int)
+@click.option("--case-kind", type=click.Choice(["abstract", "full_text"]), default="abstract", show_default=True)
+@click.option("--allow-current-source", is_flag=True)
+def benchmark_import_db(seer_root: pathlib.Path, benchmark_db: pathlib.Path, dataset: str, run_specs: tuple[tuple[int, int | None], ...], seed: int, case_kind: str, allow_current_source: bool) -> None:
+    """Snapshot selected papers/groups from a source database into SQLite."""
+    from .benchmarking.source import DjangoSource, SourceSnapshotter
+    from .benchmarking.store import BenchmarkStore, DatasetSpec
+    store = BenchmarkStore(benchmark_db)
+    spec = DatasetSpec(dataset, str(seer_root), {"runs": [list(item) for item in run_specs]}, seed=seed, case_kind=case_kind)
+    result = SourceSnapshotter(DjangoSource(seer_root), store).import_dataset(spec, run_specs, allow_current_source=allow_current_source)
+    console.print("[green]Source PostgreSQL read-only mode verified.[/]")
+    console.print(f"[green]Snapshot complete:[/] {result['cases']} cases from {result['runs']} run(s) into {benchmark_db}")
+
+
+@benchmark.command(name="run")
+@click.option("--benchmark-db", required=True, type=click.Path(exists=True, dir_okay=False, path_type=pathlib.Path))
+@click.option("--dataset", required=True)
+@click.option("--settings", "settings_path", required=True, type=click.Path(exists=True, dir_okay=False, path_type=pathlib.Path))
+@click.option("--models", "models_path", required=True, type=click.Path(exists=True, dir_okay=False, path_type=pathlib.Path))
+@click.option("--model", "model_names", multiple=True, required=True)
+@click.option("--retry-errors", is_flag=True)
+@click.option("--concurrency", type=click.IntRange(min=1), default=1, show_default=True)
+@click.option("--rpm", type=float, default=None)
+def benchmark_run(benchmark_db: pathlib.Path, dataset: str, settings_path: pathlib.Path, models_path: pathlib.Path, model_names: tuple[str, ...], retry_errors: bool, concurrency: int, rpm: float | None) -> None:
+    """Run one or more Phase-2 models against local benchmark cases."""
+    import asyncio
+    from .benchmarking.models import select_model_configs
+    from .benchmarking.runner import BenchmarkRunner
+    from .benchmarking.store import BenchmarkStore
+    store = BenchmarkStore(benchmark_db)
+    configs = select_model_configs(models_path, list(model_names))
+    for config in configs:
+        result = asyncio.run(BenchmarkRunner(store, settings_path=str(settings_path), concurrency=concurrency, per_provider_rpm=rpm).run(dataset, config, retry_errors=retry_errors))
+        console.print(f"[green]{config.name}[/]: {result}")
+
+
+@benchmark.command(name="status")
+@click.option("--benchmark-db", required=True, type=click.Path(exists=True, dir_okay=False, path_type=pathlib.Path))
+@click.option("--dataset", required=True)
+def benchmark_status(benchmark_db: pathlib.Path, dataset: str) -> None:
+    """Show local benchmark case and execution progress."""
+    from .benchmarking.store import BenchmarkStore
+    store = BenchmarkStore(benchmark_db)
+    cases = store.get_cases(dataset)
+    rows = store.get_executions(dataset)
+    grouped: dict[str, dict[str, int]] = {}
+    for row in rows:
+        grouped.setdefault(row["model_name"], {}).setdefault(row["status"], 0)
+        grouped[row["model_name"]][row["status"]] += 1
+    console.print(f"Cases: {len(cases)}")
+    table = Table(title=f"Benchmark status: {dataset}"); table.add_column("Model"); table.add_column("Execution status")
+    for name, counts in grouped.items():
+        table.add_row(name, ", ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+    console.print(table)
+
+
+@benchmark.command(name="evaluate")
+@click.option("--benchmark-db", required=True, type=click.Path(exists=True, dir_okay=False, path_type=pathlib.Path))
+@click.option("--dataset", required=True)
+@click.option("--reference", required=True)
+@click.option("--candidates", multiple=True, default=("all",), help="all, comma-separated names, or repeat --candidates")
+@click.option("--quote-threshold", type=click.FloatRange(min=0, max=1), default=.90, show_default=True)
+@click.option("--json-out", type=click.Path(path_type=pathlib.Path), default=None)
+@click.option("--csv-out", type=click.Path(path_type=pathlib.Path), default=None)
+def benchmark_evaluate(benchmark_db: pathlib.Path, dataset: str, reference: str, candidates: tuple[str, ...], quote_threshold: float, json_out: pathlib.Path | None, csv_out: pathlib.Path | None) -> None:
+    """Compare stored model outputs offline; no LLM or source DB is opened."""
+    from .benchmarking.evaluate import evaluate, write_report
+    from .benchmarking.store import BenchmarkStore
+    values = [item.strip() for option in candidates for item in option.split(",") if item.strip()]
+    report = evaluate(BenchmarkStore(benchmark_db), dataset, reference, values, quote_threshold=quote_threshold)
+    write_report(report, json_out, csv_out)
+    table = Table(title=f"Phase-2 benchmark: {dataset} (reference: {reference})")
+    for column in ("Candidate", "Groups", "Group accuracy", "Answer accuracy", "Missing", "Incomplete", "Errors"):
+        table.add_column(column)
+    for name, row in report["models"].items():
+        fmt = lambda value: "n/a" if value is None else f"{100 * value:.1f}%"
+        table.add_row(name, str(row["eligible_groups"]), fmt(row["group_accuracy"]), fmt(row["answer_accuracy"]), str(row["candidate_missing"]), str(row.get("candidate_incomplete", 0)), str(row["candidate_errors"]))
+    console.print(table)
+    if report["excluded"]:
+        console.print(f"[yellow]Excluded reference cases:[/] {report['excluded']}")
+
+
 @cli.command()
 @click.argument("pipeline_json", type=click.Path(exists=True))
 @click.option("--settings", "settings_path", default=None)
@@ -452,7 +578,14 @@ def preview_prompt(
     SEER network call when OCR is not yet cached (a placeholder is used instead).
     """
     with open(pipeline_json) as f:
-        pipeline = PipelineConfig.model_validate(json.load(f))
+        payload = json.load(f)
+    if "disputes" in payload:
+        _preview_dispute_prompt(
+            DisputePipelineConfig.model_validate(payload), settings_path, runs,
+            papers, which_pass, output_path, no_fetch,
+        )
+        return
+    pipeline = PipelineConfig.model_validate(payload)
 
     settings = Settings.load(settings_path)
 
@@ -565,6 +698,119 @@ def preview_prompt(
 
     output = "\n".join(lines)
 
+    if output_path:
+        pathlib.Path(output_path).write_text(output, encoding="utf-8")
+        console.print(f"[green]Wrote {len(lines)} sections to {output_path}[/]")
+    else:
+        click.echo(output)
+
+
+def _preview_dispute_prompt(
+    pipeline: DisputePipelineConfig,
+    settings_path: str | None,
+    runs: str | None,
+    papers: str | None,
+    which_pass: str,
+    output_path: str | None,
+    no_fetch: bool,
+) -> None:
+    """Preview the same Pass-1/Pass-2 messages used by ``arbitrate``."""
+    from .annotate.prompt import build_format_messages
+    from .arbitrate.prompt import build_dispute_messages
+    from .arbitrate_orchestrator import _papers_from_disputes, _questions_for_paper
+    from .batching import resolve_groups
+    from .caching import apply_cache
+    from .config import effective_arbiter_config
+    from .seer_client import SeerClient
+    from .store import Store
+
+    settings = Settings.load(settings_path)
+    run_ids = {int(x) for x in runs.split(",")} if runs else None
+    paper_ids = {int(x) for x in papers.split(",")} if papers else None
+    runs_to_process = [r for r in pipeline.runs if run_ids is None or r.run_id in run_ids]
+    disputes_by_paper: dict[int, list] = {}
+    for dispute in pipeline.disputes:
+        if paper_ids is None or dispute.paper_id in paper_ids:
+            disputes_by_paper.setdefault(dispute.paper_id, []).append(dispute)
+    papers_to_process = [p for p in _papers_from_disputes(pipeline.disputes) if p.paper_id in disputes_by_paper]
+    if not runs_to_process:
+        console.print("[yellow]No matching runs.[/]")
+        return
+    if not papers_to_process:
+        console.print("[yellow]No matching papers.[/]")
+        return
+
+    question_by_key = {q.key: q for q in pipeline.questions}
+    store = Store(settings.runtime.store_path)
+
+    async def _source_text(paper, cfg):
+        if cfg.text_source == "candidates_only":
+            return ""
+        if cfg.text_source == "abstract":
+            return paper.abstract
+        cached = store.get_ocr(paper.paper_id)
+        if cached is not None:
+            return cached
+        if no_fetch:
+            return "[OCR TEXT NOT AVAILABLE — run the pipeline first or remove --no-fetch]"
+        text = await SeerClient(pipeline.api_base, pipeline.api_token).fetch_ocr_markdown(paper.paper_id)
+        if text is not None:
+            store.save_ocr(paper.paper_id, text)
+            return text
+        return "[OCR TEXT NOT AVAILABLE]"
+
+    lines: list[str] = []
+
+    async def _build() -> None:
+        for run in runs_to_process:
+            cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
+            for paper in papers_to_process:
+                paper_disputes = disputes_by_paper[paper.paper_id]
+                questions = _questions_for_paper(paper_disputes, question_by_key)
+                if any(d.item_type == "continuation" for d in paper_disputes):
+                    if cfg.text_source == "candidates_only":
+                        raise click.ClickException(
+                            "text_source='candidates_only' cannot preview continuation items"
+                        )
+                    groups = [questions]
+                else:
+                    groups = resolve_groups(cfg, questions)
+                candidates = {(d.paper_id, d.version_id): d.candidates for d in paper_disputes}
+                item_types = {d.version_id: d.item_type for d in paper_disputes}
+                source_text = await _source_text(paper, cfg)
+                for group_idx, group in enumerate(groups):
+                    keys = ", ".join(q.key for q in group)
+                    lines.append(
+                        f"{'=' * 80}\nRUN:    {run.name}  (id={run.run_id})\n"
+                        f"MODEL:  {run.model_provider}/{run.model_name}\n"
+                        f"PAPER:  {paper.title}  (id={paper.paper_id})\n"
+                        f"GROUP:  {group_idx + 1}/{len(groups)}  keys=[{keys}]\n"
+                        f"CACHE:  {'on' if cfg.cache else 'off'}  batching={cfg.batching}  "
+                        f"text_source={cfg.text_source}\n{'=' * 80}"
+                    )
+                    if which_pass in ("1", "both"):
+                        messages = build_dispute_messages(
+                            None if cfg.text_source == "candidates_only" else source_text,
+                            group, {q.version_id: candidates.get((paper.paper_id, q.version_id), []) for q in group},
+                            anonymize_raters=cfg.anonymize_raters, text_source=cfg.text_source,
+                            system_prompt=cfg.system_prompt, cache_first=cfg.cache_first,
+                            item_types_by_version_id=item_types,
+                        )
+                        messages = apply_cache(run.model_provider, messages, enabled=cfg.cache, ttl=cfg.cache_ttl)
+                        lines.append("\n--- PASS 1 ---\n")
+                        for message in messages:
+                            content = message["content"]
+                            if isinstance(content, list):
+                                content = "".join(block.get("text", repr(block)) if isinstance(block, dict) else str(block) for block in content)
+                            lines.append(f"[{message['role'].upper()}]\n{content}\n")
+                    if which_pass in ("2", "both"):
+                        lines.append("\n--- PASS 2 ---\n")
+                        placeholder = "[PASS-1 OUTPUT WOULD GO HERE — this is the reasoning text that pass-2 reformats into JSON]"
+                        for message in build_format_messages(placeholder, group):
+                            lines.append(f"[{message['role'].upper()}]\n{message['content']}\n")
+
+    asyncio.run(_build())
+    output = "\n".join(lines)
     if output_path:
         pathlib.Path(output_path).write_text(output, encoding="utf-8")
         console.print(f"[green]Wrote {len(lines)} sections to {output_path}[/]")

@@ -73,6 +73,23 @@ async def complete(
         total_tokens=raw_usage.get("total_tokens", 0) or 0,
     )
 
+    # Ollama reports no thinking-token count: its `/api/chat` response carries only
+    # `prompt_eval_count` and `eval_count`, and thinking is folded into the latter.
+    # It does return the thinking TEXT, so split the reported completion tokens by
+    # character share -- both strings come from the same tokenizer, so their
+    # chars-per-token cancels. Measured 0-6% against `eval_count - tokens(content)`
+    # on gemma4:31b-cloud and glm-5.2:cloud (worst case: long visible answers).
+    #
+    # Deliberately keyed on "text but no count" rather than on a provider name, so
+    # it cannot fire for a provider that reports a real number. It never applies to
+    # Anthropic: with `thinking.display` at its default ("omitted" on Sonnet 5 /
+    # Opus 5 / Opus 4.7+) there is no text to measure, and the count is reported
+    # anyway. Counts derived here are approximate -- callers that display them
+    # should mark them as such.
+    if not usage.reasoning_tokens and reasoning and usage.output_tokens:
+        share = len(reasoning) / (len(reasoning) + len(text))
+        usage.reasoning_tokens = round(share * usage.output_tokens)
+
     # Cost via LiteLLM
     cost_val: Decimal | None = None
     try:
@@ -118,6 +135,17 @@ class _DummyResult:
         self.raw = {"dummy": True, "model": model}
 
 
+def _dummy_question_keys(messages: list[dict]) -> list[str]:
+    """Pull question keys out of a build_messages()-shaped prompt, from its
+    ``--- QUESTION: <key> ---`` section headers (see annotate/prompt.py)."""
+    import re
+
+    content = " ".join(
+        m.get("content", "") for m in messages if isinstance(m.get("content"), str)
+    )
+    return re.findall(r"--- QUESTION: (\S+) ---", content)
+
+
 async def dummy_complete(
     model: str,
     provider: str,
@@ -139,11 +167,32 @@ async def dummy_complete(
         ]
         text = json.dumps({"results": results})
     else:
-        text = (
-            "STUDY_DESIGN_KEY\n"
-            "Quote: 'patients were randomised'\n"
-            "Reasoning: The paper describes randomisation.\n"
-            "Answer: rct\n"
-            "Confidence: 4\n"
-        )
+        # Emit a real "--- ANSWER: <key> ---" block per question found in the
+        # prompt (see annotate/prompt.py's DEFAULT_SYSTEM template) so this
+        # dummy stands in faithfully for a Pass-1 model under the
+        # pass1_block_present() presence check in annotate/scope.py — a
+        # canned, key-agnostic block would otherwise get every "ok" demoted
+        # to "absent" as a false-positive fabrication.
+        keys = _dummy_question_keys(messages)
+        if keys:
+            text = "\n".join(
+                f"--- ANSWER: {k} ---\n"
+                "Quotes:\n"
+                "- \"patients were randomised\"\n"
+                "Reasoning: The paper describes randomisation.\n"
+                "Answer: rct\n"
+                "Confidence: 4\n"
+                for k in keys
+            )
+        else:
+            # No recognizable question blocks (e.g. a caller passing custom
+            # messages directly, such as arbitration) — fall back to the
+            # original generic text.
+            text = (
+                "STUDY_DESIGN_KEY\n"
+                "Quote: 'patients were randomised'\n"
+                "Reasoning: The paper describes randomisation.\n"
+                "Answer: rct\n"
+                "Confidence: 4\n"
+            )
     return _DummyResult(text=text, model=model)  # type: ignore[return-value]

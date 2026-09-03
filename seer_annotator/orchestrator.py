@@ -97,116 +97,203 @@ def _parse_save_post_tail(
         fmt_cost   = fu.get("cost")
         p2_latency = fu.get("latency_ms", 0) or 0
 
-        parsed = parse_structured_output(p2_text, [q.key for q in group], annotate_mode=True)
-        # Deterministic scope enforcement — authoritative over the model (see
-        # annotate/scope.py). enabled=False (early_exit_on_ic_exclusion off)
-        # short-circuits to excl_idx=None every time, so no cell can ever come
-        # out "skipped" unless the run opted in.
-        parsed, excl_idx = apply_scope_and_status(
-            group, parsed, enabled=cfg.early_exit_on_ic_exclusion
-        )
+        def _save_extraction_error(question, detail, *, code, label, extra=None):
+            """Persist a per-question error answer and log it.
+
+            One cell's bad reply costs that cell, not the run — this is the shared
+            tail for every "we cannot trust this answer" exit below.
+            """
+            logger.error(
+                "%s — run %d, paper %d, group %d, key %r: %s",
+                label, run.run_id, paper.paper_id, group_idx, question.key, detail,
+            )
+            diagnostic = {"phase": "pass2", "code": code, "detail": detail}
+            if extra:
+                diagnostic.update(extra)
+            error_payload = build_error_answer(
+                run_id=run.run_id, paper_id=paper.paper_id, question=question,
+                extraction_detail=detail,
+                raw_response={
+                    "pass1_text": p1_text,
+                    "pass2_text": p2_text,
+                    "p1_usage": p1_usage.get(cid, {}),
+                    "p2_usage": p2_usage.get(cid, {}),
+                    "diagnostics": [diagnostic],
+                    "batch_group_id": cid,
+                },
+            )
+            store.save_answer(run.run_id, paper.paper_id, question.version_id, error_payload, cid)
+            if on_payload_saved is not None:
+                on_payload_saved(error_payload)
+
+        try:
+            parsed = parse_structured_output(p2_text, [q.key for q in group], annotate_mode=True)
+            # Deterministic scope enforcement — authoritative over the model (see
+            # annotate/scope.py). enabled=False (early_exit_on_ic_exclusion off)
+            # short-circuits to excl_idx=None every time, so no cell can ever come
+            # out "skipped" unless the run opted in.
+            parsed, excl_idx = apply_scope_and_status(
+                group, parsed, enabled=cfg.early_exit_on_ic_exclusion,
+                # `or None`: p1_text defaults to "" above, and an empty string would
+                # read as "pass-1 answered nothing" and demote the whole group.
+                pass1_text=p1_text or None,
+            )
+        except Exception as exc:
+            # Nothing above this tail catches — run_pipeline calls it unguarded and
+            # asyncio.run re-raises — so an escape here ends the job and leaves every
+            # remaining paper unattempted. Fail the cell instead.
+            detail = f"pass-2 parse failed: {type(exc).__name__}: {exc}"
+            logger.exception(
+                "PARSE CRASH — run %d, paper %d, group %d", run.run_id, paper.paper_id, group_idx,
+            )
+            for question in group:
+                _save_extraction_error(
+                    question, detail, code="pass2_parse_crash", label="EXTRACTION FAILURE",
+                )
+            if fail_fast and first_extraction_error is None:
+                first_extraction_error = ExtractionError({q.key: detail for q in group})
+            continue
+
         if excl_idx is not None and excluded_papers is not None:
             excluded_papers[paper.paper_id] = f"gated out: {group[excl_idx].key}=false"
 
         for i, (question, result) in enumerate(zip(group, parsed)):
-            status = result.get("extraction_status", "ok")
+            try:
+                status = result.get("extraction_status", "ok")
 
-            if status == "skipped":
-                payload = build_skipped_answer(
-                    run_id=run.run_id, paper_id=paper.paper_id, question=question,
-                    extraction_detail=result.get("extraction_detail", "gated out"),
+                if status == "skipped":
+                    payload = build_skipped_answer(
+                        run_id=run.run_id, paper_id=paper.paper_id, question=question,
+                        extraction_detail=result.get("extraction_detail", "gated out"),
+                    )
+                    store.save_answer(run.run_id, paper.paper_id, question.version_id, payload, cid)
+                    if on_payload_saved is not None:
+                        on_payload_saved(payload)
+                    continue
+
+                if status == "absent":
+                    # Genuine omission (no exclusion moots this key) — per-key error,
+                    # NOT a whole-group failure (the A5 parse-tolerance fix). Prefer
+                    # the demotion's own extraction_detail (e.g. "pass-1 has no
+                    # answer block for ...") over the generic message — it tells
+                    # apart Pass-1 never answering from Pass-2 dropping the key.
+                    err_detail = result.get(
+                        "extraction_detail", f"key {question.key!r} not found in pass-2 output"
+                    )
+                    _save_extraction_error(
+                        question, err_detail, code="pass2_parse_missing_keys",
+                        label="EXTRACTION FAILURE", extra={"missing_keys": [question.key]},
+                    )
+                    if fail_fast and first_extraction_error is None:
+                        first_extraction_error = ExtractionError({question.key: err_detail})
+                    continue
+
+                cited_error = result.get("cited_text_error")
+                if cited_error:
+                    # The item's JSON did not survive parsing: json_repair
+                    # resynchronised the malformed part into a nested list inside
+                    # cited_text, swallowing this item's comment/confidence/status
+                    # along with it. The value we would save is not what the model
+                    # wrote, so report an extraction failure instead of an answer
+                    # that looks normal. See annotate.parse.cited_text_violation.
+                    _save_extraction_error(
+                        question, cited_error, code="pass2_malformed_cited_text",
+                        label="EXTRACTION FAILURE",
+                    )
+                    if fail_fast and first_extraction_error is None:
+                        first_extraction_error = ExtractionError({question.key: cited_error})
+                    continue
+
+                verify = verify_citation(
+                    result.get("cited_text", ""),
+                    source_texts.get(paper.paper_id, ""),
+                    max_error_rate=cfg.citation_max_error_rate,
+                    max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
+                )
+                cited_text_verified = None if verify.get("note") == "no citation provided" else verify["ok"]
+
+                verify_list = verify_citations(
+                    result.get("cited_text", ""),
+                    source_texts.get(paper.paper_id, ""),
+                    max_error_rate=cfg.citation_max_error_rate,
+                    max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
+                )
+                citations = build_citations(result.get("cited_text", ""), verify_list)
+
+                raw_response = {
+                    "pass1_text": p1_text,
+                    "pass2_text": p2_text,
+                    "parse_result": result,
+                    "verify": verify,
+                    "text_source": cfg.text_source,
+                    "batch_group_id": cid,
+                    "batch_mode": True,
+                    "p1_usage": u,
+                    "p2_usage": p2_usage.get(cid, {}),
+                }
+                # status == "invalid" is Pass-2's own mechanical determination
+                # ("content present but unmappable") — pass it through explicitly
+                # rather than letting build_llm_answer re-derive extraction_status
+                # from _map_value, since that would fall back to "ok" for a value
+                # that happens to coincidentally validate.
+                status_kwargs: dict = {}
+                if status == "invalid":
+                    status_kwargs = {
+                        "extraction_status": "invalid",
+                        "extraction_detail": f"pass-2 reported unmappable value for {question.key!r}",
+                    }
+                payload = build_llm_answer(
+                    run_id=run.run_id,
+                    paper_id=paper.paper_id,
+                    question=question,
+                    value=result.get("value"),
+                    comment=result.get("comment", ""),
+                    cited_text=result.get("cited_text", ""),
+                    cited_text_verified=cited_text_verified,
+                    citations=citations,
+                    raw_response=raw_response,
+                    latency_ms=(p1_latency + p2_latency) if i == 0 else 0,
+                    tokens_total=tok_input + tok_output + tok_cached if i == 0 else 0,
+                    tokens_input=tok_input if i == 0 else 0,
+                    tokens_output=tok_output if i == 0 else 0,
+                    tokens_cached=tok_cached if i == 0 else 0,
+                    tokens_reasoning=tok_reasoning if i == 0 else 0,
+                    reasoning_content=p1_reasoning_content if i == 0 else None,
+                    cost=p1_cost if i == 0 else None,
+                    cost_currency="USD",
+                    fmt_tokens_total=fmt_total if i == 0 else 0,
+                    fmt_tokens_input=fmt_input if i == 0 else 0,
+                    fmt_tokens_output=fmt_output if i == 0 else 0,
+                    fmt_tokens_cached=fmt_cached if i == 0 else 0,
+                    fmt_cost=fmt_cost if i == 0 else None,
+                    confidence=result.get("confidence"),
+                    **status_kwargs,
                 )
                 store.save_answer(run.run_id, paper.paper_id, question.version_id, payload, cid)
                 if on_payload_saved is not None:
                     on_payload_saved(payload)
-                continue
-
-            if status == "absent":
-                # Genuine omission (no exclusion moots this key) — per-key error,
-                # NOT a whole-group failure (the A5 parse-tolerance fix).
-                err_detail = f"key {question.key!r} not found in pass-2 output"
-                logger.error(
-                    "EXTRACTION FAILURE — run %d, paper %d, group %d, key %r: %s",
-                    run.run_id, paper.paper_id, group_idx, question.key, err_detail,
+            except Exception as exc:
+                # Same containment as the parse guard above, one level in: verification,
+                # payload building or the store raising for one question must not take
+                # the rest of the batch (or the run) with it.
+                detail = f"pass-2 post-processing failed: {type(exc).__name__}: {exc}"
+                logger.exception(
+                    "POST-PROCESSING CRASH — run %d, paper %d, group %d, key %r",
+                    run.run_id, paper.paper_id, group_idx, question.key,
                 )
-                error_payload = build_error_answer(
-                    run_id=run.run_id, paper_id=paper.paper_id, question=question,
-                    extraction_detail=err_detail,
-                )
-                store.save_answer(run.run_id, paper.paper_id, question.version_id, error_payload, cid)
-                if on_payload_saved is not None:
-                    on_payload_saved(error_payload)
+                try:
+                    _save_extraction_error(
+                        question, detail, code="pass2_unexpected_error",
+                        label="EXTRACTION FAILURE",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not even save the error answer for run %d, paper %d, key %r",
+                        run.run_id, paper.paper_id, question.key,
+                    )
                 if fail_fast and first_extraction_error is None:
-                    first_extraction_error = ExtractionError({question.key: err_detail})
+                    first_extraction_error = ExtractionError({question.key: detail})
                 continue
-
-            verify = verify_citation(
-                result.get("cited_text", ""),
-                source_texts.get(paper.paper_id, ""),
-                max_error_rate=cfg.citation_max_error_rate,
-                max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
-            )
-            cited_text_verified = None if verify.get("note") == "no citation provided" else verify["ok"]
-
-            verify_list = verify_citations(
-                result.get("cited_text", ""),
-                source_texts.get(paper.paper_id, ""),
-                max_error_rate=cfg.citation_max_error_rate,
-                max_ellipsis_gap=cfg.citation_max_ellipsis_gap,
-            )
-            citations = build_citations(result.get("cited_text", ""), verify_list)
-
-            raw_response = {
-                "pass1_text": p1_text,
-                "pass2_text": p2_text,
-                "parse_result": result,
-                "verify": verify,
-                "text_source": cfg.text_source,
-                "batch_group_id": cid,
-                "batch_mode": True,
-                "p1_usage": u,
-            }
-            # status == "invalid" is Pass-2's own mechanical determination
-            # ("content present but unmappable") — pass it through explicitly
-            # rather than letting build_llm_answer re-derive extraction_status
-            # from _map_value, since that would fall back to "ok" for a value
-            # that happens to coincidentally validate.
-            status_kwargs: dict = {}
-            if status == "invalid":
-                status_kwargs = {
-                    "extraction_status": "invalid",
-                    "extraction_detail": f"pass-2 reported unmappable value for {question.key!r}",
-                }
-            payload = build_llm_answer(
-                run_id=run.run_id,
-                paper_id=paper.paper_id,
-                question=question,
-                value=result.get("value"),
-                comment=result.get("comment", ""),
-                cited_text=result.get("cited_text", ""),
-                cited_text_verified=cited_text_verified,
-                citations=citations,
-                raw_response=raw_response,
-                latency_ms=(p1_latency + p2_latency) if i == 0 else 0,
-                tokens_total=tok_input + tok_output + tok_cached if i == 0 else 0,
-                tokens_input=tok_input if i == 0 else 0,
-                tokens_output=tok_output if i == 0 else 0,
-                tokens_cached=tok_cached if i == 0 else 0,
-                tokens_reasoning=tok_reasoning if i == 0 else 0,
-                reasoning_content=p1_reasoning_content if i == 0 else None,
-                cost=p1_cost if i == 0 else None,
-                cost_currency="USD",
-                fmt_tokens_total=fmt_total if i == 0 else 0,
-                fmt_tokens_input=fmt_input if i == 0 else 0,
-                fmt_tokens_output=fmt_output if i == 0 else 0,
-                fmt_tokens_cached=fmt_cached if i == 0 else 0,
-                fmt_cost=fmt_cost if i == 0 else None,
-                confidence=result.get("confidence"),
-                **status_kwargs,
-            )
-            store.save_answer(run.run_id, paper.paper_id, question.version_id, payload, cid)
-            if on_payload_saved is not None:
-                on_payload_saved(payload)
 
     return first_extraction_error
 
@@ -681,6 +768,13 @@ async def run_pipeline(
                             p2_drop_payload = build_error_answer(
                                 run_id=run.run_id, paper_id=paper.paper_id, question=q,
                                 extraction_detail=err_detail,
+                                raw_response={
+                                    "pass1_text": p1_texts.get(cid, ""),
+                                    "p1_usage": p1_usage.get(cid, {}),
+                                    "p2_usage": p2_usage.get(cid, {}),
+                                    "batch_group_id": cid,
+                                    "diagnostics": [{"phase": "pass2", "code": "pass2_provider_error", "detail": err_detail}],
+                                },
                             )
                             store.save_answer(run.run_id, paper.paper_id, q.version_id, p2_drop_payload)
                             _count_payload(p2_drop_payload)
@@ -1101,7 +1195,11 @@ async def pass2_pipeline(
 
                 parsed = parse_structured_output(p2_text, [q.key for q in group], annotate_mode=True)
                 parsed, _excl_idx = apply_scope_and_status(
-                    group, parsed, enabled=cfg.early_exit_on_ic_exclusion
+                    group, parsed, enabled=cfg.early_exit_on_ic_exclusion,
+                    # .get(cid) -> None when absent, NOT "": an empty string would
+                    # read as "pass-1 answered nothing" and demote the entire group
+                    # to absent. None skips the check, failing toward prior behavior.
+                    pass1_text=pending_p1.get(cid),
                 )
 
                 for i, (question, result) in enumerate(zip(group, parsed)):
@@ -1120,7 +1218,11 @@ async def pass2_pipeline(
                         continue
 
                     if status == "absent":
-                        err_detail = f"key {question.key!r} not found in pass-2 output"
+                        # Prefer the demotion's own extraction_detail (e.g. "pass-1
+                        # has no answer block for ...") over the generic message.
+                        err_detail = result.get(
+                            "extraction_detail", f"key {question.key!r} not found in pass-2 output"
+                        )
                         logger.error(
                             "EXTRACTION FAILURE (pass2) — run %d, paper %d, group %s, key %r: %s",
                             run.run_id, paper_cell.paper_id, cid, question.key, err_detail,
@@ -1128,6 +1230,26 @@ async def pass2_pipeline(
                         store.save_answer(
                             run.run_id, paper_cell.paper_id, question.version_id,
                             build_error_answer(run_id=run.run_id, paper_id=paper_cell.paper_id, question=question, extraction_detail=err_detail),
+                            cid,
+                        )
+                        n_failed += 1
+                        continue
+
+                    cited_error = result.get("cited_text_error")
+                    if cited_error:
+                        # The item's JSON did not survive parsing intact, so its
+                        # value/comment/confidence are not what the model wrote
+                        # (see annotate.parse.cited_text_violation).
+                        logger.error(
+                            "EXTRACTION FAILURE (pass2) — run %d, paper %d, group %s, key %r: %s",
+                            run.run_id, paper_cell.paper_id, cid, question.key, cited_error,
+                        )
+                        store.save_answer(
+                            run.run_id, paper_cell.paper_id, question.version_id,
+                            build_error_answer(
+                                run_id=run.run_id, paper_id=paper_cell.paper_id,
+                                question=question, extraction_detail=cited_error,
+                            ),
                             cid,
                         )
                         n_failed += 1

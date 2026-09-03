@@ -1,0 +1,93 @@
+dataset: abstract-ic-run36-500-seed20260825   cases: 500
+
+FABRICATION — a status of ok/unmappable on a question Pass-1 never answered
+model                         done  answers  no P1 blk  ghost    rate  w/value IC gate moved
+gemma4-31b                     500     2000        531      1  0.19%        1             1
+qwen3.5-397b                   500     2000        531      1  0.19%        1             1
+deepseek-v4-pro                500     2000        531      1  0.19%        1             1
+gpt-5-mini                     500     2000        531      4  0.75%        4             1
+gpt-5-nano                     500     2000        531      9  1.69%        9             1
+deepseek-v4-flash-nothink      500     2000        531     13  2.45%       13             1
+
+DATA LOSS — 'absent' claimed although the Pass-1 block is present
+model                         P1 blk present  false absent    rate  parse-recovered
+gemma4-31b                              1469             0  0.00%                0
+qwen3.5-397b                            1469             0  0.00%                0
+deepseek-v4-pro                         1469             0  0.00%                0
+gpt-5-mini                              1469             1  0.07%                0
+gpt-5-nano                              1469            42  2.86%                0
+deepseek-v4-flash-nothink               1469             1  0.07%                0
+
+WIRE RELIABILITY (per group of questions)
+model                         groups  native  fallbk  repair  missKey  dupKey  unexKey  schemaV  errors
+gemma4-31b                       500 99.60%       2       2        0       0        0        0       0
+qwen3.5-397b                     500 99.80%       1       1        0       0        0        0       0
+deepseek-v4-pro                  500 100.00%       0       0        0       0        0        0       0
+gpt-5-mini                       500 100.00%       0       0        0       0        0        0       0
+gpt-5-nano                       500 100.00%       0       0       76       0        0        3       0
+deepseek-v4-flash-nothink        500 98.80%       6       6        0       0        0        0       0
+
+CITATION FIDELITY vs Pass-1 (reference-free; blocks that carry real quotes)
+model                         scored  perfect  format only  TEXT LOST  text intact
+gpt-5-mini                      1441     1441            0          0 100.00%
+qwen3.5-397b                    1441     1441            0          0 100.00%
+deepseek-v4-pro                 1441     1440            0          1 99.93%
+deepseek-v4-flash-nothink       1441     1423           16          2 99.86%
+gemma4-31b                      1441     1439            0          2 99.86%
+gpt-5-nano                      1402     1363           20         19 98.64%
+
+COST / SPEED (per completed group)
+model                          in tok  out tok   reason  $/1k grp   p50 ms   p95 ms
+gemma4-31b                       1128      558        0      0.00     2551     5797
+qwen3.5-397b                     1099     5303        0      0.00    61154    88174
+deepseek-v4-pro                  1063     1831        0      0.00    12188    25232
+gpt-5-mini                       1186     1363      884      3.02    11330    17154
+gpt-5-nano                       1186     4228     3622      1.75    31596    62617
+deepseek-v4-flash-nothink        1063      482        0      0.00     2011     4134
+
+--- gemma4-31b: 2 fabrication / gate events ---
+    36:8040:36-8040-0 xai_operation ok No 20
+    IC-GATE 36:8040:36-8040-0 raw=xai_operation enforced=None 
+
+--- qwen3.5-397b: 2 fabrication / gate events ---
+    36:8040:36-8040-0 xai_operation ok No 20
+    IC-GATE 36:8040:36-8040-0 raw=xai_operation enforced=None 
+
+--- deepseek-v4-pro: 2 fabrication / gate events ---
+    36:8040:36-8040-0 xai_operation ok No 20
+    IC-GATE 36:8040:36-8040-0 raw=xai_operation enforced=None 
+
+--- gpt-5-mini: 5 fabrication / gate events ---
+    36:8040:36-8040-0 is_paper ok Yes 20
+    36:8040:36-8040-0 language_model_applied ok Yes 20
+    36:8040:36-8040-0 xai_operation ok No 20
+    36:8040:36-8040-0 xai_applied_to_language_model ok No 20
+    IC-GATE 36:8040:36-8040-0 raw=xai_operation enforced=None 
+
+--- gpt-5-nano: 10 fabrication / gate events ---
+    36:8040:36-8040-0 is_paper ok Yes 20
+    36:8040:36-8040-0 language_model_applied ok Yes 20
+    36:8040:36-8040-0 xai_operation ok No 20
+    36:8040:36-8040-0 xai_applied_to_language_model ok No 20
+    IC-GATE 36:8040:36-8040-0 raw=xai_operation enforced=None 
+    36:18203:36-18203-0 language_model_applied ok Yes 20
+    36:18203:36-18203-0 xai_applied_to_language_model ok No 20
+    36:25660:36-25660-0 is_paper ok Yes 20
+    36:25660:36-25660-0 language_model_applied ok Yes 20
+    36:25660:36-25660-0 xai_applied_to_language_model ok No 20
+
+--- deepseek-v4-flash-nothink: 14 fabrication / gate events ---
+    36:8040:36-8040-0 is_paper ok Yes 20
+    36:8040:36-8040-0 language_model_applied ok Yes 20
+    36:8040:36-8040-0 xai_operation ok No 20
+    36:8040:36-8040-0 xai_applied_to_language_model ok No 20
+    IC-GATE 36:8040:36-8040-0 raw=xai_operation enforced=None 
+    36:18203:36-18203-0 is_paper ok Yes 20
+    36:18203:36-18203-0 language_model_applied ok Yes 20
+    36:18203:36-18203-0 xai_applied_to_language_model ok No 20
+    36:25286:36-25286-0 is_paper ok Yes 15
+    36:25286:36-25286-0 language_model_applied ok Yes 15
+    36:25286:36-25286-0 xai_applied_to_language_model ok No 15
+    36:25660:36-25660-0 is_paper ok Yes 20
+    36:25660:36-25660-0 language_model_applied ok Yes 20
+    36:25660:36-25660-0 xai_applied_to_language_model ok No 20

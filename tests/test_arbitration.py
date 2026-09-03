@@ -171,6 +171,56 @@ def test_anonymize_raters_hides_rater_key():
     assert "user:3" in attributed_text and "run:10" in attributed_text
 
 
+def test_continuation_prompt_keeps_explicit_stopped_candidate_slot():
+    from seer_annotator.config import Candidate, Question
+
+    q = Question(
+        question_id=2, key="follow_up", version=1, version_id=2,
+        label="Follow up", question_type="boolean",
+    )
+    candidates = [
+        Candidate(
+            rater_key="run:1", answer_status="excluded",
+            stopped_at_question_key="eligibility", detail="Paper excluded by this rater.",
+        ),
+        Candidate(rater_key="run:2", answer_status="answered", value=True),
+    ]
+    messages = build_dispute_messages(
+        "paper", [q], {2: candidates}, item_types_by_version_id={2: "continuation"},
+    )
+    rendered = " ".join(m["content"] for m in messages if isinstance(m["content"], str))
+    assert "CONTINUATION QUESTION" in rendered
+    assert "No answer: Paper excluded by this rater. (at eligibility)" in rendered
+    assert "Proposed value: True" in rendered
+
+
+def test_adjudication_scope_accepts_omission_only_after_exclusion():
+    from seer_annotator.arbitrate_orchestrator import _apply_adjudication_scope
+    from seer_annotator.config import Question
+
+    gate = Question(
+        question_id=1, key="gate", version=1, version_id=1, label="Gate",
+        question_type="boolean", is_ic=True, ic_include_when_true=True,
+    )
+    later = Question(
+        question_id=2, key="later", version=1, version_id=2, label="Later",
+        question_type="text",
+    )
+    stopped = _apply_adjudication_scope(
+        [gate, later],
+        [{"key": "gate", "value": False, "status": "ok"},
+         {"key": "later", "value": None, "status": "absent"}],
+    )
+    assert stopped[1]["resolution_status"] == "not_applicable"
+
+    continued = _apply_adjudication_scope(
+        [gate, later],
+        [{"key": "gate", "value": True, "status": "ok"},
+         {"key": "later", "value": None, "status": "absent"}],
+    )
+    assert continued[1]["resolution_status"] == "error"
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_run_arbitration_pipeline_sends_start_and_terminal_heartbeats(pipeline, settings):

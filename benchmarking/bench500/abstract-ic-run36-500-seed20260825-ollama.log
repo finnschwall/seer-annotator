@@ -1,0 +1,31 @@
+Lane ollama started: 2026-08-26T11:36:59+02:00
+Dataset: abstract-ic-run36-500-seed20260825
+SQLite: /home/ies/schwall/sysreview/seer-annotator/benchmarking/bench500/phase2-500.sqlite
+Models: deepseek-v4-flash-nothink gemma4-31b qwen3.5-397b deepseek-v4-pro
+
+Running model: deepseek-v4-flash-nothink (2026-08-26T11:36:59+02:00)
+deepseek-v4-flash-nothink: {'complete': 500, 'error': 0, 'skipped': 0}
+
+Running model: gemma4-31b (2026-08-26T11:45:35+02:00)
+gemma4-31b: {'complete': 500, 'error': 0, 'skipped': 0}
+
+Running model: qwen3.5-397b (2026-08-26T11:54:15+02:00)
+qwen3.5-397b: {'complete': 500, 'error': 0, 'skipped': 0}
+
+Running model: deepseek-v4-pro (2026-08-26T14:05:22+02:00)
+deepseek-v4-pro: {'complete': 500, 'error': 0, 'skipped': 0}
+
+Lane ollama finished: 2026-08-26T14:34:02+02:00
+Cases: 500
+               Benchmark status:                
+       abstract-ic-run36-500-seed20260825       
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓
+┃ Model                     ┃ Execution status ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━┩
+│ deepseek-v4-flash-nothink │ complete=500     │
+│ gpt-5-mini                │ complete=500     │
+│ gemma4-31b                │ complete=500     │
+│ gpt-5-nano                │ complete=500     │
+│ qwen3.5-397b              │ complete=500     │
+│ deepseek-v4-pro           │ complete=500     │
+└───────────────────────────┴──────────────────┘

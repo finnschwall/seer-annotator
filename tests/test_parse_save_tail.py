@@ -43,6 +43,14 @@ def _wire(results):
     return json.dumps({"results": results})
 
 
+def _p1_text(*keys):
+    """A minimal Pass-1 free-form text containing a real "--- ANSWER: <key> ---"
+    block for each of *keys* — needed so annotate/scope.py's pass1_block_present
+    demotion check (see tests/test_pass1_presence.py) doesn't treat these
+    synthetic Pass-2 "ok"/"unmappable" fixtures as fabricated."""
+    return "\n".join(f"--- ANSWER: {k} ---\nAnswer: something\nConfidence: 10\n" for k in keys)
+
+
 def _answers_by_key(store, run_id, paper_id, question_map):
     rows = store.all_answers(run_id=run_id, paper_id=paper_id)
     out = {}
@@ -67,7 +75,7 @@ def test_downstream_marked_skipped_when_early_exit_enabled(store):
     pending_cells = {"cid1": (type("P", (), {"paper_id": 100})(), group, 0)}
 
     err = _parse_save_post_tail(
-        p1_texts={"cid1": "p1 text"}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
+        p1_texts={"cid1": _p1_text("gate", "downstream")}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
         pending_cells=pending_cells, source_texts={100: "source"},
         run=run, cfg=cfg, store=store, fail_fast=False,
     )
@@ -98,7 +106,7 @@ def test_downstream_not_skipped_when_flag_disabled(store):
     pending_cells = {"cid1": (type("P", (), {"paper_id": 101})(), group, 0)}
 
     _parse_save_post_tail(
-        p1_texts={"cid1": "p1 text"}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
+        p1_texts={"cid1": _p1_text("gate", "downstream")}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
         pending_cells=pending_cells, source_texts={101: "source"},
         run=run, cfg=cfg, store=store, fail_fast=False,
     )
@@ -125,7 +133,7 @@ def test_one_missing_key_does_not_error_the_whole_group(store):
     pending_cells = {"cid1": (type("P", (), {"paper_id": 102})(), group, 0)}
 
     _parse_save_post_tail(
-        p1_texts={"cid1": "p1 text"}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
+        p1_texts={"cid1": _p1_text("q1")}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
         pending_cells=pending_cells, source_texts={102: "source"},
         run=run, cfg=cfg, store=store, fail_fast=False,
     )
@@ -149,7 +157,7 @@ def test_unmappable_status_becomes_invalid(store):
     pending_cells = {"cid1": (type("P", (), {"paper_id": 103})(), group, 0)}
 
     _parse_save_post_tail(
-        p1_texts={"cid1": "p1 text"}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
+        p1_texts={"cid1": _p1_text("q1")}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
         pending_cells=pending_cells, source_texts={103: "source"},
         run=run, cfg=cfg, store=store, fail_fast=False,
     )
@@ -174,7 +182,7 @@ def test_excluded_papers_out_param_populated(store):
     excluded: dict = {}
 
     _parse_save_post_tail(
-        p1_texts={"cid1": "p1 text"}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
+        p1_texts={"cid1": _p1_text("gate")}, p1_usage={}, p2_texts={"cid1": p2_text}, p2_usage={},
         pending_cells=pending_cells, source_texts={104: "source"},
         run=run, cfg=cfg, store=store, fail_fast=False,
         excluded_papers=excluded,

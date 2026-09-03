@@ -99,6 +99,82 @@ def _parse_raw_value(raw: str) -> object:
         return float(raw)
 
 
+# A block header as the prompt template writes it: "ANSWER"/"QUESTION" in
+# capitals, alone on its line apart from decoration. Deliberately
+# case-SENSITIVE, unlike the key match below, so that a block's own
+# "Answer: Yes" field line is never mistaken for the start of the next block.
+_BLOCK_HEADER_LINE = re.compile(r"^[^A-Za-z0-9\n]{0,8}(?:ANSWER|QUESTION)\s*:", re.MULTILINE)
+
+# The template's "Answer:" field label, tolerant of wrapping decoration
+# ("**Answer:** yes"). Its presence is the evidence that a block holds a real
+# answer rather than an echo of the question.
+_ANSWER_FIELD_LINE = re.compile(r"^[^A-Za-z0-9\n]{0,4}Answer\s*:[^\S\n]*\S",
+                                re.IGNORECASE | re.MULTILINE)
+
+
+def _key_header_pattern(label: str, key: str) -> str:
+    """Header pattern for *key* under *label* ("ANSWER" or "QUESTION").
+
+    Unanchored on purpose: whatever decorates the header ("---", "**", "===")
+    simply isn't matched, so no character class for it is needed. The negative
+    lookahead (rather than ``\\b``) is what keeps key boundaries exact.
+    """
+    return label + r"\s*:\s*" + re.escape(key) + r"(?![A-Za-z0-9_.\-])"
+
+
+def pass1_block_present(pass1_text: str, key: str) -> bool:
+    """Whether Pass-1's free-form text contains an answer block for *key*
+    (see prompt.py's standing instruction to the reasoning model).
+
+    Two shapes count:
+
+    1. An ``--- ANSWER: <key> ---`` header, on the header alone. The match is
+       deliberately tolerant — case-insensitive, permissive about the
+       dashes/asterisks/whitespace typically wrapping "ANSWER" and about
+       whitespace around the colon — because a Pass-1 model that wobbles on
+       the exact header formatting (e.g. "**ANSWER: key**" or
+       "===ANSWER: key===") still genuinely answered the question. A strict
+       match would turn that formatting wobble into silent data loss on an
+       otherwise-good answer, which is worse than the fabrication problem
+       this function exists to catch.
+
+    2. A ``--- QUESTION: <key> ---`` header **whose block contains an
+       "Answer:" field line**. Observed in production: a reasoning model
+       answers correctly — real quotes, reasoning, answer, confidence — but
+       labels the block after the question it is answering rather than after
+       the answer, echoing the header shape the questions message uses. That
+       is the same formatting wobble as (1), so it is recovered the same way.
+
+    Shape 2 must show answer content; the bare header is not enough. Echoing
+    a header is exactly what the model in the observed case did, so a model
+    one step sloppier could echo a question header and then answer nothing
+    (e.g. print the header, then stop on an IC exclusion) — and accepting a
+    bare ``QUESTION:`` header would hand Pass-2 a free pass to invent that
+    answer, which is precisely what this guard exists to prevent. Requiring
+    the "Answer:" field leaves the accept-set of shape 1 unchanged: only the
+    new fallback has to prove it holds an answer.
+
+    Residual (accepted) gap: a Pass-1 text that echoes a question header for
+    an unanswered key AND writes its other headers in lower case gives the
+    block-boundary scan nothing to stop at, so the next block's "Answer:"
+    line can be read as this block's. That needs mixed-case headers in one
+    output, and still needs Pass-2 to fabricate on top of it.
+
+    What this must NOT be tolerant about is key boundaries: it uses a
+    negative lookahead (rather than ``\\b``) so a text containing only
+    ``q10``'s block is never mistaken for containing ``q1``'s.
+    """
+    if re.search(_key_header_pattern("ANSWER", key), pass1_text, re.IGNORECASE):
+        return True
+    for m in re.finditer(_key_header_pattern("QUESTION", key), pass1_text, re.IGNORECASE):
+        rest = pass1_text[m.end():]
+        boundary = _BLOCK_HEADER_LINE.search(rest)
+        block = rest[: boundary.start()] if boundary else rest
+        if _ANSWER_FIELD_LINE.search(block):
+            return True
+    return False
+
+
 class ExtractionError(RuntimeError):
     """Raised when pass-2 parsing fails to extract one or more question keys.
 
@@ -169,21 +245,96 @@ def _try_repair(line: str) -> dict | None:
     return obj
 
 
+def _try_repair_document(text: str) -> list | None:
+    """Attempt a whole-document json_repair when json.loads fails on the full Pass-2 text.
+
+    Handles failures the line-based fallback can't, e.g. pretty-printed multi-line
+    JSON that's missing only the final closing brace — no single line is a complete
+    JSON object there, so the line parser recovers nothing and every question gets
+    silently placeholdered.
+
+    _try_repair's per-line "value must match a raw-text regex" guard doesn't
+    translate to a whole document (there's no single line to cross-check a given
+    field against), so the guard here is coarser: accept the repair only if it
+    yields at least one dict item with a non-empty "key". That's enough to reject
+    json_repair inventing a plausible-looking structure from unrelated garbage,
+    without trying to validate every field.
+
+    Returns the item list (from {"results": [...]} or a bare [...]), or None if
+    repair isn't available, fails, or doesn't produce a usable shape.
+    """
+    try:
+        from json_repair import repair_json
+    except ImportError:
+        return None
+
+    try:
+        repaired = json.loads(repair_json(text))
+    except Exception:
+        return None
+
+    if isinstance(repaired, dict) and "results" in repaired:
+        items = repaired["results"]
+    elif isinstance(repaired, list):
+        items = repaired
+    else:
+        return None
+
+    if not isinstance(items, list) or not any(
+        isinstance(item, dict) and item.get("key") for item in items
+    ):
+        return None
+    return items
+
+
 _NO_DIRECT_QUOTE = "[NO DIRECT QUOTE]"
 
 
+def cited_text_violation(raw: object) -> str | None:
+    """Describe why ``raw`` is not a usable cited_text, or None if it is fine.
+
+    Valid shapes are: absent/null, a string, or a list of strings. Anything else
+    means the wire value did not survive intact — in practice a json_repair
+    resynchronisation that swallowed the item's later fields into a nested list
+    inside cited_text. The quote list is then not a quote list any more, and the
+    rest of the item (comment, confidence, status) is missing, so the answer must
+    be reported as an extraction failure rather than saved as a normal answer.
+    """
+    if raw is None or isinstance(raw, str):
+        return None
+    if isinstance(raw, list):
+        bad = sorted({type(e).__name__ for e in raw if not isinstance(e, str)})
+        if bad:
+            return (
+                f"cited_text list contains non-string element(s) of type "
+                f"{', '.join(bad)} — the JSON item did not survive parsing intact: "
+                f"{raw!r:.300}"
+            )
+        return None
+    return (
+        f"cited_text must be a string or a list of strings, got "
+        f"{type(raw).__name__}: {raw!r:.300}"
+    )
+
+
 def _normalize_cited_text(raw: object) -> str | list | None:
-    """Return None when the LLM signalled no verbatim quote is available."""
+    """Return None when the LLM signalled no verbatim quote is available.
+
+    Also guarantees the shape downstream code assumes: a str, a list of str, or
+    None/"" — never a nested list, dict or number. Elements that are not strings
+    are dropped here; ``cited_text_violation`` is what reports that they were
+    there (see _extract_result).
+    """
     if raw is None:
         return ""
     if isinstance(raw, list):
-        stripped = [s.strip() if isinstance(s, str) else s for s in raw]
-        if stripped == [_NO_DIRECT_QUOTE]:
+        quotes = [s for s in raw if isinstance(s, str)]
+        if [s.strip() for s in quotes] == [_NO_DIRECT_QUOTE]:
             return None
-        return raw
-    if isinstance(raw, str) and raw.strip() == _NO_DIRECT_QUOTE:
-        return None
-    return raw or ""
+        return quotes
+    if isinstance(raw, str):
+        return None if raw.strip() == _NO_DIRECT_QUOTE else raw
+    return ""
 
 
 def _extract_result(obj: dict) -> dict:
@@ -198,14 +349,23 @@ def _extract_result(obj: dict) -> dict:
     status = obj.get("status")
     if status not in _STATUS_VALUES:
         status = "ok"
-    return {
+    raw_cited = obj.get("cited_text")
+    result = {
         "key": obj.get("key"),
         "value": obj.get("value"),
-        "cited_text": _normalize_cited_text(obj.get("cited_text")),
+        "cited_text": _normalize_cited_text(raw_cited),
         "comment": obj.get("comment") or "",
         "confidence": obj.get("confidence"),
         "status": status,
     }
+    violation = cited_text_violation(raw_cited)
+    if violation:
+        logger.error(
+            "Malformed cited_text for key=%r — reporting as an extraction failure: %s",
+            obj.get("key"), violation,
+        )
+        result["cited_text_error"] = violation
+    return result
 
 
 def _fill_missing(
@@ -282,23 +442,27 @@ def parse_structured_output(
     text = _strip_code_fence(text)
     try:
         obj = json.loads(text)
-    except json.JSONDecodeError:
+        if isinstance(obj, dict) and "results" in obj:
+            items = obj["results"]
+        elif isinstance(obj, list):
+            items = obj
+        else:
+            raise ValueError(f"unexpected top-level JSON shape: {type(obj).__name__}")
+    except (json.JSONDecodeError, ValueError) as exc:
+        # Try a whole-document repair (handles e.g. pretty-printed JSON missing only
+        # the final closing brace) before giving up on structured JSON entirely — the
+        # line-based fallback below only understands JSONL and misses that case.
+        items = _try_repair_document(text)
+        if items is None:
+            logger.warning(
+                "parse_structured_output: response is not valid JSON (%s) — falling back "
+                "to line-by-line parser. First 200 chars: %.200r", exc, text
+            )
+            return parse_format_output(text, question_keys, annotate_mode=annotate_mode)
         logger.warning(
-            "parse_structured_output: response is not valid JSON — falling back to "
-            "line-by-line parser. First 200 chars: %.200r", text
+            "parse_structured_output: whole-document JSON repair recovered %d item(s) "
+            "after %s. First 200 chars: %.200r", len(items), exc, text
         )
-        return parse_format_output(text, question_keys, annotate_mode=annotate_mode)
-
-    if isinstance(obj, dict) and "results" in obj:
-        items = obj["results"]
-    elif isinstance(obj, list):
-        items = obj
-    else:
-        logger.warning(
-            "parse_structured_output: unexpected JSON shape — falling back to "
-            "line-by-line parser. type=%s", type(obj).__name__
-        )
-        return parse_format_output(text, question_keys, annotate_mode=annotate_mode)
 
     results: dict[str, dict] = {}
     for item in items:
@@ -344,3 +508,153 @@ def parse_format_output(
             results[key] = r
 
     return _fill_missing(results, question_keys, annotate_mode=annotate_mode)
+
+
+def parse_structured_output_diagnostic(
+    text: str, question_keys: list[str], *, annotate_mode: bool = True
+) -> dict:
+    """Parse formatted output and retain mechanical parser diagnostics.
+
+    This is deliberately an additive API: existing callers should continue to
+    use :func:`parse_structured_output`, whose return shape and error semantics
+    are unchanged.  ``present`` distinguishes an explicitly emitted
+    ``status="absent"`` entry from a key which was omitted altogether.
+    """
+    expected = list(question_keys)
+    expected_set = set(expected)
+    stripped = _strip_code_fence(text)
+    native_json = False
+    fallback_used = False
+    repair_used = False
+    parse_errors: list[str] = []
+    raw_items: list[dict] = []
+    raw_entries: list[object] = []
+
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, dict) and "results" in obj:
+            items = obj["results"]
+            if not isinstance(items, list):
+                raise ValueError("results is not an array")
+            native_json = True
+        elif isinstance(obj, list):
+            items = obj
+            native_json = True
+        else:
+            raise ValueError("unexpected top-level JSON shape")
+        raw_entries = list(items)
+        raw_items = [item for item in items if isinstance(item, dict) and item.get("key")]
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        fallback_used = True
+        parse_errors.append(str(exc))
+        # Try a whole-document repair first — it recovers cases the line-based parser
+        # below can't, e.g. pretty-printed JSON missing only the final closing brace,
+        # where no single line is a complete JSON object. On success, feed the
+        # recovered items through the same raw_entries/raw_items shape the native-JSON
+        # path uses, so the field validation and key-order checks below run unchanged.
+        doc_items = _try_repair_document(stripped)
+        if doc_items is not None:
+            repair_used = True
+            raw_entries = list(doc_items)
+            raw_items = [item for item in doc_items if isinstance(item, dict) and item.get("key")]
+        else:
+            for line in stripped.splitlines():
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as line_exc:
+                    item = _try_repair(line)
+                    if item is not None:
+                        repair_used = True
+                    else:
+                        parse_errors.append(str(line_exc))
+                if isinstance(item, dict):
+                    raw_entries.append(item)
+                    if item.get("key"):
+                        raw_items.append(item)
+
+    # The tolerant extraction API intentionally supplies defaults for old
+    # callers.  Benchmark validity is stricter: every emitted result must
+    # explicitly carry the complete wire contract and valid field types.
+    required_fields = ("key", "value", "cited_text", "comment", "confidence", "status")
+    schema_violations: list[dict] = []
+    missing_fields: list[dict] = []
+    allowed_status = {"ok", "absent", "unmappable"}
+    for ordinal, item in enumerate(raw_entries):
+        if not isinstance(item, dict):
+            schema_violations.append({"ordinal": ordinal, "key": None, "fields": ["entry must be an object"]})
+            continue
+        absent = [field for field in required_fields if field not in item]
+        if absent:
+            missing_fields.append({"ordinal": ordinal, "key": item.get("key"), "fields": absent})
+        invalid: list[str] = []
+        if "key" in item and (not isinstance(item["key"], str) or not item["key"]):
+            invalid.append("key")
+        if "value" in item:
+            value = item["value"]
+            if not (value is None or isinstance(value, (str, int, float, bool)) or
+                    (isinstance(value, list) and all(isinstance(v, str) for v in value))):
+                invalid.append("value")
+        # null and "" are equivalent on the wire for these two fields — _extract_result
+        # normalizes both to "" (via _normalize_cited_text / `obj.get("comment") or ""`),
+        # so a model that writes null here is not a schema violation.
+        if "cited_text" in item and not (item["cited_text"] is None or isinstance(item["cited_text"], str) or
+                                           (isinstance(item["cited_text"], list) and all(isinstance(v, str) for v in item["cited_text"]))):
+            invalid.append("cited_text")
+        if "comment" in item and not (item["comment"] is None or isinstance(item["comment"], str)):
+            invalid.append("comment")
+        if "confidence" in item and not (item["confidence"] is None or (isinstance(item["confidence"], int) and not isinstance(item["confidence"], bool))):
+            invalid.append("confidence")
+        if "status" in item and item["status"] not in allowed_status:
+            invalid.append("status")
+        if invalid:
+            schema_violations.append({"ordinal": ordinal, "key": item.get("key"), "fields": invalid})
+
+    emitted = [str(item["key"]) for item in raw_items]
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for key in emitted:
+        if key in seen and key not in duplicates:
+            duplicates.append(key)
+        seen.add(key)
+    unexpected = list(dict.fromkeys(key for key in emitted if key not in expected_set))
+    missing = [key for key in expected if key not in seen]
+
+    # Keep the last duplicate's legacy value, matching parse_structured_output.
+    by_key: dict[str, dict] = {}
+    for item in raw_items:
+        key = str(item["key"])
+        if key in expected_set:
+            answer = _extract_result(item)
+            answer["present"] = True
+            by_key[key] = answer
+    answers: list[dict] = []
+    for key in expected:
+        if key in by_key:
+            answers.append(by_key[key])
+        elif annotate_mode:
+            answers.append({
+                "key": key, "value": None, "cited_text": "", "comment": "",
+                "confidence": None, "status": "absent", "present": False,
+            })
+        else:
+            answers.append({
+                "key": key, "value": None, "cited_text": "", "comment": "",
+                "confidence": None, "parse_error": f"key {key!r} not found in pass-2 output",
+                "present": False,
+            })
+    return {
+        "answers": answers,
+        "native_json": native_json,
+        "fallback_used": fallback_used,
+        "repair_used": repair_used,
+        "emitted_key_order": emitted,
+        "missing_keys": missing,
+        "duplicate_keys": duplicates,
+        "unexpected_keys": unexpected,
+        "parse_errors": parse_errors,
+        "missing_fields": missing_fields,
+        "schema_violations": schema_violations,
+    }

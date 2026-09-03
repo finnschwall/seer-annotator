@@ -33,6 +33,12 @@ seer-annotate status pipeline.json
 
 Resume after interruption: just re-run the same command. Already-done and posted cells are skipped.
 
+## Phase-2 formatting benchmark
+
+The offline benchmark workflow (snapshot source experiment data, run multiple
+formatting models, then evaluate later) is documented in
+[seer_annotator/benchmarking/README.md](seer_annotator/benchmarking/README.md).
+
 ---
 
 ## Running the two stages separately

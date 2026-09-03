@@ -17,7 +17,13 @@ from ..llm import LLMResult, complete as llm_complete, dummy_complete
 from ..mapping import build_error_answer, build_llm_answer, build_skipped_answer
 from .citation import build_citations
 from .prompt import build_messages, build_format_messages
-from .parse import ANNOTATE_RESPONSE_FORMAT, ExtractionError, parse_structured_output, _RESPONSE_FORMAT
+from .parse import (
+    ANNOTATE_RESPONSE_FORMAT,
+    ExtractionError,
+    parse_structured_output,
+    pass1_block_present,
+    _RESPONSE_FORMAT,
+)
 from .scope import apply_scope_and_status
 from .verify import verify_citation, verify_citations
 
@@ -129,7 +135,7 @@ async def annotate_group(
     # (early_exit_on_ic_exclusion off) always yields excl_idx=None, so no
     # question can come out "skipped" unless the run opted in.
     parsed, _excl_idx = apply_scope_and_status(
-        questions, parsed, enabled=cfg.early_exit_on_ic_exclusion
+        questions, parsed, enabled=cfg.early_exit_on_ic_exclusion, pass1_text=p1.text
     )
 
     if any(r.get("extraction_status") == "absent" for r in parsed):
@@ -153,10 +159,32 @@ async def annotate_group(
             # Genuine omission (not gated out of scope) — a per-key error, NOT
             # a whole-group ExtractionError (the A5 parse-tolerance fix: one
             # missing key must not discard every other question's good answer).
+            # Prefer the demotion's own extraction_detail (e.g. "pass-1 has no
+            # answer block for ...") when set — it distinguishes a fabricated
+            # Pass-2 answer from Pass-2 simply dropping the key.
             payloads.append(
                 build_error_answer(
                     run_id=run.run_id, paper_id=paper_id, question=question,
-                    extraction_detail=f"key {question.key!r} not found in pass-2 output",
+                    extraction_detail=result.get(
+                        "extraction_detail", f"key {question.key!r} not found in pass-2 output"
+                    ),
+                )
+            )
+            continue
+
+        cited_error = result.get("cited_text_error")
+        if cited_error:
+            # Malformed cited_text means the whole item came back garbled — record
+            # an extraction failure rather than a plausible-looking answer (see
+            # annotate.parse.cited_text_violation).
+            logger.error(
+                "EXTRACTION FAILURE — run %d, paper %s, key %r: %s",
+                run.run_id, paper_id, question.key, cited_error,
+            )
+            payloads.append(
+                build_error_answer(
+                    run_id=run.run_id, paper_id=paper_id, question=question,
+                    extraction_detail=cited_error,
                 )
             )
             continue
@@ -294,6 +322,18 @@ async def reformat_group(
     for the whole group either way; ``require_status=True`` only changes which
     signal that failure is read from (mechanical "absent" status vs. the
     legacy ``parse_error``), for parity with the main annotate path's schema.
+
+    ``require_status=True`` also enforces the same demote-only fabrication
+    guard as ``annotate/scope.py``: an entry claiming "ok"/"unmappable" whose
+    key has no answer block in ``pass1_text`` (per
+    ``parse.pass1_block_present``) is demoted to "absent" before the failure
+    check below runs. Unlike
+    ``apply_scope_and_status``, this function doesn't compute an IC exclusion
+    point at all, so there's no exclusion-index-corruption risk to guard
+    against here — but the same demoted entry now trips the existing
+    ``status == "absent"`` failure path and raises ``ExtractionError`` for the
+    whole group, rather than silently reformatting a fabricated answer. This
+    check never runs when ``require_status=False`` (arbitration).
     """
     fmt_messages = build_format_messages(pass1_text, questions, require_status=require_status)
 
@@ -317,9 +357,30 @@ async def reformat_group(
     parsed = parse_structured_output(p2.text, [q.key for q in questions], annotate_mode=require_status)
 
     if require_status:
-        failed = {r["key"]: "not found in pass-2 output" for r in parsed if r.get("status") == "absent"}
+        for r in parsed:
+            if r.get("status") in ("ok", "unmappable") and not pass1_block_present(pass1_text, r["key"]):
+                logger.warning(
+                    "reformat_group: Pass-2 claimed status=%r for key=%r but pass-1 has "
+                    "no answer block for it — demoting to 'absent'",
+                    r["status"], r["key"],
+                )
+                r["status"] = "absent"
+                r["value"] = None
+                r["cited_text"] = ""
+                r["comment"] = ""
+                r["confidence"] = None
+                r["extraction_detail"] = f"pass-1 has no answer block for {r['key']!r}"
+        failed = {
+            r["key"]: r.get("extraction_detail", "not found in pass-2 output")
+            for r in parsed if r.get("status") == "absent"
+        }
     else:
         failed = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
+    malformed = {
+        r["key"]: r["cited_text_error"] for r in parsed if r.get("cited_text_error")
+    }
+    if malformed:
+        failed = {**failed, **malformed}
     if failed:
         raise ExtractionError(failed)
 

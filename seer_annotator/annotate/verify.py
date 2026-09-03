@@ -130,7 +130,11 @@ def verify_citation(
     # Elements shorter than 20 chars are skipped (structural markers like "=== Abstract ===").
     # Each element falls back to ellipsis splitting if direct fuzzy fails.
     if isinstance(cited_text, list):
-        segments = [_normalize(_strip_outer_quotes(s)) for s in cited_text if s and s.strip()]
+        # str(s): elements are normally strings, but a badly repaired JSON item can
+        # put a nested list or dict here. Coerce rather than crash — same tolerance
+        # as verify_citations() below. The malformed item is flagged separately by
+        # annotate.parse.cited_text_violation.
+        segments = [_normalize(_strip_outer_quotes(str(s))) for s in cited_text if s and str(s).strip()]
         segments = [s for s in segments if len(s) >= 20]
         if not segments:
             return {"ok": True, "note": "no citation provided"}
@@ -138,7 +142,10 @@ def verify_citation(
             return {"ok": True, "note": f"matched {len(segments)} listed segment(s)"}
         return {"ok": False, "note": "one or more listed cited segments not found in source"}
 
-    # From here cited_text is a str
+    # From here cited_text should be a str; coerce anything else (a dict, a number)
+    # so this back-compat entry point can never raise on an unexpected shape.
+    if not isinstance(cited_text, str):
+        cited_text = str(cited_text)
     norm_cited = _normalize(cited_text)
 
     # 3. Direct fuzzy match — handles outer-quote artifacts (1–2 edit ops ≤ 5% for ≥40-char citations)

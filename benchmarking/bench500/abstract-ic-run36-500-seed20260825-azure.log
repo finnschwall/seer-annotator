@@ -1,0 +1,27 @@
+Lane azure started: 2026-08-26T11:37:04+02:00
+Dataset: abstract-ic-run36-500-seed20260825
+SQLite: /home/ies/schwall/sysreview/seer-annotator/benchmarking/bench500/phase2-500.sqlite
+Models: gpt-5-mini gpt-5-nano
+
+Running model: gpt-5-mini (2026-08-26T11:37:04+02:00)
+gpt-5-mini: {'complete': 500, 'error': 0, 'skipped': 0}
+
+Running model: gpt-5-nano (2026-08-26T11:49:47+02:00)
+INFO openai._base_client: Retrying request to /chat/completions in 0.392612 seconds
+INFO openai._base_client: Retrying request to /chat/completions in 0.439943 seconds
+INFO openai._base_client: Retrying request to /chat/completions in 0.448143 seconds
+INFO openai._base_client: Retrying request to /chat/completions in 0.487976 seconds
+gpt-5-nano: {'complete': 500, 'error': 0, 'skipped': 0}
+
+Lane azure finished: 2026-08-26T12:39:57+02:00
+Cases: 500
+  Benchmark status: abstract-ic-run36-500-seed20260825   
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Model                     ┃ Execution status          ┃
+┡━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ deepseek-v4-flash-nothink │ complete=500              │
+│ gpt-5-mini                │ complete=500              │
+│ gemma4-31b                │ complete=500              │
+│ gpt-5-nano                │ complete=500              │
+│ qwen3.5-397b              │ complete=174, running=326 │
+└───────────────────────────┴───────────────────────────┘

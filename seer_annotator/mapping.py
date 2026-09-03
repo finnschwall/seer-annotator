@@ -179,6 +179,7 @@ def build_error_answer(
     paper_id: int,
     question: Question,
     extraction_detail: str,
+    raw_response: dict | None = None,
 ) -> dict:
     """Build a minimal error payload to post to SEER when the pipeline fails for a question."""
     return build_llm_answer(
@@ -190,7 +191,7 @@ def build_error_answer(
         cited_text="",
         cited_text_verified=None,
         citations=[],
-        raw_response={},
+        raw_response=raw_response or {},
         latency_ms=0,
         tokens_total=0,
         tokens_input=0,

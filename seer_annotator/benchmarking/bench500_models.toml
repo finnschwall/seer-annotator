@@ -1,0 +1,89 @@
+# 500-abstract Phase-2 formatting benchmark.
+#
+# Credentials stay in working_dir/settings.toml and are never copied into the
+# benchmark database. Two provider lanes with independent rate limits (ollama
+# cloud, Azure OpenAI) can therefore be run as two concurrent processes against
+# the same SQLite file.
+#
+# Two model choices here are load-bearing:
+#   - deepseek-v4-flash runs with reasoning disabled. LiteLLM maps any
+#     reasoning_effort outside {low,medium,high} to Ollama's "think": false
+#     (litellm/llms/ollama/completion/transformation.py). Verified: 4 output
+#     tokens vs 142 for the same prompt with reasoning on, and it lifted native
+#     JSON output from 80.5% to 98.8% and p95 latency from 326s to 4.1s.
+#   - The Azure gpt-5 deployments are pinned to temperature 1.0 because they
+#     reject 0.0 outright; 1 is the only value they accept.
+
+# --- lane 1: ollama cloud -------------------------------------------------
+
+[models.deepseek-v4-flash-nothink]
+provider = "ollama"
+model = "deepseek-v4-flash:cloud"
+structured_output = true
+temperature = 0.0
+timeout = 600
+drop_params = false
+
+[models.deepseek-v4-flash-nothink.params]
+api_base = "https://ollama.com"
+reasoning_effort = "none"
+
+[models.gemma4-31b]
+provider = "ollama"
+model = "gemma4:31b-cloud"
+structured_output = true
+temperature = 0.0
+timeout = 600
+drop_params = false
+
+[models.gemma4-31b.params]
+api_base = "https://ollama.com"
+
+[models."qwen3.5-397b"]
+provider = "ollama"
+model = "qwen3.5:397b-cloud"
+structured_output = true
+temperature = 0.0
+timeout = 600
+drop_params = false
+
+[models."qwen3.5-397b".params]
+api_base = "https://ollama.com"
+
+[models.deepseek-v4-pro]
+provider = "ollama"
+model = "deepseek-v4-pro:cloud"
+structured_output = true
+temperature = 0.0
+timeout = 600
+drop_params = false
+
+[models.deepseek-v4-pro.params]
+api_base = "https://ollama.com"
+
+# --- lane 2: Azure OpenAI -------------------------------------------------
+# gpt-5 deployments reject temperature=0.0 — only 1 is accepted — so these two
+# are pinned to 1.0 rather than the 0.0 the Ollama configs use. api_version is
+# pinned here for reproducibility; it overrides [providers.azure].
+
+[models.gpt-5-mini]
+provider = "azure"
+model = "gpt-5-mini"
+structured_output = true
+temperature = 1.0
+timeout = 600
+drop_params = false
+
+[models.gpt-5-mini.params]
+api_version = "2024-02-01"
+
+[models.gpt-5-nano]
+provider = "azure"
+model = "gpt-5-nano"
+structured_output = true
+temperature = 1.0
+timeout = 600
+drop_params = false
+
+[models.gpt-5-nano.params]
+api_version = "2024-02-01"

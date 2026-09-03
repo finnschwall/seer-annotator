@@ -51,6 +51,7 @@ from .store import Store
 from .mapping import build_error_resolution, build_resolution
 from .annotate.parse import ExtractionError, parse_structured_output
 from .annotate.verify import verify_citation
+from .annotate.scope import ic_answer_passes
 from .arbitrate.prompt import build_dispute_messages
 from .orchestrator import _chunks
 
@@ -93,12 +94,20 @@ def _questions_for_paper(disputes_for_paper: list[DisputeItem], question_by_key:
     return questions
 
 
-def _build_p1_messages_fn(cfg: ArbiterRunConfig, candidates_by_paper_version: dict[tuple[int, int], list[Candidate]]):
+def _build_p1_messages_fn(
+    cfg: ArbiterRunConfig,
+    candidates_by_paper_version: dict[tuple[int, int], list[Candidate]],
+    item_types_by_paper_version: dict[tuple[int, int], str],
+):
     """Closure passed as batch_runner's build_p1_messages — (source, group, paper_id) -> messages."""
 
     def _fn(source_text: str, group: list[Question], paper_id: int) -> list[dict]:
         candidates_by_version_id = {
             q.version_id: candidates_by_paper_version.get((paper_id, q.version_id), []) for q in group
+        }
+        item_types_by_version_id = {
+            q.version_id: item_types_by_paper_version.get((paper_id, q.version_id), "disagreement")
+            for q in group
         }
         return build_dispute_messages(
             None if cfg.text_source == "candidates_only" else source_text,
@@ -108,9 +117,69 @@ def _build_p1_messages_fn(cfg: ArbiterRunConfig, candidates_by_paper_version: di
             text_source=cfg.text_source,
             system_prompt=cfg.system_prompt,
             cache_first=cfg.cache_first,
+            item_types_by_version_id=item_types_by_version_id,
         )
 
     return _fn
+
+
+def _condition_matches(value: object, required_value: str, negate: bool) -> bool:
+    if required_value == "":
+        matched = value is not None and value != "" and value != []
+    elif isinstance(value, bool):
+        matched = str(value).lower() == required_value.lower()
+    elif isinstance(value, list):
+        matched = required_value in {str(v) for v in value}
+    else:
+        matched = str(value) == required_value
+    return not matched if negate else matched
+
+
+def _apply_adjudication_scope(questions: list[Question], parsed: list[dict]) -> list[dict]:
+    """Deterministically classify applicable, invalid, and path-inactive output."""
+    values: dict[str, object] = {}
+    excluded_by: str | None = None
+    out: list[dict] = []
+    for question, original in zip(questions, parsed):
+        result = dict(original)
+        inactive_detail = None
+        if excluded_by is not None:
+            inactive_detail = f"not applicable: paper excluded at {excluded_by}"
+        elif question.conditions:
+            for condition in question.conditions:
+                dependency = condition.get("depends_on")
+                # A dependency outside this adjudication sequence was already
+                # settled by the source raters. Conservatively keep the child
+                # applicable; dependencies answered in this sequence are
+                # authoritative and can close the branch.
+                if dependency not in values:
+                    continue
+                if not _condition_matches(
+                    values[dependency], condition.get("required_value", ""),
+                    bool(condition.get("negate")),
+                ):
+                    inactive_detail = f"not applicable: condition on {dependency} not met"
+                    break
+
+        if inactive_detail:
+            result["value"] = None
+            result["resolution_status"] = "not_applicable"
+            result["resolution_detail"] = inactive_detail
+        else:
+            parse_status = result.get("status", "ok")
+            if parse_status == "unmappable":
+                result["resolution_status"] = "invalid"
+                result["resolution_detail"] = "adjudicator output could not be mapped"
+            elif parse_status == "absent":
+                result["resolution_status"] = "error"
+                result["resolution_detail"] = "applicable continuation question was omitted"
+            else:
+                result["resolution_status"] = "ok"
+                values[question.key] = result.get("value")
+                if question.is_ic and ic_answer_passes(question, result.get("value")) is False:
+                    excluded_by = question.key
+        out.append(result)
+    return out
 
 
 def _skip_resolution_cell_fn(store: Store):
@@ -177,7 +246,13 @@ def _parse_save_post_tail_resolutions(
         fmt_cost = fu.get("cost")
         p2_latency = fu.get("latency_ms", 0) or 0
 
-        parsed = parse_structured_output(p2_text, [q.key for q in group])
+        # Missing later keys may be a valid consequence of an adjudicated IC
+        # exclusion. Preserve them as status='absent' first; the deterministic
+        # path pass below decides whether each omission is terminally
+        # not-applicable or a genuine error.
+        parsed = parse_structured_output(
+            p2_text, [q.key for q in group], annotate_mode=True,
+        )
 
         failed_keys = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
         if failed_keys:
@@ -205,6 +280,7 @@ def _parse_save_post_tail_resolutions(
                 first_extraction_error = err
             continue
 
+        parsed = _apply_adjudication_scope(group, parsed)
         for i, (question, result) in enumerate(zip(group, parsed)):
             d = dispute_by_paper_version.get((paper.paper_id, question.version_id))
             if d is None:
@@ -212,6 +288,29 @@ def _parse_save_post_tail_resolutions(
                     "No dispute item for paper=%d version_id=%d — skipping",
                     paper.paper_id, question.version_id,
                 )
+                continue
+
+            cited_error = result.get("cited_text_error")
+            if cited_error:
+                # The item's JSON did not survive parsing intact, so its resolution
+                # value/comment are not what the model wrote — record an error
+                # resolution for this dispute item only (see
+                # annotate.parse.cited_text_violation).
+                logger.error(
+                    "EXTRACTION FAILURE — run %d, paper %d, group %d, key %r: %s",
+                    run.run_id, paper.paper_id, group_idx, question.key, cited_error,
+                )
+                error_payload = build_error_resolution(
+                    arbiter_run_id=run.run_id, paper_id=paper.paper_id,
+                    dispute_item_id=d.dispute_item_id, question=question,
+                    resolution_detail=cited_error,
+                )
+                store.save_resolution(
+                    run.run_id, d.dispute_item_id, paper.paper_id, question.version_id,
+                    error_payload,
+                )
+                if on_payload_saved is not None:
+                    on_payload_saved(error_payload)
                 continue
 
             verify = verify_citation(
@@ -230,6 +329,7 @@ def _parse_save_post_tail_resolutions(
                 "batch_group_id": cid,
                 "batch_mode": True,
                 "p1_usage": u,
+                "p2_usage": p2_usage.get(cid, {}),
             }
             payload = build_resolution(
                 arbiter_run_id=run.run_id,
@@ -256,6 +356,8 @@ def _parse_save_post_tail_resolutions(
                 fmt_tokens_cached=fmt_cached if i == 0 else 0,
                 fmt_cost=fmt_cost if i == 0 else None,
                 confidence=result.get("confidence"),
+                resolution_status=result.get("resolution_status"),
+                resolution_detail=result.get("resolution_detail"),
             )
             store.save_resolution(run.run_id, d.dispute_item_id, paper.paper_id, question.version_id, payload, cid)
             if on_payload_saved is not None:
@@ -306,6 +408,9 @@ async def run_arbitration_pipeline(
 
     question_by_key = {q.key: q for q in pipeline.questions}
     dispute_by_paper_version, candidates_by_paper_version = _dispute_index(disputes)
+    item_types_by_paper_version = {
+        (d.paper_id, d.version_id): d.item_type for d in disputes
+    }
     all_papers = _papers_from_disputes(disputes)
     disputes_by_paper: dict[int, list[DisputeItem]] = {}
     for d in disputes:
@@ -340,10 +445,18 @@ async def run_arbitration_pipeline(
             cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
             _litellm.drop_params = cfg.drop_params
 
-            groups_def: dict[int, list[list[Question]]] = {
-                paper_id: resolve_groups(cfg, _questions_for_paper(paper_disputes, question_by_key))
-                for paper_id, paper_disputes in disputes_by_paper.items()
-            }
+            groups_def: dict[int, list[list[Question]]] = {}
+            for paper_id, paper_disputes in disputes_by_paper.items():
+                ordered_questions = _questions_for_paper(paper_disputes, question_by_key)
+                if any(d.item_type == "continuation" for d in paper_disputes):
+                    if cfg.text_source == "candidates_only":
+                        raise ValueError(
+                            "text_source='candidates_only' cannot adjudicate continuation items; "
+                            "use full_text or abstract"
+                        )
+                    groups_def[paper_id] = [ordered_questions]
+                else:
+                    groups_def[paper_id] = resolve_groups(cfg, ordered_questions)
 
             chunks = _chunks(all_papers, cfg.chunk_papers)
             progress.reset(chunk_task, total=len(chunks), visible=True)
@@ -479,7 +592,9 @@ async def run_arbitration_pipeline(
                     store, settings, dry_run, groups_def=groups_def,
                     chunk_i=chunk_i, sem=sem, limiter=limiter,
                     on_cell_done=_on_cell_done, on_total_known=_on_total,
-                    build_p1_messages=_build_p1_messages_fn(cfg, candidates_by_paper_version),
+                    build_p1_messages=_build_p1_messages_fn(
+                        cfg, candidates_by_paper_version, item_types_by_paper_version,
+                    ),
                     should_skip_cell=_skip_resolution_cell_fn(store),
                 )
 
@@ -724,6 +839,9 @@ async def arbitration_pass1_pipeline(
 
     question_by_key = {q.key: q for q in pipeline.questions}
     dispute_by_paper_version, candidates_by_paper_version = _dispute_index(disputes)
+    item_types_by_paper_version = {
+        (d.paper_id, d.version_id): d.item_type for d in disputes
+    }
     all_papers = _papers_from_disputes(disputes)
     disputes_by_paper: dict[int, list[DisputeItem]] = {}
     for d in disputes:
@@ -735,10 +853,17 @@ async def arbitration_pass1_pipeline(
     for run in runs:
         cfg = effective_arbiter_config(run.config, settings.arbiter_run_defaults)
         _litellm.drop_params = cfg.drop_params
-        groups_def: dict[int, list[list[Question]]] = {
-            paper_id: resolve_groups(cfg, _questions_for_paper(paper_disputes, question_by_key))
-            for paper_id, paper_disputes in disputes_by_paper.items()
-        }
+        groups_def: dict[int, list[list[Question]]] = {}
+        for paper_id, paper_disputes in disputes_by_paper.items():
+            ordered_questions = _questions_for_paper(paper_disputes, question_by_key)
+            if any(d.item_type == "continuation" for d in paper_disputes):
+                if cfg.text_source == "candidates_only":
+                    raise ValueError(
+                        "text_source='candidates_only' cannot adjudicate continuation items"
+                    )
+                groups_def[paper_id] = [ordered_questions]
+            else:
+                groups_def[paper_id] = resolve_groups(cfg, ordered_questions)
 
         source_texts: dict[int, str] = {}
         for paper in all_papers:
@@ -763,7 +888,9 @@ async def arbitration_pass1_pipeline(
             run, cfg, all_papers, source_texts, pending_cells,
             store, settings, dry_run, groups_def=groups_def,
             sem=sem, limiter=limiter,
-            build_p1_messages=_build_p1_messages_fn(cfg, candidates_by_paper_version),
+            build_p1_messages=_build_p1_messages_fn(
+                cfg, candidates_by_paper_version, item_types_by_paper_version,
+            ),
             should_skip_cell=_skip_resolution_cell_fn(store),
         )
         if p1_error:
@@ -1004,6 +1131,25 @@ async def arbitration_pass2_pipeline(
                 for i, (question, result) in enumerate(zip(group, parsed)):
                     d = dispute_by_paper_version.get((paper_cell.paper_id, question.version_id))
                     if d is None:
+                        continue
+
+                    cited_error = result.get("cited_text_error")
+                    if cited_error:
+                        # Same as the online path: a garbled item becomes an error
+                        # resolution for this dispute item, not a normal one.
+                        logger.error(
+                            "EXTRACTION FAILURE (pass2) — run %d, paper %d, group %s, key %r: %s",
+                            run.run_id, paper_cell.paper_id, cid, question.key, cited_error,
+                        )
+                        store.save_resolution(
+                            run.run_id, d.dispute_item_id, paper_cell.paper_id, question.version_id,
+                            build_error_resolution(
+                                arbiter_run_id=run.run_id, paper_id=paper_cell.paper_id,
+                                dispute_item_id=d.dispute_item_id, question=question,
+                                resolution_detail=cited_error,
+                            ),
+                        )
+                        n_failed += 1
                         continue
 
                     verify = verify_citation(

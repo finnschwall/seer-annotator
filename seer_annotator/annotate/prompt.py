@@ -54,6 +54,7 @@ _QUESTION_BLOCK_TEMPLATE = """\
 --- QUESTION: {key} ---
 Label: {label}
 {help_section}
+{condition_section}
 {options_section}{ic_section}"""
 
 # Standing instruction added to the questions message only when
@@ -80,6 +81,26 @@ def _format_options(question: Question) -> str:
     if question.allow_multiple:
         lines.append("Multiple selections allowed.")
     return "\n".join(lines)
+
+
+def _format_section_header(question: Question, prev_section_key: str | None) -> str:
+    """Render a section header block when `question` starts a new section relative to
+    the previous question in this same `build_messages` call, mirroring the section
+    card header + notes human annotators see in the SEER UI (`Section.label`/`.notes`).
+
+    Only fires on a section *transition* within the questions passed to one call —
+    there's no cross-batch state, so if a section's questions get split across
+    multiple LLM calls (e.g. per_question/size batching), each call re-renders the
+    header for whichever of that section's questions it happens to start with.
+    Returns "" if `question` has no section, or is a continuation of the same
+    section as the previous question.
+    """
+    if question.section_key is None or question.section_key == prev_section_key:
+        return ""
+    lines = [f"=== SECTION: {question.section_label or question.section_key} ==="]
+    if question.section_notes:
+        lines.append(question.section_notes)
+    return "\n".join(lines) + "\n\n"
 
 
 def _format_ic_section(question: Question) -> str:
@@ -109,6 +130,17 @@ def _format_ic_section(question: Question) -> str:
     return ""
 
 
+def _format_conditions(question: Question) -> str:
+    if not question.conditions:
+        return ""
+    rendered = []
+    for cond in question.conditions:
+        negate = "not " if cond.get("negate") else ""
+        required = cond.get("required_value") or "any non-empty answer"
+        rendered.append(f"{cond.get('depends_on')} must {negate}equal {required!r}")
+    return "Answer only when: " + "; and ".join(rendered)
+
+
 def build_messages(
     source_text: str,
     questions: list[Question],
@@ -136,22 +168,29 @@ def build_messages(
     )
 
     q_blocks = []
+    prev_section_key: str | None = None
     for q in questions:
+        section_header = _format_section_header(q, prev_section_key)
+        prev_section_key = q.section_key
         help_section = f"Help: {q.help_text}" if q.help_text else ""
         options_section = _format_options(q)
         ic_section = _format_ic_section(q)
+        condition_section = _format_conditions(q)
         q_blocks.append(
-            _QUESTION_BLOCK_TEMPLATE.format(
+            section_header
+            + _QUESTION_BLOCK_TEMPLATE.format(
                 key=q.key,
                 label=q.label,
                 help_section=help_section,
+                condition_section=condition_section,
                 options_section=options_section,
                 ic_section=ic_section,
             )
         )
 
     question_content = (
-        "Answer each question below for the paper text provided above.\n\n"
+        "Answer each applicable question below for the paper text provided above. "
+        "Work in order and omit questions whose listed conditions are not met.\n\n"
         + ("\n" + _EARLY_EXIT_INSTRUCTION + "\n" if early_exit_on_ic_exclusion else "")
         + "\n\n".join(q_blocks)
     )
@@ -194,6 +233,7 @@ _STATUS_RULE = """\
                       categorical value was required).
   Never guess a value to avoid "absent"/"unmappable", and never explain *why* a value is
   absent or unmappable — just report which of the three applies.
+  For "absent"/"unmappable" entries, cited_text and comment must be "" (null is also accepted).
 """
 
 

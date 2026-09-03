@@ -38,6 +38,15 @@ class Question(BaseModel):
     # `annotations.ic.ic_answer_passes` on the SEER side. None for non-boolean
     # question types, or when the question isn't an IC gate.
     ic_include_when_true: bool | None = None
+    conditions: list[dict[str, Any]] = Field(default_factory=list)
+    # The scheme Section (key/label/notes) this question currently belongs to on the
+    # SEER side, if any — mirrors what human annotators see as a section card header
+    # and guidance text above a group of questions. None if the question isn't
+    # assigned to a section. See annotate/prompt.py::build_messages for how this
+    # renders into the Pass-1 prompt.
+    section_key: str | None = None
+    section_label: str | None = None
+    section_notes: str | None = None
 
 
 class Paper(BaseModel):
@@ -120,6 +129,9 @@ class PipelineConfig(BaseModel):
 
 class Candidate(BaseModel):
     rater_key: str
+    answer_status: Literal["answered", "excluded", "condition_not_met", "missing", "error"] = "answered"
+    stopped_at_question_key: str | None = None
+    detail: str = ""
     value: Any = None
     comment: str = ""
     cited_text: str = ""
@@ -133,6 +145,7 @@ class DisputeItem(BaseModel):
     abstract: str = ""
     question_key: str
     version_id: int
+    item_type: Literal["disagreement", "continuation"] = "disagreement"
     candidates: list[Candidate] = Field(default_factory=list)
 
 

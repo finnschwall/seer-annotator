@@ -1,0 +1,23 @@
+# Credentials stay in the normal settings.toml provider sections. These
+# entries are immutable configuration snapshots once a run starts.
+[models.reference]
+provider = "ollama"
+model = "deepseek-v4-flash:cloud"
+structured_output = true
+temperature = 0.0
+timeout = 600
+drop_params = false
+
+[models.reference.params]
+# Direct Ollama cloud access; the API key remains in settings.toml.
+api_base = "https://ollama.com"
+
+[models.candidate]
+provider = "openai"
+model = "kit.gemma4-31b-it"
+structured_output = true
+temperature = 0.0
+
+# Arbitrary LiteLLM parameters may be nested, for example:
+# [models.candidate.params]
+# max_tokens = 2048
