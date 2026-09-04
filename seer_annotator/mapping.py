@@ -20,6 +20,33 @@ _EMPTY_PAYLOAD = {
 }
 
 
+# Which `extraction_status` values count as a failed cell in a job's
+# `cells_error` total. "error" is a real failure (API/parse/no source text);
+# "invalid" is a value pass 2 could not map onto the question's schema — an
+# answer nobody can use, so it counts too. "skipped" (gated out by an earlier
+# inclusion-criteria answer) and "absent" ("the paper does not say") are
+# legitimate outcomes and are not errors.
+CELL_ERROR_STATUSES = frozenset({"error", "invalid"})
+
+
+def payload_is_error(payload: dict) -> bool:
+    """True if this answer/resolution payload counts towards `cells_error`.
+
+    Answers carry `extraction_status` and resolutions carry `resolution_status`; the
+    two are the same idea under different names, and a payload has exactly one of
+    them. (Arbitration's counter used to read `extraction_status` only, so an
+    arbitration job always reported zero errors no matter how many cells failed.)
+
+    One definition, used both by the orchestrators' live per-cell counters and by
+    ``Store.finished_cells`` / ``finished_resolutions``, which re-derive the same
+    verdicts from stored rows when a parked batch job resumes. The two must agree, or
+    a resumed run reports a different error count than the same work would have
+    reported in a single process.
+    """
+    status = payload.get("extraction_status", payload.get("resolution_status"))
+    return status in CELL_ERROR_STATUSES
+
+
 def build_llm_answer(
     *,
     run_id: int,

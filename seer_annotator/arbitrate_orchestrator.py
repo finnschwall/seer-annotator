@@ -48,7 +48,7 @@ from .progress import ProgressReporter, ProgressReporterProtocol
 from .rate_limiter import PerProviderRateLimiter
 from .seer_client import SeerClient
 from .store import Store
-from .mapping import build_error_resolution, build_resolution
+from .mapping import build_error_resolution, build_resolution, payload_is_error
 from .annotate.parse import ExtractionError, parse_structured_output
 from .annotate.verify import verify_citation
 from .annotate.scope import ic_answer_passes
@@ -474,7 +474,23 @@ async def run_arbitration_pipeline(
             # not one paper x question the way annotation's run_pipeline counts it — disputes
             # are already the flattened per-question unit, so cells_total is simply len(disputes).
             cells_total = len(disputes)
-            cell_counters = {"done": 0, "error": 0}
+            # {dispute_item_id: is_error} for every cell counted so far, seeded from the
+            # store rather than starting empty — same reason as annotation's run_pipeline:
+            # a batch run parks on BatchPendingError and re-enters this function from the
+            # top, and already-resolved items are dropped before they can be counted. See
+            # Store.finished_resolutions.
+            counted_cells = store.finished_resolutions(
+                run.run_id, [d.dispute_item_id for d in disputes],
+            )
+            cell_counters = {
+                "done": len(counted_cells),
+                "error": sum(1 for is_error in counted_cells.values() if is_error),
+            }
+            if counted_cells:
+                logger.info(
+                    "Arbiter run %d: resuming with %d/%d cells already done (%d error)",
+                    run.run_id, cell_counters["done"], cells_total, cell_counters["error"],
+                )
 
             # Tracks progress within whichever pass is currently in flight for the
             # active chunk (mirrors orchestrator.run_pipeline's phase_state) — reset
@@ -510,14 +526,23 @@ async def run_arbitration_pipeline(
                 _heartbeat_tasks.add(task)
                 task.add_done_callback(_heartbeat_tasks.discard)
 
-            def _count_payload(payload: dict, _c=cell_counters) -> None:
-                _c["done"] += 1
-                if payload.get("extraction_status") == "error":
-                    _c["error"] += 1
+            def _count_payload(payload: dict, _c=cell_counters, _seen=counted_cells) -> None:
+                key = payload.get("dispute_item")
+                if key is None:
+                    key = object()  # unidentifiable payload: count it, never collapse it
+                is_error = payload_is_error(payload)
+                if key in _seen:
+                    # Re-processed cell: correct its verdict in place, don't recount it.
+                    _c["error"] -= 1 if _seen[key] else 0
+                else:
+                    _c["done"] += 1
+                _c["error"] += 1 if is_error else 0
+                _seen[key] = is_error
                 _maybe_heartbeat()
 
             await reporter.heartbeat(
-                status="running", cells_total=cells_total, cells_done=0, cells_error=0,
+                status="running", cells_total=cells_total,
+                cells_done=cell_counters["done"], cells_error=cell_counters["error"],
                 message=_progress_message("starting"),
             )
 

@@ -9,6 +9,7 @@ from seer_annotator.mapping import (
     build_skipped_answer,
     build_resolution,
     build_error_resolution,
+    payload_is_error,
     _map_value,
 )
 
@@ -228,3 +229,46 @@ def test_build_error_resolution():
     assert payload["resolution_detail"] == "no_ocr"
     assert payload["value_categorical"] is None
     assert payload["confidence"] is None
+
+
+# ---------------------------------------------------------------------------
+# payload_is_error — the one definition of "this cell counts towards cells_error",
+# shared by the orchestrators' live counters and Store.finished_cells/finished_resolutions.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status,expected", [
+    ("error", True),      # API/parse failure
+    ("invalid", True),    # pass 2 could not map the value onto the question
+    ("ok", False),
+    ("skipped", False),   # gated out by an earlier inclusion-criteria answer
+    ("absent", False),    # "the paper does not say" — a real answer
+    (None, False),
+])
+def test_payload_is_error(status, expected):
+    payload = {} if status is None else {"extraction_status": status}
+    assert payload_is_error(payload) is expected
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("error", True),
+    ("invalid", True),
+    ("ok", False),
+])
+def test_payload_is_error_reads_resolution_status(status, expected):
+    """Arbitration payloads name the field `resolution_status`. Reading only
+    `extraction_status` made every arbitration job report zero cell errors."""
+    assert payload_is_error({"resolution_status": status}) is expected
+
+
+def test_build_error_answer_counts_as_error():
+    q = make_q("text")
+    assert payload_is_error(
+        build_error_answer(run_id=1, paper_id=1, question=q, extraction_detail="boom")
+    ) is True
+
+
+def test_build_skipped_answer_does_not_count_as_error():
+    q = make_q("text")
+    assert payload_is_error(
+        build_skipped_answer(run_id=1, paper_id=1, question=q, extraction_detail="gated out: x=false")
+    ) is False

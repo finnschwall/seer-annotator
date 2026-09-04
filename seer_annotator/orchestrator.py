@@ -28,7 +28,7 @@ from .progress import ProgressReporter, ProgressReporterProtocol
 from .rate_limiter import PerProviderRateLimiter
 from .seer_client import SeerClient
 from .store import Store
-from .mapping import build_error_answer, build_llm_answer, build_skipped_answer
+from .mapping import build_error_answer, build_llm_answer, build_skipped_answer, payload_is_error
 from .annotate.citation import build_citations
 from .annotate.parse import ANNOTATE_RESPONSE_FORMAT, ExtractionError, parse_structured_output
 from .annotate.scope import apply_scope_and_status
@@ -538,7 +538,29 @@ async def run_pipeline(
                 else ProgressReporter(progress_url, pipeline.api_token, run.run_id)
             )
             cells_total = len(papers) * len(pipeline.questions)
-            cell_counters = {"done": 0, "error": 0}
+            # {cell key: is_error} for every cell counted so far, seeded from the store
+            # rather than starting empty: a run using the batch API parks on
+            # BatchPendingError and re-enters run_pipeline from the top, and the cells an
+            # earlier invocation finished are dropped before they can be counted. Starting
+            # at 0 made a resumed multi-chunk run report its last chunk only (e.g. 36/316),
+            # which SEER correctly refuses to accept as a success — so a finished job was
+            # marked failed. Keyed per cell, not a bare total, because a resume also
+            # re-processes every cell that is not done/posted; each must count once
+            # however many times it is seen. See Store.finished_cells.
+            counted_cells = store.finished_cells(
+                run.run_id,
+                [p.paper_id for p in papers],
+                [q.version_id for q in pipeline.questions],
+            )
+            cell_counters = {
+                "done": len(counted_cells),
+                "error": sum(1 for is_error in counted_cells.values() if is_error),
+            }
+            if counted_cells:
+                logger.info(
+                    "Run %d: resuming with %d/%d cells already done (%d error)",
+                    run.run_id, cell_counters["done"], cells_total, cell_counters["error"],
+                )
 
             # Tracks progress within whichever pass is currently in flight for the
             # active chunk ("pass1" = extraction, "pass2" = structured-output
@@ -580,14 +602,24 @@ async def run_pipeline(
                 _heartbeat_tasks.add(task)
                 task.add_done_callback(_heartbeat_tasks.discard)
 
-            def _count_payload(payload: dict, _c=cell_counters) -> None:
-                _c["done"] += 1
-                if payload.get("extraction_status") == "error":
-                    _c["error"] += 1
+            def _count_payload(payload: dict, _c=cell_counters, _seen=counted_cells) -> None:
+                key = (payload.get("paper"), payload.get("question_version"))
+                if key[0] is None or key[1] is None:
+                    key = object()  # unidentifiable payload: count it, never collapse it
+                is_error = payload_is_error(payload)
+                if key in _seen:
+                    # Re-processed cell (its group had a failure): correct its verdict
+                    # in place instead of counting it a second time.
+                    _c["error"] -= 1 if _seen[key] else 0
+                else:
+                    _c["done"] += 1
+                _c["error"] += 1 if is_error else 0
+                _seen[key] = is_error
                 _maybe_heartbeat()
 
             await reporter.heartbeat(
-                status="running", cells_total=cells_total, cells_done=0, cells_error=0,
+                status="running", cells_total=cells_total,
+                cells_done=cell_counters["done"], cells_error=cell_counters["error"],
                 message=_progress_message("starting"),
             )
 

@@ -81,7 +81,9 @@ Controlled by `batching` in `RunConfig`:
 
 Batching affects prompt construction (`prompt.py`) and how `mapping.py` splits the Pass-2 response back into per-question answers.
 
-`chunk_papers` (default `10`) controls how many papers `run` processes in each chunk: for each chunk it completes all of Pass 1, then all of Pass 2, then posts. Smaller chunks mean earlier posting and finer crash recovery; larger chunks increase infra-separation between phases. Override per-run in the pipeline JSON or at invocation with `--chunk-papers`. The `pass1` / `pass2` commands always process all papers at once (they are already single-phase by design).
+`chunk_papers` controls how many papers `run` processes in each chunk: for each chunk it completes all of Pass 1, then all of Pass 2, then posts. Smaller chunks mean earlier posting and finer crash recovery; larger chunks increase infra-separation between phases. Override per-run in the pipeline JSON or at invocation with `--chunk-papers`. The `pass1` / `pass2` commands always process all papers at once (they are already single-phase by design).
+
+Its code default is conditional (`CHUNK_PAPERS_DEFAULT` = 10, `CHUNK_PAPERS_DEFAULT_BATCH` = 500, applied in `effective_run_config`/`effective_arbiter_config`): under `batch_p1`/`batch_p2` a chunk is a whole provider batch that the caller parks on and waits for, so many small chunks means many sequential multi-hour waits. It stays bounded rather than unlimited because one provider batch is capped (Anthropic: 100,000 requests or 256 MB, and one full-text request is ~200 KB). An explicitly set value always wins, 0 included.
 
 ### Provider abstraction
 

@@ -6,13 +6,28 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Iterable, Iterator
 
 ANSWER_STATUSES = {"pending", "done", "posted", "failed", "skipped", "pass1_done"}
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _payload_is_error(payload_json: str | None) -> bool:
+    """Apply `mapping.payload_is_error` to a stored payload, tolerating junk.
+
+    Imported lazily: `mapping` is a leaf module today, and keeping the import
+    inside the function means `store` stays importable even if that ever changes.
+    """
+    from .mapping import payload_is_error
+
+    try:
+        payload = json.loads(payload_json)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(payload, dict) and payload_is_error(payload)
 
 
 class Store:
@@ -216,6 +231,44 @@ class Store:
         status = self.get_status(run_id, paper_id, version_id)
         return status in ("done", "posted")
 
+    def finished_cells(
+        self, run_id: int, paper_ids: Iterable[int], version_ids: Iterable[int]
+    ) -> dict:
+        """Return ``{(paper_id, version_id): is_error}`` for the already-finished cells
+        of ``run_id`` — what the orchestrator's per-cell counter has counted so far.
+
+        A run that submits provider batches does not live in one process: every
+        ``BatchPendingError`` parks the job, and ``run_pipeline`` is later called again
+        from the top. Cells finished by an earlier invocation are dropped before they
+        can be counted (``should_skip_cell`` in ``batch_runner``), so a counter starting
+        at 0 reports only the last invocation's own share of the work — and SEER
+        downgrades a 'succeeded' heartbeat short of ``cells_total`` to 'failed'.
+
+        Returned per cell rather than as a total because a resume also *re*-processes
+        every cell that is not `done`/`posted` — a failed cell, and the finished cells
+        of its question group with it — and each of those must still count exactly once
+        when it comes round again.
+
+        "Finished" means a payload was saved, which is exactly the set of cells that
+        went through ``_count_payload``. Rows left at ``pass1_done`` carry a payload too
+        but are only half processed, so they are excluded. Restricted to the papers and
+        question versions of the caller's current scope, so the result can never exceed
+        that scope's ``cells_total``.
+        """
+        papers = set(paper_ids)
+        versions = set(version_ids)
+        out: dict = {}
+        with self._connect() as con:
+            for row in con.execute(
+                """SELECT paper_id, version_id, payload_json FROM answers
+                   WHERE run_id=? AND payload_json IS NOT NULL AND status<>'pass1_done'""",
+                (run_id,),
+            ):
+                if row["paper_id"] not in papers or row["version_id"] not in versions:
+                    continue
+                out[(row["paper_id"], row["version_id"])] = _payload_is_error(row["payload_json"])
+        return out
+
     def reset_runs(self, run_ids: list[int]) -> None:
         """Delete all cached answer rows for these run ids, forcing a fresh re-annotation on
         the next run without disturbing other runs' cached state in a shared store."""
@@ -326,6 +379,27 @@ class Store:
                    WHERE arbiter_run_id=? AND dispute_item_id=?""",
                 [(_now(), arbiter_run_id, did) for did in dispute_item_ids],
             )
+
+    def finished_resolutions(self, arbiter_run_id: int, dispute_item_ids: Iterable[int]) -> dict:
+        """Return ``{dispute_item_id: is_error}`` for the already-finished dispute items
+        of ``arbiter_run_id`` — the resolutions-table twin of ``finished_cells``, and
+        needed for the same reason (see that method). Arbitration's cell is one dispute
+        item, so the scope filter is a set of dispute item ids rather than papers x
+        question versions.
+        """
+        items = set(dispute_item_ids)
+        out: dict = {}
+        with self._connect() as con:
+            for row in con.execute(
+                """SELECT dispute_item_id, payload_json FROM resolutions
+                   WHERE arbiter_run_id=? AND payload_json IS NOT NULL
+                     AND status<>'pass1_done'""",
+                (arbiter_run_id,),
+            ):
+                if row["dispute_item_id"] not in items:
+                    continue
+                out[row["dispute_item_id"]] = _payload_is_error(row["payload_json"])
+        return out
 
     def reset_arbiter_runs(self, arbiter_run_ids: list[int]) -> None:
         """Delete all cached resolution rows for these arbiter run ids, forcing fresh

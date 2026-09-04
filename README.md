@@ -287,7 +287,7 @@ These set default values for all per-run settings. Any field present here applie
 concurrency             = 8       # max parallel LLM calls
 per_provider_rpm        = null    # omit for unlimited
 drop_params             = false
-chunk_papers            = 10      # papers per chunk for 'run' (0 = all at once)
+chunk_papers            = 10      # papers per chunk for 'run' (0 = all at once; unset = 500 under batch_p1/batch_p2)
 
 # Citation verification
 citation_max_error_rate   = 0.05
@@ -318,7 +318,7 @@ batch_p2                = false
 | `concurrency` | `8` | Max parallel LLM calls across all papers and groups |
 | `per_provider_rpm` | `null` | Max requests-per-minute per provider; `null` = unlimited |
 | `drop_params` | `false` | LiteLLM: silently strip unsupported parameters instead of raising |
-| `chunk_papers` | `10` | Papers per chunk for `run` (0 = all papers in one chunk); overridable via `--chunk-papers` |
+| `chunk_papers` | `10`, or `500` with `batch_p1`/`batch_p2` | Papers per chunk for `run` (0 = all papers in one chunk); overridable via `--chunk-papers`. The batch default is higher because each chunk submits and waits on its own provider batch — see [Batch mode](#batch-mode) |
 | `citation_max_error_rate` | `0.05` | Fuzzy match tolerance for citation verification — see [Citation verification](#citation-verification) |
 | `citation_max_ellipsis_gap` | `600` | Max source-character gap between ellipsis parts — see [Citation verification](#citation-verification) |
 | `text_source` | `"full_text"` | Document source: `"full_text"` (OCR) or `"abstract"` |
@@ -399,6 +399,8 @@ The most common setup is `batch_p1 = true` alone — the reasoning model is the 
   This is expected, not a failure — the batch was submitted successfully and is still processing on the provider's side. **Re-run the exact same command** (same pipeline JSON, same local store) periodically to check again; thanks to the batch id being cached in the local store, re-running never re-submits the batch — it just polls once more. Repeat until the batch is done and the command completes normally. A cron/systemd timer that re-runs the command every 5–15 minutes works well for unattended use.
 
 Batch jobs are resumable in the same sense across process restarts or crashes: the batch id lives in the local store, so any later invocation of the same command against the same pipeline JSON picks up the existing batch rather than submitting a new one.
+
+**One chunk = one batch.** `run` processes papers in chunks of `chunk_papers`, and in batch mode each chunk submits its own provider batch and stops on it, so eight chunks means eight sequential waits rather than one. That is why an unset `chunk_papers` resolves to 500 here instead of 10 (`CHUNK_PAPERS_DEFAULT_BATCH`). It stays bounded because a single batch is capped by the provider — Anthropic allows 100,000 requests or 256 MB, and one full-text request is roughly 200 KB, so a few thousand full-text papers do not fit in one batch. Set it explicitly if you need something else; `0` (everything in one chunk) is honoured as given.
 
 **Supported providers:** `anthropic`, `openai`, `azure`.
 
@@ -593,8 +595,8 @@ Heartbeats are POSTed with `Authorization: Token <api_token>` (the pipeline JSON
 | `run_id` | int | The `ExperimentRun` (or, for `arbitrate`, the arbiter `ExperimentRun`) this run belongs to (`runs[0].run_id` in the pipeline JSON). |
 | `status` | string | `running` \| `succeeded` \| `failed`. |
 | `cells_total` | int | For `run`: `len(papers) × len(questions)` for the run's filtered scope. For `arbitrate`: `len(disputes)` (one cell = one dispute item, not paper×question). Computed once at run start. |
-| `cells_done` | int | Cumulative count of built answer/resolution payloads (including error payloads) across all chunks so far. |
-| `cells_error` | int | Cumulative count of those payloads with `extraction_status == "error"`. |
+| `cells_done` | int | Cumulative count of built answer/resolution payloads (including error payloads) across all chunks so far. Counts the whole run, not the current process: a run that resumes (batch mode parks and re-enters `run_pipeline` from the top) seeds this from cells already in the local store, so it never restarts at 0 mid-run. |
+| `cells_error` | int | Cumulative count of those payloads whose `extraction_status` (`resolution_status` for `arbitrate`) is `"error"` — a real failure — or `"invalid"` — a value Pass 2 could not map onto the question. One definition: `mapping.payload_is_error`. Seeded on resume like `cells_done`. |
 | `message` | string, optional | Human-readable progress line (e.g. `"starting"`, `"chunk 2/8"`). Empty/absent never clobbers a previously-set message server-side. |
 | `chunk_index` | int, optional | 0-based index of the chunk currently being processed. Only present on the throttled per-pass heartbeats described above; **omitted** (key not sent at all) on the three guaranteed heartbeats. |
 | `chunk_total` | int, optional | Total chunks for this run. Same presence rule as `chunk_index`. |

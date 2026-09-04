@@ -65,6 +65,31 @@ BatchingConfig = Union[
 ]
 
 
+# Papers per chunk when `chunk_papers` is left unset. Chunking exists to give the
+# run progress checkpoints, so a small number is right for online calls — but a
+# batch run submits ONE provider batch per chunk and parks until it comes back,
+# so N chunks means N sequential batch waits (a 79-paper run at 10 took 2h41m in
+# eight waits). Hence the batch default is high but not unlimited: Anthropic caps
+# a single batch at 100,000 requests or 256 MB, and one full-text paper's request
+# is ~200 KB, so a single chunk stops being submittable somewhere above ~1,300
+# full-text papers. 500 keeps a run inside that limit with room to spare while
+# still costing only one or two batch waits.
+CHUNK_PAPERS_DEFAULT = 10
+CHUNK_PAPERS_DEFAULT_BATCH = 500
+
+
+def _default_chunk_papers(cfg):
+    """Raise `chunk_papers` to the batch default when the config uses the batch API.
+
+    Only called by effective_run_config/effective_arbiter_config, and only when
+    neither the settings file nor the run's own config named a chunk size — an
+    explicit value always stands, including a deliberately small one.
+    """
+    if cfg.batch_p1 or cfg.batch_p2:
+        cfg.chunk_papers = CHUNK_PAPERS_DEFAULT_BATCH
+    return cfg
+
+
 class RunConfig(BaseModel):
     concurrency: int = 8
     per_provider_rpm: float | None = None
@@ -85,7 +110,7 @@ class RunConfig(BaseModel):
     cache_first: Literal["text", "questions"] = "questions"
     cache_ttl: Literal["5m", "1h"] = "1h"
     system_prompt: str | None = None
-    chunk_papers: int = 10
+    chunk_papers: int = CHUNK_PAPERS_DEFAULT
     batch_p1: bool = False
     batch_p2: bool = False
     fail_fast: bool = False
@@ -179,7 +204,7 @@ class ArbiterRunConfig(BaseModel):
     cache_first: Literal["text", "questions"] = "text"
     cache_ttl: Literal["5m", "1h"] = "1h"
     system_prompt: str | None = None
-    chunk_papers: int = 10
+    chunk_papers: int = CHUNK_PAPERS_DEFAULT
     batch_p1: bool = False
     batch_p2: bool = False
     fail_fast: bool = False
@@ -278,10 +303,19 @@ def effective_run_config(run_config: RunConfig, defaults: RunDefaults) -> RunCon
 
     Fields explicitly set in the pipeline JSON always win over run_defaults.
     run_defaults fill in for fields that are absent from the pipeline JSON.
+
+    One field's code default is conditional: an unset `chunk_papers` resolves to
+    CHUNK_PAPERS_DEFAULT_BATCH instead of CHUNK_PAPERS_DEFAULT when the run uses
+    the batch API, since a chunk there costs a whole batch round trip. The
+    pydantic default stays the online one, so read the effective value from here
+    rather than from `RunConfig.model_fields`.
     """
     base = defaults.model_dump(exclude_none=True)
     override = run_config.model_dump(exclude_unset=True)
-    return RunConfig.model_validate({**base, **override})
+    merged = RunConfig.model_validate({**base, **override})
+    if "chunk_papers" not in base and "chunk_papers" not in override:
+        merged = _default_chunk_papers(merged)
+    return merged
 
 
 class ArbiterRunDefaults(BaseModel):
@@ -325,7 +359,10 @@ def effective_arbiter_config(run_config: ArbiterRunConfig, defaults: ArbiterRunD
     """
     base = defaults.model_dump(exclude_none=True)
     override = run_config.model_dump(exclude_unset=True)
-    return ArbiterRunConfig.model_validate({**base, **override})
+    merged = ArbiterRunConfig.model_validate({**base, **override})
+    if "chunk_papers" not in base and "chunk_papers" not in override:
+        merged = _default_chunk_papers(merged)
+    return merged
 
 
 class Settings(BaseModel):

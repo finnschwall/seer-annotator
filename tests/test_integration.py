@@ -169,3 +169,97 @@ async def test_no_ocr_posts_error(pipeline, settings):
             payload = json.loads(row["payload_json"])
             assert payload["extraction_status"] == "error"
             assert payload["extraction_detail"] == "no_ocr"
+
+
+class RecordingReporter:
+    """Captures every heartbeat instead of POSTing it."""
+
+    def __init__(self, run_id):
+        self.run_id = run_id
+        self.beats = []
+
+    async def heartbeat(self, **kwargs):
+        self.beats.append(kwargs)
+
+    @property
+    def terminal(self):
+        return self.beats[-1]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_resumed_run_reports_cells_finished_earlier(pipeline, settings):
+    """A run that resumes must report the cells an earlier invocation finished.
+
+    This is the batch-API failure mode: BatchPendingError parks the job and
+    run_pipeline is called again from the top, but cells already in the store are
+    dropped before they can be counted. With the counter starting at 0 the final
+    heartbeat said e.g. 36/316 done, and SEER — which refuses to believe a
+    'succeeded' heartbeat short of cells_total — marked a finished job failed.
+    """
+    respx.get("https://seer.test/api/papers/42/ocr/").mock(
+        return_value=httpx.Response(200, json={"markdown": "Full text of paper A"})
+    )
+    respx.get("https://seer.test/api/papers/43/ocr/").mock(
+        return_value=httpx.Response(200, json={"markdown": "Full text of paper B"})
+    )
+    respx.post("https://seer.test/api/llmanswers/bulk/").mock(
+        return_value=httpx.Response(200, json={"created": 2})
+    )
+
+    store = Store(settings.runtime.store_path)
+    # Paper 42 was finished by an earlier invocation of this same run.
+    for q in pipeline.questions:
+        store.save_answer(10, 42, q.version_id, {"extraction_status": "ok"})
+        store.mark_posted(10, 42, [q.version_id])
+
+    reporter = RecordingReporter(10)
+    await run_pipeline(
+        pipeline, settings, store=store, dry_run=True,
+        run_ids=[10], reporter_factory=lambda run_id: reporter,
+    )
+
+    terminal = reporter.terminal
+    assert terminal["status"] == "succeeded"
+    assert terminal["cells_total"] == 4          # 2 papers x 2 questions
+    assert terminal["cells_done"] == 4           # not 2 — paper 42 counts too
+    # The very first heartbeat already reflects the resumed work, so the UI does
+    # not drop back to 0 on every resume.
+    assert reporter.beats[0]["cells_done"] == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_resumed_run_does_not_double_count_a_retried_cell(pipeline, settings):
+    """A resume re-processes every cell that is not done/posted — a failed cell, and
+    the finished cells of its question group with it. Each must still count once, or
+    a run ends up reporting more cells done than it has."""
+    respx.get("https://seer.test/api/papers/42/ocr/").mock(
+        return_value=httpx.Response(200, json={"markdown": "Full text of paper A"})
+    )
+    respx.get("https://seer.test/api/papers/43/ocr/").mock(
+        return_value=httpx.Response(200, json={"markdown": "Full text of paper B"})
+    )
+    respx.post("https://seer.test/api/llmanswers/bulk/").mock(
+        return_value=httpx.Response(200, json={"created": 2})
+    )
+
+    store = Store(settings.runtime.store_path)
+    # Paper 42: one cell finished, one failed — the failed one gets retried now.
+    store.save_answer(10, 42, 14, {"extraction_status": "ok"})
+    store.mark_posted(10, 42, [14])
+    store.save_answer(10, 42, 15, {"extraction_status": "error"})
+    store.mark_failed(10, 42, 15, "boom")
+
+    reporter = RecordingReporter(10)
+    await run_pipeline(
+        pipeline, settings, store=store, dry_run=True,
+        run_ids=[10], reporter_factory=lambda run_id: reporter,
+    )
+
+    terminal = reporter.terminal
+    assert terminal["cells_total"] == 4
+    assert terminal["cells_done"] == 4          # not 5 — the retried cell counts once
+    # The retry succeeded, so the error it was seeded with is cleared, not carried.
+    assert terminal["cells_error"] == 0
+    assert terminal["status"] == "succeeded"

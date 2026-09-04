@@ -142,3 +142,100 @@ def test_update_reformatted_resolution(store):
     assert len(rows) == 1
     assert rows[0]["payload"]["value_text"] == "new"
     assert store.get_resolution_status(1, 501) == "done"
+
+
+# ---------------------------------------------------------------------------
+# Resume-safe progress counters (finished_cells / finished_resolutions)
+#
+# These exist because a batch run parks on BatchPendingError and re-enters
+# run_pipeline from the top: a counter starting at 0 reports only the last
+# invocation's work, and SEER downgrades a "succeeded" heartbeat short of
+# cells_total to "failed". Returned per cell rather than as a total because a
+# resume re-processes every cell that is not done/posted. See Store.finished_cells.
+# ---------------------------------------------------------------------------
+
+PAPERS = [1, 2]
+VERSIONS = [10, 11]
+
+
+def _ok(value="x"):
+    return {"extraction_status": "ok", "value_text": value}
+
+
+def _err():
+    return {"extraction_status": "error", "extraction_detail": "boom"}
+
+
+def _invalid():
+    return {"extraction_status": "invalid", "extraction_detail": "unmappable value"}
+
+
+def test_finished_cells_empty(store):
+    assert store.finished_cells(1, PAPERS, VERSIONS) == {}
+
+
+def test_finished_cells_reports_each_cell_once(store):
+    store.save_answer(1, 1, 10, _ok())
+    store.save_answer(1, 1, 11, _ok())
+    store.save_answer(1, 2, 10, _err())
+    assert store.finished_cells(1, PAPERS, VERSIONS) == {
+        (1, 10): False, (1, 11): False, (2, 10): True,
+    }
+
+
+def test_finished_cells_counts_invalid_as_error(store):
+    """`invalid` is an answer nobody can use — it belongs in cells_error, and the
+    live counter (mapping.payload_is_error) must agree with this."""
+    store.save_answer(1, 1, 10, _invalid())
+    assert store.finished_cells(1, PAPERS, VERSIONS) == {(1, 10): True}
+
+
+def test_finished_cells_survives_posted_and_failed(store):
+    """mark_posted/mark_failed change the row's status but keep its payload: the
+    cell was still counted once when its payload was saved."""
+    store.save_answer(1, 1, 10, _ok())
+    store.mark_posted(1, 1, [10])
+    store.save_answer(1, 1, 11, _err())
+    store.mark_failed(1, 1, 11, "boom")
+    assert store.finished_cells(1, PAPERS, VERSIONS) == {(1, 10): False, (1, 11): True}
+
+
+def test_finished_cells_ignores_pending_and_pass1(store):
+    """A pending row has no payload and a pass1_done row is only half processed —
+    neither has gone through _count_payload yet."""
+    store.upsert_pending(1, 1, 10)
+    store.save_pass1(1, 1, 11, {"extraction_status": "ok"})
+    assert store.finished_cells(1, PAPERS, VERSIONS) == {}
+
+
+def test_finished_cells_is_scoped(store):
+    """Other runs, and papers/versions outside the caller's scope, never appear —
+    the seed must not be able to exceed that scope's cells_total."""
+    store.save_answer(1, 1, 10, _ok())
+    store.save_answer(1, 99, 10, _ok())   # paper out of scope
+    store.save_answer(1, 1, 99, _ok())    # question version out of scope
+    store.save_answer(2, 1, 10, _ok())    # different run
+    assert store.finished_cells(1, PAPERS, VERSIONS) == {(1, 10): False}
+
+
+def test_finished_resolutions(store):
+    store.save_resolution(1, 501, 42, 14, {"resolution_status": "ok"})
+    store.save_resolution(1, 502, 42, 15, {"resolution_status": "invalid"})
+    store.mark_resolutions_posted(1, [501])
+    store.save_pass1_resolution(1, 503, 42, 16, {"resolution_status": "ok"})
+    store.upsert_pending_resolution(1, 504, 42, 17)
+    store.save_resolution(2, 505, 42, 18, {"resolution_status": "ok"})  # other arbiter run
+
+    assert store.finished_resolutions(1, [501, 502, 503, 504]) == {501: False, 502: True}
+    assert store.finished_resolutions(1, [501]) == {501: False}
+
+
+def test_finished_cells_tolerates_unreadable_payload(store):
+    """A row whose payload can't be parsed still counts as done — dropping it would
+    make a finished run look unfinished, which is the failure this seed prevents."""
+    store.save_answer(1, 1, 10, _ok())
+    with store._tx() as con:
+        con.execute(
+            "UPDATE answers SET payload_json='{not json' WHERE run_id=1 AND paper_id=1 AND version_id=10"
+        )
+    assert store.finished_cells(1, PAPERS, VERSIONS) == {(1, 10): False}
