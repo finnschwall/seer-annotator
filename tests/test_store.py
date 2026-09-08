@@ -52,6 +52,90 @@ def test_get_unposted(store):
     assert unposted[0]["question_version"] == 11
 
 
+# ---------------------------------------------------------------------------
+# Delivery and retryability are separate facts
+#
+# `status` says whether the cell is recomputed on the next run; `posted_at` says
+# whether SEER has the payload. A dropped cell (provider error, truncated pass)
+# is both retryable and owed an error answer. While one column carried both,
+# mark_failed cancelled the post, and the paper disappeared from the run with no
+# error anywhere to explain it.
+# ---------------------------------------------------------------------------
+
+def test_failed_cell_is_still_unposted_work(store):
+    store.save_answer(1, 1, 10, {"run": 1, "paper": 1, "question_version": 10})
+    store.mark_failed(1, 1, 10, "pass1 truncated")
+
+    unposted = store.get_unposted(1, 1)
+    assert [p["question_version"] for p in unposted] == [10]
+
+
+def test_posting_a_failed_cell_keeps_it_retryable(store):
+    store.save_answer(1, 1, 10, {"run": 1, "paper": 1, "question_version": 10})
+    store.mark_failed(1, 1, 10, "pass1 truncated")
+    store.mark_posted(1, 1, [10])
+
+    assert store.get_status(1, 1, 10) == "failed"
+    assert store.should_skip_cell(1, 1, 10) is False   # next run tries it again
+    assert store.get_unposted(1, 1) == []              # but it is not posted twice
+
+
+def test_retried_cell_is_posted_again(store):
+    """The retry's answer must reach SEER, or the error answer posted for the
+    first attempt stays there as the run's final word."""
+    store.save_answer(1, 1, 10, {"question_version": 10, "extraction_status": "error"})
+    store.mark_failed(1, 1, 10, "boom")
+    store.mark_posted(1, 1, [10])
+
+    store.save_answer(1, 1, 10, {"question_version": 10, "extraction_status": "ok"})
+
+    unposted = store.get_unposted(1, 1)
+    assert [p["extraction_status"] for p in unposted] == ["ok"]
+
+
+def test_get_unposted_ignores_half_processed_cells(store):
+    store.save_pass1(1, 1, 10, {"question_version": 10, "pass1_text": "..."})
+    assert store.get_unposted(1, 1) == []
+
+
+def test_get_postable_includes_failed(store):
+    store.save_answer(1, 1, 10, {"question_version": 10})
+    store.mark_failed(1, 1, 10, "boom")
+    store.save_answer(1, 1, 11, {"question_version": 11})
+    store.mark_posted(1, 1, [11])
+
+    postable = store.get_postable(1, 1)
+    assert {p["question_version"] for p in postable} == {10, 11}
+
+
+def test_store_file_written_before_posted_at_is_upgraded(tmp_path):
+    """A job store outlives the code that wrote it — a parked batch job is resumed
+    days later from the file on disk. Rows already posted must not be posted again."""
+    import sqlite3
+
+    path = str(tmp_path / "legacy.db")
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE answers (
+            run_id INTEGER NOT NULL, paper_id INTEGER NOT NULL, version_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', payload_json TEXT, batch_group_id TEXT,
+            error TEXT, updated_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, paper_id, version_id)
+        );
+        INSERT INTO answers (run_id, paper_id, version_id, status, payload_json, updated_at)
+        VALUES (1, 1, 10, 'posted', '{"question_version": 10}', 'then'),
+               (1, 1, 11, 'done',   '{"question_version": 11}', 'then'),
+               (1, 1, 12, 'failed', '{"question_version": 12}', 'then');
+    """)
+    con.commit()
+    con.close()
+
+    store = Store(path)
+
+    # 11 was never delivered; 12 is the error answer the old code dropped.
+    assert {p["question_version"] for p in store.get_unposted(1, 1)} == {11, 12}
+
+
 def test_stats(store):
     store.mark_skipped(1, 5, 99, "no_ocr")
     store.upsert_pending(1, 5, 100)
@@ -125,6 +209,23 @@ def test_get_unposted_and_postable_resolutions(store):
 
     postable = store.get_postable_resolutions(1, 42)
     assert {p["dispute_item"] for p in postable} == {501, 502}
+
+
+def test_failed_resolution_is_posted_and_stays_retryable(store):
+    """The resolutions twin of test_posting_a_failed_cell_keeps_it_retryable —
+    a dropped dispute item owes SEER an error resolution just as a dropped
+    annotation cell owes it an error answer."""
+    store.save_resolution(1, 503, 42, 16, {"dispute_item": 503})
+    store.mark_resolution_failed(1, 503, "provider error")
+
+    assert [r["dispute_item"] for r in store.get_unposted_resolutions(1, 42)] == [503]
+
+    store.mark_resolutions_posted(1, [503])
+
+    assert store.get_resolution_status(1, 503) == "failed"
+    assert store.should_skip_resolution_cell(1, 503) is False
+    assert store.get_unposted_resolutions(1, 42) == []
+    assert [r["dispute_item"] for r in store.get_postable_resolutions(1, 42)] == [503]
 
 
 def test_resolution_stats(store):

@@ -46,6 +46,7 @@ from .config import (
 )
 from .progress import ProgressReporter, ProgressReporterProtocol
 from .rate_limiter import PerProviderRateLimiter
+from .reply_quality import pass2_incomplete_reason
 from .seer_client import SeerClient
 from .store import Store
 from .mapping import build_error_resolution, build_resolution, payload_is_error
@@ -53,7 +54,7 @@ from .annotate.parse import ExtractionError, parse_structured_output
 from .annotate.verify import verify_citation
 from .annotate.scope import ic_answer_passes
 from .arbitrate.prompt import build_dispute_messages
-from .orchestrator import _chunks
+from .orchestrator import _chunks, _p1_drop_reason
 
 logger = logging.getLogger(__name__)
 
@@ -246,15 +247,23 @@ def _parse_save_post_tail_resolutions(
         fmt_cost = fu.get("cost")
         p2_latency = fu.get("latency_ms", 0) or 0
 
-        # Missing later keys may be a valid consequence of an adjudicated IC
-        # exclusion. Preserve them as status='absent' first; the deterministic
-        # path pass below decides whether each omission is terminally
-        # not-applicable or a genuine error.
-        parsed = parse_structured_output(
-            p2_text, [q.key for q in group], annotate_mode=True,
-        )
+        # A reply that looped or ran out of room is not a result document, and
+        # parsing it reads values off whatever json_repair closed. Fail the
+        # whole group on the reply instead — same gate as the annotate tail.
+        incomplete = pass2_incomplete_reason(p2_text, fu)
+        if incomplete is not None:
+            parsed = []
+            failed_keys = {q.key: incomplete[1] for q in group}
+        else:
+            # Missing later keys may be a valid consequence of an adjudicated IC
+            # exclusion. Preserve them as status='absent' first; the deterministic
+            # path pass below decides whether each omission is terminally
+            # not-applicable or a genuine error.
+            parsed = parse_structured_output(
+                p2_text, [q.key for q in group], annotate_mode=True,
+            )
 
-        failed_keys = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
+            failed_keys = {r["key"]: r["parse_error"] for r in parsed if "parse_error" in r}
         if failed_keys:
             err = ExtractionError(failed_keys)
             logger.error(
@@ -290,12 +299,15 @@ def _parse_save_post_tail_resolutions(
                 )
                 continue
 
-            cited_error = result.get("cited_text_error")
+            # The item's JSON did not survive parsing intact, so its resolution
+            # value/comment are not what the model wrote — record an error
+            # resolution for this dispute item only. Either the damage landed
+            # inside cited_text, or the reply stopped partway through the item
+            # (see annotate.parse.cited_text_violation and
+            # _incomplete_item_violation). No require_status here: arbitration
+            # asks for no status field, so an item without one is complete.
+            cited_error = result.get("cited_text_error") or result.get("item_error")
             if cited_error:
-                # The item's JSON did not survive parsing intact, so its resolution
-                # value/comment are not what the model wrote — record an error
-                # resolution for this dispute item only (see
-                # annotate.parse.cited_text_violation).
                 logger.error(
                     "EXTRACTION FAILURE — run %d, paper %d, group %d, key %r: %s",
                     run.run_id, paper.paper_id, group_idx, question.key, cited_error,
@@ -341,19 +353,19 @@ def _parse_save_post_tail_resolutions(
                 cited_text=result.get("cited_text", ""),
                 cited_text_verified=cited_text_verified,
                 raw_response=raw_response,
-                latency_ms=(p1_latency + p2_latency) if i == 0 else 0,
-                tokens_total=tok_input + tok_output + tok_cached if i == 0 else 0,
-                tokens_input=tok_input if i == 0 else 0,
-                tokens_output=tok_output if i == 0 else 0,
-                tokens_cached=tok_cached if i == 0 else 0,
-                tokens_reasoning=tok_reasoning if i == 0 else 0,
+                latency_ms=(p1_latency + p2_latency) if i == 0 else None,
+                tokens_total=tok_input + tok_output + tok_cached if i == 0 else None,
+                tokens_input=tok_input if i == 0 else None,
+                tokens_output=tok_output if i == 0 else None,
+                tokens_cached=tok_cached if i == 0 else None,
+                tokens_reasoning=tok_reasoning if i == 0 else None,
                 reasoning_content=p1_reasoning_content if i == 0 else None,
                 cost=p1_cost if i == 0 else None,
                 cost_currency="USD",
-                fmt_tokens_total=fmt_total if i == 0 else 0,
-                fmt_tokens_input=fmt_input if i == 0 else 0,
-                fmt_tokens_output=fmt_output if i == 0 else 0,
-                fmt_tokens_cached=fmt_cached if i == 0 else 0,
+                fmt_tokens_total=fmt_total if i == 0 else None,
+                fmt_tokens_input=fmt_input if i == 0 else None,
+                fmt_tokens_output=fmt_output if i == 0 else None,
+                fmt_tokens_cached=fmt_cached if i == 0 else None,
                 fmt_cost=fmt_cost if i == 0 else None,
                 confidence=result.get("confidence"),
                 resolution_status=result.get("resolution_status"),
@@ -653,11 +665,11 @@ async def run_arbitration_pipeline(
                 for cid, (paper, group, group_idx) in pending_cells.items():
                     if cid in p1_texts:
                         continue
-                    # Prefer the real per-item error (batch item errored/canceled/
-                    # expired, or an online call exception) when available — mirrors
-                    # orchestrator.py's run_pipeline handling of the same gap.
-                    cell_error_detail = p1_errors.get(
-                        cid, "pass1 failed — no output (API error/timeout); see log"
+                    # See _p1_drop_reason (orchestrator.py) for which of the three
+                    # possible reasons this dispute gets, and why its Pass-1 usage
+                    # rides along without any Pass-1 text.
+                    cell_error_detail, cell_raw = _p1_drop_reason(
+                        cid, p1_errors, p1_usage, p1_error,
                     )
                     for q in group:
                         d = dispute_by_paper_version.get((paper.paper_id, q.version_id))
@@ -667,12 +679,13 @@ async def run_arbitration_pipeline(
                             arbiter_run_id=run.run_id, paper_id=paper.paper_id,
                             dispute_item_id=d.dispute_item_id, question=q,
                             resolution_detail=cell_error_detail,
+                            raw_response=cell_raw,
                         )
                         store.save_resolution(
                             run.run_id, d.dispute_item_id, paper.paper_id, q.version_id, p1_drop_payload,
                         )
                         _count_payload(p1_drop_payload)
-                        if cid in p1_errors:
+                        if cid in p1_errors or p1_error:
                             store.mark_resolution_failed(run.run_id, d.dispute_item_id, cell_error_detail)
 
                 pending_p1 = {cid: t for cid, t in p1_texts.items() if cid in pending_cells}
@@ -711,6 +724,16 @@ async def run_arbitration_pipeline(
                             arbiter_run_id=run.run_id, paper_id=paper.paper_id,
                             dispute_item_id=d.dispute_item_id, question=q,
                             resolution_detail=err_detail,
+                            raw_response={
+                                "pass1_text": p1_texts.get(cid, ""),
+                                "p1_usage": p1_usage.get(cid, {}),
+                                "p2_usage": p2_usage.get(cid, {}),
+                                "batch_group_id": cid,
+                                "diagnostics": [{
+                                    "phase": "pass2", "code": "pass2_provider_error",
+                                    "detail": err_detail,
+                                }],
+                            },
                         )
                         store.save_resolution(
                             run.run_id, d.dispute_item_id, paper.paper_id, q.version_id, p2_drop_payload,
@@ -972,11 +995,11 @@ async def arbitration_pass1_pipeline(
                     cited_text="",
                     cited_text_verified=None,
                     raw_response=raw_response,
-                    latency_ms=p1_latency if i == 0 else 0,
-                    tokens_total=tok_input + tok_output + tok_cached if i == 0 else 0,
-                    tokens_input=tok_input if i == 0 else 0,
-                    tokens_output=tok_output if i == 0 else 0,
-                    tokens_cached=tok_cached if i == 0 else 0,
+                    latency_ms=p1_latency if i == 0 else None,
+                    tokens_total=tok_input + tok_output + tok_cached if i == 0 else None,
+                    tokens_input=tok_input if i == 0 else None,
+                    tokens_output=tok_output if i == 0 else None,
+                    tokens_cached=tok_cached if i == 0 else None,
                     cost=p1_cost if i == 0 else None,
                     cost_currency="USD",
                 )
@@ -1113,11 +1136,11 @@ async def arbitration_pass2_pipeline(
                 p1_payload_row0 = p1_payload_by_cid.get(cid, {})
                 u = p1_usage_by_cid.get(cid, {})
 
-                p1_tok_input = p1_payload_row0.get("tokens_input", 0) or 0
-                p1_tok_output = p1_payload_row0.get("tokens_output", 0) or 0
-                p1_tok_cached = p1_payload_row0.get("tokens_cached", 0) or 0
-                p1_tok_total = p1_payload_row0.get("tokens_total", 0) or 0
-                p1_tok_reasoning = p1_payload_row0.get("tokens_reasoning", 0) or 0
+                p1_tok_input = p1_payload_row0.get("tokens_input")
+                p1_tok_output = p1_payload_row0.get("tokens_output")
+                p1_tok_cached = p1_payload_row0.get("tokens_cached")
+                p1_tok_total = p1_payload_row0.get("tokens_total")
+                p1_tok_reasoning = p1_payload_row0.get("tokens_reasoning")
                 p1_reasoning_content = p1_payload_row0.get("reasoning_content")
                 p1_cost_str = p1_payload_row0.get("cost")
                 p1_cost = Decimal(p1_cost_str) if p1_cost_str else None
@@ -1208,19 +1231,19 @@ async def arbitration_pass2_pipeline(
                         cited_text=result.get("cited_text", ""),
                         cited_text_verified=cited_text_verified,
                         raw_response=raw_response,
-                        latency_ms=(p1_latency + p2_latency) if i == 0 else 0,
-                        tokens_total=p1_tok_total if i == 0 else 0,
-                        tokens_input=p1_tok_input if i == 0 else 0,
-                        tokens_output=p1_tok_output if i == 0 else 0,
-                        tokens_cached=p1_tok_cached if i == 0 else 0,
-                        tokens_reasoning=p1_tok_reasoning if i == 0 else 0,
+                        latency_ms=(p1_latency + p2_latency) if i == 0 else None,
+                        tokens_total=p1_tok_total if i == 0 else None,
+                        tokens_input=p1_tok_input if i == 0 else None,
+                        tokens_output=p1_tok_output if i == 0 else None,
+                        tokens_cached=p1_tok_cached if i == 0 else None,
+                        tokens_reasoning=p1_tok_reasoning if i == 0 else None,
                         reasoning_content=p1_reasoning_content if i == 0 else None,
                         cost=p1_cost if i == 0 else None,
                         cost_currency="USD",
-                        fmt_tokens_total=fmt_total if i == 0 else 0,
-                        fmt_tokens_input=fmt_input if i == 0 else 0,
-                        fmt_tokens_output=fmt_output if i == 0 else 0,
-                        fmt_tokens_cached=fmt_cached if i == 0 else 0,
+                        fmt_tokens_total=fmt_total if i == 0 else None,
+                        fmt_tokens_input=fmt_input if i == 0 else None,
+                        fmt_tokens_output=fmt_output if i == 0 else None,
+                        fmt_tokens_cached=fmt_cached if i == 0 else None,
                         fmt_cost=fmt_cost if i == 0 else None,
                         confidence=result.get("confidence"),
                     )
@@ -1434,11 +1457,11 @@ async def reformat_arbitration_pipeline(
                             cited_text=parsed.get("cited_text", ""),
                             cited_text_verified=result["cited_text_verified"],
                             raw_response=new_raw,
-                            latency_ms=old_payload.get("latency_ms", 0),
-                            tokens_total=old_payload.get("tokens_total", 0),
-                            tokens_input=old_payload.get("tokens_input", 0),
-                            tokens_output=old_payload.get("tokens_output", 0),
-                            tokens_cached=old_payload.get("tokens_cached", 0),
+                            latency_ms=old_payload.get("latency_ms"),
+                            tokens_total=old_payload.get("tokens_total"),
+                            tokens_input=old_payload.get("tokens_input"),
+                            tokens_output=old_payload.get("tokens_output"),
+                            tokens_cached=old_payload.get("tokens_cached"),
                             cost=Decimal(old_payload["cost"]) if old_payload.get("cost") else None,
                             cost_currency=old_payload.get("cost_currency", "USD"),
                             fmt_tokens_total=result["fmt_tokens_total"],

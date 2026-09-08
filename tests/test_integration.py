@@ -171,6 +171,60 @@ async def test_no_ocr_posts_error(pipeline, settings):
             assert payload["extraction_detail"] == "no_ocr"
 
 
+@pytest.mark.asyncio
+@respx.mock
+async def test_dropped_pass1_cell_is_posted_and_stays_retryable(pipeline, settings, monkeypatch):
+    """A cell whose Pass-1 call fails owes SEER an error answer *and* has to be
+    retried next run. Those are two different facts; when the store carried both
+    in one column, marking the cell retryable cancelled its post and the paper
+    vanished from the run with nothing to explain it.
+    """
+    import seer_annotator.llm as llm_module
+    from seer_annotator.llm import dummy_complete
+
+    respx.get("https://seer.test/api/papers/42/ocr/").mock(
+        return_value=httpx.Response(200, json={"markdown": "Full text of paper A"})
+    )
+    respx.get("https://seer.test/api/papers/43/ocr/").mock(
+        return_value=httpx.Response(200, json={"markdown": "Full text of paper B"})
+    )
+
+    async def flaky_complete(model, provider, messages, **kwargs):
+        # Only paper 42's `sample_size` group fails. Everything else answers
+        # normally, including the run's first call — a first call that raises is
+        # a different (fatal, whole-run) path.
+        prompt = " ".join(m.get("content", "") for m in messages if isinstance(m.get("content"), str))
+        if "Full text of paper A" in prompt and "sample_size" in prompt:
+            raise RuntimeError("provider exploded")
+        return await dummy_complete(model, provider, messages, **kwargs)
+
+    monkeypatch.setattr(llm_module, "complete", flaky_complete)
+
+    posted = []
+
+    def capture_post(request):
+        posted.extend(json.loads(request.content))
+        return httpx.Response(200, json={"created": len(posted), "updated": 0, "errors": []})
+
+    respx.post("https://seer.test/api/experiment-runs/10/answers/bulk/").mock(side_effect=capture_post)
+
+    store = Store(settings.runtime.store_path)
+    client = SeerClient(pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions)
+
+    await run_pipeline(
+        pipeline, settings, store=store, client=client, dry_run=False, run_ids=[10],
+    )
+
+    dropped = [a for a in posted if a["paper"] == 42 and a["question_key"] == "sample_size"]
+    assert len(dropped) == 1, "the failed cell must reach SEER as an error answer"
+    assert dropped[0]["extraction_status"] == "error"
+    assert "provider exploded" in dropped[0]["extraction_detail"]
+
+    assert store.get_status(10, 42, 15) == "failed"        # retried next run
+    assert store.should_skip_cell(10, 42, 15) is False
+    assert store.get_unposted(10, 42) == []                # delivered once, not again
+
+
 class RecordingReporter:
     """Captures every heartbeat instead of POSTing it."""
 

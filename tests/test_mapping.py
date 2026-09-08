@@ -272,3 +272,32 @@ def test_build_skipped_answer_does_not_count_as_error():
     assert payload_is_error(
         build_skipped_answer(run_id=1, paper_id=1, question=q, extraction_detail="gated out: x=false")
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# Blank usage figures on non-carrying rows
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("build", [
+    lambda **kw: build_llm_answer(
+        run_id=1, paper_id=2, question=make_q("boolean"), value=True,
+        comment="", cited_text="", raw_response={}, cost=None, **kw,
+    ),
+    lambda **kw: build_resolution(
+        arbiter_run_id=1, paper_id=2, dispute_item_id=3, question=make_q("boolean"),
+        value=True, comment="", cited_text="", raw_response={}, cost=None, **kw,
+    ),
+])
+def test_blank_usage_figures_stay_none(build):
+    """None must survive into the payload, not be coerced to 0.
+
+    SEER writes any field that is not None, so a 0 in a row that is not carrying
+    the group's figures overwrites the real count recorded on an earlier post.
+    """
+    payload = build(
+        latency_ms=None, tokens_total=None, tokens_input=None,
+        tokens_output=None, tokens_cached=None,
+    )
+
+    for field in ("latency_ms", "tokens_total", "tokens_input", "tokens_output", "tokens_cached"):
+        assert payload[field] is None, field

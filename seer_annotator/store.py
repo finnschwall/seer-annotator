@@ -72,6 +72,7 @@ class Store:
                     batch_group_id  TEXT,
                     error           TEXT,
                     updated_at      TEXT NOT NULL,
+                    posted_at       TEXT,
                     PRIMARY KEY (run_id, paper_id, version_id)
                 );
 
@@ -90,9 +91,28 @@ class Store:
                     batch_group_id  TEXT,
                     error           TEXT,
                     updated_at      TEXT NOT NULL,
+                    posted_at       TEXT,
                     PRIMARY KEY (arbiter_run_id, dispute_item_id)
                 );
             """)
+            self._add_posted_at(con, "answers")
+            self._add_posted_at(con, "resolutions")
+
+    @staticmethod
+    def _add_posted_at(con: sqlite3.Connection, table: str) -> None:
+        """Add the `posted_at` column to a store file written before it existed.
+
+        Job stores are per-job files that outlive the code that wrote them (a batch
+        job is resumed days later, from a `state.db` on disk), so the schema has to
+        be brought forward in place. Rows already at status 'posted' were delivered,
+        so they are backfilled — otherwise a resume would post every one of them a
+        second time.
+        """
+        cols = {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
+        if "posted_at" in cols:
+            return
+        con.execute(f"ALTER TABLE {table} ADD COLUMN posted_at TEXT")
+        con.execute(f"UPDATE {table} SET posted_at = updated_at WHERE status = 'posted'")
 
     # ------------------------------------------------------------------
     # OCR cache
@@ -142,6 +162,12 @@ class Store:
         payload: dict,
         batch_group_id: str | None = None,
     ) -> None:
+        """Save a finished cell's payload as undelivered.
+
+        INSERT OR REPLACE writes a whole new row, so a retry's payload arrives with
+        `posted_at` back at NULL — which is what makes the retry's answer replace
+        the error answer that was posted for the earlier attempt.
+        """
         with self._tx() as con:
             con.execute(
                 """INSERT OR REPLACE INTO answers
@@ -190,6 +216,9 @@ class Store:
             )
 
     def mark_failed(self, run_id: int, paper_id: int, version_id: int, error: str) -> None:
+        """Mark the cell for recomputation on the next run. Says nothing about
+        delivery: the error answer this row holds is still owed to SEER, and
+        `posted_at` — deliberately untouched here — is what tracks that."""
         with self._tx() as con:
             con.execute(
                 """UPDATE answers SET status='failed', error=?, updated_at=?
@@ -198,29 +227,52 @@ class Store:
             )
 
     def mark_posted(self, run_id: int, paper_id: int, version_ids: list[int]) -> None:
+        """Record that these payloads reached SEER.
+
+        Only a 'done' row becomes 'posted'. A 'failed' row keeps its status, because
+        status decides whether the cell is recomputed next run and delivering its
+        error answer is no reason to stop retrying it.
+        """
+        now = _now()
         with self._tx() as con:
             con.executemany(
-                """UPDATE answers SET status='posted', updated_at=?
-                   WHERE run_id=? AND paper_id=? AND version_id=?""",
-                [(_now(), run_id, paper_id, vid) for vid in version_ids],
+                """UPDATE answers
+                      SET posted_at=?, updated_at=?,
+                          status=CASE WHEN status='done' THEN 'posted' ELSE status END
+                    WHERE run_id=? AND paper_id=? AND version_id=?""",
+                [(now, now, run_id, paper_id, vid) for vid in version_ids],
             )
 
     def get_unposted(self, run_id: int, paper_id: int) -> list[dict]:
+        """Payloads saved for this paper that SEER has not been sent yet.
+
+        Keyed on `posted_at`, never on status, because the two answer different
+        questions — has this been delivered, and should this cell be recomputed —
+        and a dropped cell is 'yes' to both. Selecting on status='done' alone is
+        what used to make `mark_failed` silently cancel the post of an error
+        answer, so the paper vanished from a run with no error to show for it.
+
+        'pass1_done' rows carry a payload too, but a half-processed cell is not an
+        answer, so the statuses that can be posted are listed explicitly.
+        """
         with self._connect() as con:
             rows = con.execute(
                 """SELECT payload_json FROM answers
-                   WHERE run_id=? AND paper_id=? AND status='done'
+                   WHERE run_id=? AND paper_id=? AND posted_at IS NULL
+                   AND status IN ('done', 'failed')
                    AND payload_json IS NOT NULL""",
                 (run_id, paper_id),
             ).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
 
     def get_postable(self, run_id: int, paper_id: int) -> list[dict]:
-        """Return payloads for answers that are done or already posted (for repost)."""
+        """Return every payload this store holds for the paper, delivered or not
+        (for repost). Includes 'failed' rows: an error answer is an answer, and a
+        repost that skipped them would rebuild the same silent gap."""
         with self._connect() as con:
             rows = con.execute(
                 """SELECT payload_json FROM answers
-                   WHERE run_id=? AND paper_id=? AND status IN ('done', 'posted')
+                   WHERE run_id=? AND paper_id=? AND status IN ('done', 'posted', 'failed')
                    AND payload_json IS NOT NULL""",
                 (run_id, paper_id),
             ).fetchall()
@@ -365,6 +417,7 @@ class Store:
             )
 
     def mark_resolution_failed(self, arbiter_run_id: int, dispute_item_id: int, error: str) -> None:
+        """The resolutions twin of `mark_failed` — retryability only, never delivery."""
         with self._tx() as con:
             con.execute(
                 """UPDATE resolutions SET status='failed', error=?, updated_at=?
@@ -373,11 +426,16 @@ class Store:
             )
 
     def mark_resolutions_posted(self, arbiter_run_id: int, dispute_item_ids: list[int]) -> None:
+        """The resolutions twin of `mark_posted` — see it for why a 'failed' row
+        keeps its status."""
+        now = _now()
         with self._tx() as con:
             con.executemany(
-                """UPDATE resolutions SET status='posted', updated_at=?
-                   WHERE arbiter_run_id=? AND dispute_item_id=?""",
-                [(_now(), arbiter_run_id, did) for did in dispute_item_ids],
+                """UPDATE resolutions
+                      SET posted_at=?, updated_at=?,
+                          status=CASE WHEN status='done' THEN 'posted' ELSE status END
+                    WHERE arbiter_run_id=? AND dispute_item_id=?""",
+                [(now, now, arbiter_run_id, did) for did in dispute_item_ids],
             )
 
     def finished_resolutions(self, arbiter_run_id: int, dispute_item_ids: Iterable[int]) -> dict:
@@ -415,21 +473,25 @@ class Store:
             )
 
     def get_unposted_resolutions(self, arbiter_run_id: int, paper_id: int) -> list[dict]:
+        """The resolutions twin of `get_unposted` — see it for why this selects on
+        `posted_at` rather than status."""
         with self._connect() as con:
             rows = con.execute(
                 """SELECT payload_json FROM resolutions
-                   WHERE arbiter_run_id=? AND paper_id=? AND status='done'
+                   WHERE arbiter_run_id=? AND paper_id=? AND posted_at IS NULL
+                   AND status IN ('done', 'failed')
                    AND payload_json IS NOT NULL""",
                 (arbiter_run_id, paper_id),
             ).fetchall()
         return [json.loads(r["payload_json"]) for r in rows]
 
     def get_postable_resolutions(self, arbiter_run_id: int, paper_id: int) -> list[dict]:
-        """Return payloads for resolutions that are done or already posted (for repost)."""
+        """Return every resolution payload this store holds for the paper, delivered
+        or not (for repost). Includes 'failed' rows, like `get_postable`."""
         with self._connect() as con:
             rows = con.execute(
                 """SELECT payload_json FROM resolutions
-                   WHERE arbiter_run_id=? AND paper_id=? AND status IN ('done', 'posted')
+                   WHERE arbiter_run_id=? AND paper_id=? AND status IN ('done', 'posted', 'failed')
                    AND payload_json IS NOT NULL""",
                 (arbiter_run_id, paper_id),
             ).fetchall()
@@ -582,6 +644,23 @@ class Store:
     def delete_batch_id(self, key: str) -> None:
         with self._tx() as con:
             con.execute("DELETE FROM kv WHERE key=?", (key,))
+
+    def owes_batch(self, batch_id: str) -> bool:
+        """Is `batch_id` still owed — submitted, and not yet collected?
+
+        `submit_and_poll` saves the id before polling and deletes it once
+        `collect()` has returned (or the batch came back failed), so presence
+        here is the one durable record of "this batch still has results nobody
+        has taken". A caller that tracks batches in its own database has no
+        other way to tell a batch it is still waiting on from one that was
+        collected hours ago: the provider will happily serve the results again,
+        and the job row alone does not say whether anyone did.
+        """
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT 1 FROM kv WHERE value=? LIMIT 1", (batch_id,),
+            ).fetchone()
+        return row is not None
 
     # ------------------------------------------------------------------
     # UI / inspection helpers

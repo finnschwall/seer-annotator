@@ -26,6 +26,11 @@ class LLMResult:
     cost_currency: str
     latency_ms: int
     raw: dict = field(default_factory=dict)
+    # Why the model stopped. "length" means it hit max_tokens with more to say,
+    # i.e. `text` is cut off mid-sentence — the one finish reason a caller must
+    # not treat as a complete answer. None when the provider reported nothing.
+    # See TRUNCATED_FINISH_REASONS in batch_runner.py.
+    finish_reason: str | None = None
 
 
 async def complete(
@@ -57,6 +62,7 @@ async def complete(
     choice = response.choices[0]
     text: str = choice.message.content or ""
     reasoning: str | None = getattr(choice.message, "reasoning_content", None)
+    finish_reason: str | None = getattr(choice, "finish_reason", None)
 
     # Normalize usage
     u = response.usage or {}
@@ -90,10 +96,28 @@ async def complete(
         share = len(reasoning) / (len(reasoning) + len(text))
         usage.reasoning_tokens = round(share * usage.output_tokens)
 
-    # Cost via LiteLLM
+    # Cost via LiteLLM.
+    #
+    # `model=litellm_model` is required, not decoration. Left to itself,
+    # completion_cost() prices the name the PROVIDER echoed back in the response
+    # body, and Azure echoes a dated snapshot rather than the deployment you
+    # called: ask for `azure/gpt-5.5` and the response says
+    # `gpt-5.5-2026-04-24`, which is not a key in litellm's price table (it has
+    # `azure/gpt-5.5-2026-04-23`, one day off). completion_cost() then raises
+    # "This model isn't mapped yet", the except below swallows it, and every
+    # Azure call is recorded with no cost at all.
+    #
+    # Passing our own model name adds it as a second candidate: the response's
+    # name is still tried first, so a provider that echoes something litellm
+    # knows is unaffected (measured: identical results for anthropic and
+    # ollama). It is only a fallback, so a genuinely unpriced endpoint
+    # (hosted_vllm, an OpenAI-compatible local gateway) still ends up as None —
+    # "unknown", which is the honest answer, and not a misleading $0.
     cost_val: Decimal | None = None
     try:
-        cost_float = litellm.completion_cost(completion_response=response)
+        cost_float = litellm.completion_cost(
+            completion_response=response, model=litellm_model
+        )
         if cost_float is not None:
             cost_val = Decimal(str(cost_float))
     except Exception:
@@ -113,6 +137,7 @@ async def complete(
         cost_currency="USD",
         latency_ms=latency_ms,
         raw=raw_dict,
+        finish_reason=finish_reason,
     )
 
 
@@ -133,6 +158,7 @@ class _DummyResult:
         self.cost_currency = "USD"
         self.latency_ms = 1
         self.raw = {"dummy": True, "model": model}
+        self.finish_reason = "stop"
 
 
 def _dummy_question_keys(messages: list[dict]) -> list[str]:

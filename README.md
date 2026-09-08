@@ -70,6 +70,43 @@ To switch the formatting model for Pass 2:
 seer-annotate pass2 pipeline.json --format-model claude-3-5-haiku-20241022 --format-model-provider anthropic
 ```
 
+### Re-running Pass 2 over Pass-1 text you already have
+
+`pass2` reads its Pass-1 text from the local store's `pass1_done` rows, and only `pass1` ever
+writes those. After an ordinary end-to-end `run` there are none, so `pass2` finds nothing to do —
+even though every cell's Pass-1 text exists somewhere.
+
+A host application that keeps its own record of Pass 1 can hand that text in instead, as a library
+call rather than through the CLI:
+
+```python
+from seer_annotator.orchestrator import pass2_pipeline
+
+n_done, n_failed = await pass2_pipeline(
+    pipeline, settings,
+    pass1_cells={(run_id, paper_id): [
+        {
+            "group_id": "...",          # the batch_group_id Pass 1 ran under
+            "version_ids": [14, 15],    # every question in that group
+            "pass1_text": "...",        # what Pass 1 wrote
+            "p1_usage": {...},          # optional, for token accounting
+            "p1_payload": {...},        # optional, Pass-1 token/cost carry-over
+        },
+    ]},
+    store=store, client=client, post=True,
+)
+```
+
+Everything downstream is unchanged: the same Pass-2 execution, parsing, scope/status handling and
+citation verification the store path uses. A cell with no Pass-1 text is counted as failed and
+never sent — Pass 2 would have nothing to reformat, and asking it anyway invites it to invent an
+answer.
+
+This is what makes it possible to repair a failed Pass 2 without paying for Pass 1 again. Combine
+it with `format_model=` to send the retry to a different model, which is usually the point: a
+provider that has entered a bad state loops on nearly everything sent to it for minutes, so
+re-asking the same endpoint tends to loop again.
+
 ### `run` with `--chunk-papers`
 
 `run` processes papers in chunks (default: 10 papers per chunk). For each chunk it completes all of Pass 1, then all of Pass 2, then posts, before moving to the next chunk. This balances early posting and fine crash recovery (small chunk) against batching efficiency (large chunk).

@@ -22,7 +22,8 @@ from rich.progress import (
 _console = Console()
 
 from .batching import resolve_groups
-from .batch_runner import _execute_pass1, _execute_pass2
+from .batch_runner import TRUNCATED_FINISH_REASONS, _execute_pass1, _execute_pass2
+from .reply_quality import pass2_incomplete_reason
 from .config import PipelineConfig, ProviderSettings, RunConfig, Settings, effective_run_config
 from .progress import ProgressReporter, ProgressReporterProtocol
 from .rate_limiter import PerProviderRateLimiter
@@ -35,6 +36,54 @@ from .annotate.scope import apply_scope_and_status
 from .annotate.verify import verify_citation, verify_citations
 
 logger = logging.getLogger(__name__)
+
+
+def _p1_drop_reason(
+    cid: str,
+    p1_errors: dict,
+    p1_usage: dict,
+    p1_error: "str | None",
+) -> "tuple[str, dict]":
+    """Why one cell has no usable Pass-1 output, and the evidence for it.
+
+    Returns ``(detail, raw_response)`` for ``build_error_answer``. Three sources,
+    most specific first:
+
+    ``p1_errors[cid]``
+        This cell's own failure — a batch item that errored, or an online call
+        that raised. Carries the provider's own words via ``_format_llm_error``.
+    ``p1_error``
+        The phase aborted for everyone: the online probe call failed, so no cell
+        has its own entry. Every cell nevertheless failed for this reason, and
+        it used to be dropped here in favour of the generic sentence below —
+        leaving the reader with "no output (API error/timeout); see log" for what
+        was really an expired key or a rate limit, and the actual message only in
+        the log.
+    the generic sentence
+        A cid that vanished for some other reason (e.g. loaded from a stale
+        Pass-1 dump), where there is genuinely nothing more to say.
+
+    The ``raw_response`` carries this cell's Pass-1 usage even though there is no
+    Pass-1 *text* to go with it. That usage is the only record of ``max_tokens``
+    and ``finish_reason``, which is what lets a reader downstream tell a
+    truncated Pass 1 apart from a provider error — and a truncated Pass 1 has
+    already had its text popped by ``_demote_truncated_p1``.
+    """
+    detail = p1_errors.get(cid) or p1_error or (
+        "pass1 failed — no output (API error/timeout); see log"
+    )
+    usage = p1_usage.get(cid) or {}
+    code = (
+        "pass1_truncated"
+        if usage.get("finish_reason") in TRUNCATED_FINISH_REASONS
+        else "pass1_provider_error"
+    )
+    raw_response = {
+        "p1_usage": usage,
+        "batch_group_id": cid,
+        "diagnostics": [{"phase": "pass1", "code": code, "detail": detail}],
+    }
+    return detail, raw_response
 
 
 def _chunks(lst: list, size: int) -> list[list]:
@@ -126,8 +175,26 @@ def _parse_save_post_tail(
             if on_payload_saved is not None:
                 on_payload_saved(error_payload)
 
+        # Did this reply finish? A Pass 2 that looped or ran out of room still
+        # parses — json_repair closes the braces it never wrote — and the items
+        # that got out are whichever ones came first in the schema's field
+        # order, not the ones that were right. Fail the whole group on the reply
+        # rather than let the parser read values off salvage.
+        incomplete = pass2_incomplete_reason(p2_text, fu)
+        if incomplete is not None:
+            code, detail = incomplete
+            for question in group:
+                _save_extraction_error(
+                    question, detail, code=code, label="EXTRACTION FAILURE",
+                )
+            if fail_fast and first_extraction_error is None:
+                first_extraction_error = ExtractionError({q.key: detail for q in group})
+            continue
+
         try:
-            parsed = parse_structured_output(p2_text, [q.key for q in group], annotate_mode=True)
+            parsed = parse_structured_output(
+                p2_text, [q.key for q in group], annotate_mode=True, require_status=True,
+            )
             # Deterministic scope enforcement — authoritative over the model (see
             # annotate/scope.py). enabled=False (early_exit_on_ic_exclusion off)
             # short-circuits to excl_idx=None every time, so no cell can ever come
@@ -204,6 +271,21 @@ def _parse_save_post_tail(
                         first_extraction_error = ExtractionError({question.key: cited_error})
                     continue
 
+                item_error = result.get("item_error")
+                if item_error:
+                    # The reply stopped partway through this item, and the fields
+                    # it never reached fell back to their defaults — including
+                    # status="ok". The reply gate above catches this whenever the
+                    # reply itself shows the damage; this catches the case where
+                    # it does not (see annotate.parse._incomplete_item_violation).
+                    _save_extraction_error(
+                        question, item_error, code="pass2_incomplete_item",
+                        label="EXTRACTION FAILURE",
+                    )
+                    if fail_fast and first_extraction_error is None:
+                        first_extraction_error = ExtractionError({question.key: item_error})
+                    continue
+
                 verify = verify_citation(
                     result.get("cited_text", ""),
                     source_texts.get(paper.paper_id, ""),
@@ -252,19 +334,19 @@ def _parse_save_post_tail(
                     cited_text_verified=cited_text_verified,
                     citations=citations,
                     raw_response=raw_response,
-                    latency_ms=(p1_latency + p2_latency) if i == 0 else 0,
-                    tokens_total=tok_input + tok_output + tok_cached if i == 0 else 0,
-                    tokens_input=tok_input if i == 0 else 0,
-                    tokens_output=tok_output if i == 0 else 0,
-                    tokens_cached=tok_cached if i == 0 else 0,
-                    tokens_reasoning=tok_reasoning if i == 0 else 0,
+                    latency_ms=(p1_latency + p2_latency) if i == 0 else None,
+                    tokens_total=tok_input + tok_output + tok_cached if i == 0 else None,
+                    tokens_input=tok_input if i == 0 else None,
+                    tokens_output=tok_output if i == 0 else None,
+                    tokens_cached=tok_cached if i == 0 else None,
+                    tokens_reasoning=tok_reasoning if i == 0 else None,
                     reasoning_content=p1_reasoning_content if i == 0 else None,
                     cost=p1_cost if i == 0 else None,
                     cost_currency="USD",
-                    fmt_tokens_total=fmt_total if i == 0 else 0,
-                    fmt_tokens_input=fmt_input if i == 0 else 0,
-                    fmt_tokens_output=fmt_output if i == 0 else 0,
-                    fmt_tokens_cached=fmt_cached if i == 0 else 0,
+                    fmt_tokens_total=fmt_total if i == 0 else None,
+                    fmt_tokens_input=fmt_input if i == 0 else None,
+                    fmt_tokens_output=fmt_output if i == 0 else None,
+                    fmt_tokens_cached=fmt_cached if i == 0 else None,
                     fmt_cost=fmt_cost if i == 0 else None,
                     confidence=result.get("confidence"),
                     **status_kwargs,
@@ -393,24 +475,30 @@ async def _run_rounds_with_early_exit(
         if p1_error:
             logger.error("P1 aborted (round %d) — %s", round_idx, p1_error)
             run_had_fatal_error = True
-            break  # mirrors the non-round path: a fatal P1 error aborts the run
+            # No `break` yet: the abort still has to be recorded on the cells it
+            # cost, or this round's papers end up with no answer and no error —
+            # indistinguishable from never having been in scope. The drop loop
+            # below writes them all (a fatal P1 returns no texts, so every cell
+            # in `round_pending` is a drop), and the break follows it.
 
         for cid, (paper, grp, group_idx) in round_pending.items():
             if cid in p1_texts:
                 continue
-            cell_error_detail = p1_errors.get(
-                cid, "pass1 failed — no output (API error/timeout); see log"
-            )
+            cell_error_detail, cell_raw = _p1_drop_reason(cid, p1_errors, p1_usage, p1_error)
             for q in grp:
                 p1_drop_payload = build_error_answer(
                     run_id=run.run_id, paper_id=paper.paper_id, question=q,
                     extraction_detail=cell_error_detail,
+                    raw_response=cell_raw,
                 )
                 store.save_answer(run.run_id, paper.paper_id, q.version_id, p1_drop_payload)
                 if on_payload_saved is not None:
                     on_payload_saved(p1_drop_payload)
-                if cid in p1_errors:
+                if cid in p1_errors or p1_error:
                     store.mark_failed(run.run_id, paper.paper_id, q.version_id, cell_error_detail)
+
+        if p1_error:
+            break  # mirrors the non-round path: a fatal P1 error aborts the run
 
         round_pending_p1 = {cid: t for cid, t in p1_texts.items() if cid in round_pending}
         p2_texts, p2_usage, p2_errors = await _execute_pass2(
@@ -429,6 +517,19 @@ async def _run_rounds_with_early_exit(
                 p2_drop_payload = build_error_answer(
                     run_id=run.run_id, paper_id=paper.paper_id, question=q,
                     extraction_detail=err_detail,
+                    # Same shape as the non-round path's P2-drop payload: without
+                    # the explicit code, a consumer has to guess the failing pass
+                    # from the wording of `err_detail`.
+                    raw_response={
+                        "pass1_text": p1_texts.get(cid, ""),
+                        "p1_usage": p1_usage.get(cid, {}),
+                        "p2_usage": p2_usage.get(cid, {}),
+                        "batch_group_id": cid,
+                        "diagnostics": [{
+                            "phase": "pass2", "code": "pass2_provider_error",
+                            "detail": err_detail,
+                        }],
+                    },
                 )
                 store.save_answer(run.run_id, paper.paper_id, q.version_id, p2_drop_payload)
                 if on_payload_saved is not None:
@@ -752,26 +853,29 @@ async def run_pipeline(
                     for cid, (paper, group, group_idx) in pending_cells.items():
                         if cid in p1_texts:
                             continue
-                        # Prefer the real per-item error (batch item errored/canceled/
-                        # expired, or an online call exception) when we have one;
-                        # fall back to the generic message for cids that vanished for
-                        # some other reason (e.g. loaded from a stale p1 dump).
-                        cell_error_detail = p1_errors.get(
-                            cid, "pass1 failed — no output (API error/timeout); see log"
+                        # See _p1_drop_reason for which of the three possible
+                        # reasons this cell gets, and why its Pass-1 usage rides
+                        # along without any Pass-1 text.
+                        cell_error_detail, cell_raw = _p1_drop_reason(
+                            cid, p1_errors, p1_usage, p1_error,
                         )
                         for q in group:
                             p1_drop_payload = build_error_answer(
                                 run_id=run.run_id, paper_id=paper.paper_id, question=q,
                                 extraction_detail=cell_error_detail,
+                                raw_response=cell_raw,
                             )
                             store.save_answer(run.run_id, paper.paper_id, q.version_id, p1_drop_payload)
                             _count_payload(p1_drop_payload)
-                            if cid in p1_errors:
+                            if cid in p1_errors or p1_error:
                                 # Flip the store's local status away from 'done' (what
                                 # save_answer always sets) to 'failed' so should_skip_cell
                                 # treats this as retryable on the next run, instead of
                                 # permanently poisoning it the way a deterministic parse
                                 # error is (those legitimately stay 'done').
+                                # The error answer saved just above is still posted by
+                                # the per-paper loop below: what gets posted is decided
+                                # by store.posted_at, not by this status.
                                 store.mark_failed(run.run_id, paper.paper_id, q.version_id, cell_error_detail)
 
                     # Phase 2
@@ -920,6 +1024,12 @@ async def run_pipeline(
     if first_error:
         raise first_error[0]
     if any_run_failed:
+        # Carry the reasons in the exception, not only in the console/log. The
+        # caller may be a worker with no terminal attached (SEER's llm_runner),
+        # and this message is what it stores on the job row — "see errors above"
+        # points at output that reader never had.
+        if all_run_errors:
+            raise RuntimeError("One or more runs failed: " + " | ".join(all_run_errors))
         raise RuntimeError("One or more runs failed — see errors above.")
 
 
@@ -1053,11 +1163,11 @@ async def pass1_pipeline(
                     cited_text="",
                     cited_text_verified=None,
                     raw_response=raw_response,
-                    latency_ms=p1_latency if i == 0 else 0,
-                    tokens_total=tok_input + tok_output + tok_cached if i == 0 else 0,
-                    tokens_input=tok_input if i == 0 else 0,
-                    tokens_output=tok_output if i == 0 else 0,
-                    tokens_cached=tok_cached if i == 0 else 0,
+                    latency_ms=p1_latency if i == 0 else None,
+                    tokens_total=tok_input + tok_output + tok_cached if i == 0 else None,
+                    tokens_input=tok_input if i == 0 else None,
+                    tokens_output=tok_output if i == 0 else None,
+                    tokens_cached=tok_cached if i == 0 else None,
                     cost=p1_cost if i == 0 else None,
                     cost_currency="USD",
                 )
@@ -1066,6 +1176,96 @@ async def pass1_pipeline(
 
     logger.info("Pass-1 complete: %d cells saved, %d failed", n_saved, n_failed)
     return n_saved, n_failed
+
+
+def _pass1_cells_from_store(
+    store: Store, run_id: int, paper_id: int,
+    question_map: dict, question_order: dict,
+) -> list[dict]:
+    """The store's ``pass1_done`` rows for one (run, paper), as Pass-1 cells.
+
+    Only `pass1_pipeline` ever writes those rows. A host application that keeps
+    its own Pass-1 record has none here to read, which is why `pass2_pipeline`
+    also accepts cells of this shape straight from the caller (``pass1_cells=``).
+
+    One cell per question group: ``group_id``, the ``version_ids`` it covers in
+    pipeline order, the Pass-1 text, and the Pass-1 usage/cost figures. Those
+    last two live only on the group's first row (the ``i == 0`` one); the rest of
+    the group repeats neither.
+    """
+    rows = store.get_pass1_rows(run_id, paper_id)
+    if not rows:
+        return []
+
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        raw_resp = json.loads(row["payload"]["raw_response"])
+        group_id = raw_resp.get("batch_group_id") or f"solo_{row['version_id']}"
+        groups.setdefault(group_id, []).append(row)
+
+    cells: list[dict] = []
+    for group_id, group_rows in groups.items():
+        questions_in_group = sorted(
+            [question_map[r["version_id"]] for r in group_rows if r["version_id"] in question_map],
+            key=lambda q: question_order.get(q.version_id, 0),
+        )
+        if not questions_in_group:
+            continue
+        q_to_row = {r["version_id"]: r for r in group_rows}
+        ordered_rows = [q_to_row[q.version_id] for q in questions_in_group if q.version_id in q_to_row]
+        if not ordered_rows:
+            continue
+        raw0 = json.loads(ordered_rows[0]["payload"]["raw_response"])
+        cells.append({
+            "group_id": group_id,
+            "version_ids": [q.version_id for q in questions_in_group],
+            "pass1_text": raw0.get("pass1_text") or "",
+            "p1_usage": raw0.get("p1_usage") or {},
+            "p1_payload": ordered_rows[0]["payload"],
+        })
+    return cells
+
+
+def _resolve_pass1_cells(
+    cells: list[dict], paper, question_map: dict, question_order: dict,
+) -> tuple[dict, dict, dict, dict, int]:
+    """Pass-1 cells -> the four per-group maps Pass 2 runs from.
+
+    Returns ``(pending_cells, pending_p1, p1_usage_by_cid, p1_payload_by_cid,
+    n_dropped)``. A cell whose Pass-1 text is missing or empty is dropped and
+    counted rather than sent: Pass 2 would have nothing to reformat, and asking
+    it anyway is an invitation to invent an answer.
+    """
+    pending_cells: dict[str, tuple] = {}
+    pending_p1: dict[str, str] = {}
+    p1_usage_by_cid: dict[str, dict] = {}
+    p1_payload_by_cid: dict[str, dict] = {}
+    n_dropped = 0
+
+    for cell in cells:
+        group_id = cell["group_id"]
+        questions_in_group = sorted(
+            [question_map[v] for v in (cell.get("version_ids") or []) if v in question_map],
+            key=lambda q: question_order.get(q.version_id, 0),
+        )
+        if not questions_in_group:
+            continue
+
+        pass1_text = cell.get("pass1_text")
+        if not pass1_text:
+            logger.warning(
+                "No pass1_text for paper %d group %s - skipping %d question(s)",
+                paper.paper_id, group_id, len(questions_in_group),
+            )
+            n_dropped += len(questions_in_group)
+            continue
+
+        pending_cells[group_id] = (paper, questions_in_group, 0)
+        pending_p1[group_id] = pass1_text
+        p1_usage_by_cid[group_id] = cell.get("p1_usage") or {}
+        p1_payload_by_cid[group_id] = cell.get("p1_payload") or {}
+
+    return pending_cells, pending_p1, p1_usage_by_cid, p1_payload_by_cid, n_dropped
 
 
 async def pass2_pipeline(
@@ -1080,8 +1280,29 @@ async def pass2_pipeline(
     concurrency: int | None = None,
     rpm: float | None = None,
     post: bool = True,
+    store: Store | None = None,
+    client: SeerClient | None = None,
+    pass1_cells: "dict[tuple[int, int], list[dict]] | None" = None,
 ) -> tuple[int, int]:
-    """Run only Pass-2 on pass1_done cells, producing done answers.
+    """Run only Pass-2 over already-written Pass-1 text, producing done answers.
+
+    Where the Pass-1 text comes from is the caller's choice:
+
+    - ``pass1_cells=None`` (default) reads the local store's ``pass1_done`` rows,
+      which only a standalone `pass1_pipeline` invocation ever writes. After a
+      normal end-to-end `run_pipeline` there are none, and this returns (0, 0).
+    - ``pass1_cells={(run_id, paper_id): [cell, ...]}`` uses what the caller
+      passes in - see `_pass1_cells_from_store` for the cell shape. This is how a
+      host application that keeps its own Pass-1 record retries a failed Pass 2
+      without paying for Pass 1 again.
+
+    ``store`` and ``client`` are injectable for the same reason they are on
+    `run_pipeline`: an in-process host writes answers through its own client
+    rather than over HTTP.
+
+    ``format_model`` / ``format_model_provider`` override the Pass-2 target for
+    every run. Retrying a bad endpoint against itself mostly fails, so being able
+    to send the retry somewhere else is the point of the override.
 
     Returns (n_done, n_failed).
     """
@@ -1097,8 +1318,8 @@ async def pass2_pipeline(
     _litellm.drop_params = pipeline_cfg.drop_params
     _litellm.suppress_debug_info = True
 
-    store = Store(settings.runtime.store_path)
-    client = (
+    store = store or Store(settings.runtime.store_path)
+    client = client or (
         DryRunSeerClient(pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions)
         if dry_run
         else SeerClient(pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions)
@@ -1127,60 +1348,37 @@ async def pass2_pipeline(
             cfg.format_model_provider = format_model_provider
 
         for paper in papers:
-            rows = store.get_pass1_rows(run.run_id, paper.paper_id)
-            if not rows:
+            if pass1_cells is None:
+                cells = _pass1_cells_from_store(
+                    store, run.run_id, paper.paper_id, question_map, question_order,
+                )
+            else:
+                cells = pass1_cells.get((run.run_id, paper.paper_id)) or []
+            if not cells:
                 continue
 
-            # Resolve source text for citation verification
+            # Resolve source text for citation verification. A caller-supplied
+            # store holds no OCR — only a Pass-1 run through this pipeline puts it
+            # there — so fetch it the way run_pipeline does. Verifying quotes
+            # against an empty string does not fail loudly; it silently reports
+            # every citation in the paper as unverified.
             if cfg.text_source == "full_text":
-                source_text = store.get_ocr(paper.paper_id) or ""
+                source_text = store.get_ocr(paper.paper_id)
+                if source_text is None:
+                    source_text = await client.fetch_ocr_markdown(paper.paper_id)
+                    store.save_ocr(paper.paper_id, source_text)
+                source_text = source_text or ""
             else:
                 source_text = paper.abstract
 
-            # Group rows by batch_group_id (same approach as reformat_pipeline)
-            groups: dict[str, list[dict]] = {}
-            for row in rows:
-                raw_resp = json.loads(row["payload"]["raw_response"])
-                group_id = raw_resp.get("batch_group_id") or f"solo_{row['version_id']}"
-                groups.setdefault(group_id, []).append(row)
-
-            # Reconstruct pending_cells and pending_p1 from stored rows
-            pending_cells: dict[str, tuple] = {}
-            pending_p1: dict[str, str] = {}
-            p1_usage_by_cid: dict[str, dict] = {}
-            p1_payload_by_cid: dict[str, dict] = {}  # the row payload with i==0 (has p1 tokens)
-
-            for group_id, group_rows in groups.items():
-                # Sort questions by pipeline order
-                questions_in_group = sorted(
-                    [question_map[r["version_id"]] for r in group_rows if r["version_id"] in question_map],
-                    key=lambda q: question_order.get(q.version_id, 0),
-                )
-                if not questions_in_group:
-                    continue
-
-                # Find pass1_text — stored in the row with i==0 (the one with tokens)
-                # Sort rows by question order and take the first one's raw_response for pass1_text
-                q_to_row = {r["version_id"]: r for r in group_rows}
-                ordered_rows = [q_to_row[q.version_id] for q in questions_in_group if q.version_id in q_to_row]
-                if not ordered_rows:
-                    continue
-
-                raw0 = json.loads(ordered_rows[0]["payload"]["raw_response"])
-                pass1_text = raw0.get("pass1_text")
-                if not pass1_text:
-                    logger.warning(
-                        "No pass1_text in raw_response for run=%d paper=%d group=%s — skipping",
-                        run.run_id, paper.paper_id, group_id,
-                    )
-                    n_failed += len(questions_in_group)
-                    continue
-
-                pending_cells[group_id] = (paper, questions_in_group, 0)
-                pending_p1[group_id] = pass1_text
-                p1_usage_by_cid[group_id] = raw0.get("p1_usage", {})
-                # Store the first row's payload for p1 token/cost carry-over
-                p1_payload_by_cid[group_id] = ordered_rows[0]["payload"]
+            (
+                pending_cells,
+                pending_p1,
+                p1_usage_by_cid,
+                p1_payload_by_cid,
+                n_no_pass1,
+            ) = _resolve_pass1_cells(cells, paper, question_map, question_order)
+            n_failed += n_no_pass1
 
             if not pending_p1:
                 continue
@@ -1208,10 +1406,10 @@ async def pass2_pipeline(
                 u = p1_usage_by_cid.get(cid, {})
 
                 # p1 token/cost figures from stored payload (row 0)
-                p1_tok_input  = p1_payload_row0.get("tokens_input", 0) or 0
-                p1_tok_output = p1_payload_row0.get("tokens_output", 0) or 0
-                p1_tok_cached = p1_payload_row0.get("tokens_cached", 0) or 0
-                p1_tok_total  = p1_payload_row0.get("tokens_total", 0) or 0
+                p1_tok_input  = p1_payload_row0.get("tokens_input")
+                p1_tok_output = p1_payload_row0.get("tokens_output")
+                p1_tok_cached = p1_payload_row0.get("tokens_cached")
+                p1_tok_total  = p1_payload_row0.get("tokens_total")
                 p1_cost_str   = p1_payload_row0.get("cost")
                 p1_cost       = Decimal(p1_cost_str) if p1_cost_str else None
                 p1_latency    = p1_payload_row0.get("latency_ms", 0) or 0
@@ -1225,7 +1423,43 @@ async def pass2_pipeline(
                 fmt_cost   = fu.get("cost")
                 p2_latency = fu.get("latency_ms", 0) or 0
 
-                parsed = parse_structured_output(p2_text, [q.key for q in group], annotate_mode=True)
+                # Same reply-completeness gate as the run_pipeline tail above.
+                # It matters at least as much here: this is the path a Pass-2
+                # retry takes, and a retry sent back to an endpoint that is
+                # still looping would otherwise overwrite the failed cell with a
+                # fresh answer read off a fresh loop.
+                incomplete = pass2_incomplete_reason(p2_text, fu)
+                if incomplete is not None:
+                    code, detail = incomplete
+                    logger.error(
+                        "EXTRACTION FAILURE (pass2) — run %d, paper %d, group %s: %s",
+                        run.run_id, paper_cell.paper_id, cid, detail,
+                    )
+                    for question in group:
+                        store.save_answer(
+                            run.run_id, paper_cell.paper_id, question.version_id,
+                            build_error_answer(
+                                run_id=run.run_id, paper_id=paper_cell.paper_id,
+                                question=question, extraction_detail=detail,
+                                raw_response={
+                                    "pass1_text": pending_p1.get(cid, ""),
+                                    "pass2_text": p2_text,
+                                    "p1_usage": u,
+                                    "p2_usage": fu,
+                                    "diagnostics": [
+                                        {"phase": "pass2", "code": code, "detail": detail}
+                                    ],
+                                    "batch_group_id": cid,
+                                },
+                            ),
+                            cid,
+                        )
+                        n_failed += 1
+                    continue
+
+                parsed = parse_structured_output(
+                    p2_text, [q.key for q in group], annotate_mode=True, require_status=True,
+                )
                 parsed, _excl_idx = apply_scope_and_status(
                     group, parsed, enabled=cfg.early_exit_on_ic_exclusion,
                     # .get(cid) -> None when absent, NOT "": an empty string would
@@ -1267,20 +1501,22 @@ async def pass2_pipeline(
                         n_failed += 1
                         continue
 
-                    cited_error = result.get("cited_text_error")
-                    if cited_error:
-                        # The item's JSON did not survive parsing intact, so its
-                        # value/comment/confidence are not what the model wrote
-                        # (see annotate.parse.cited_text_violation).
+                    # Either way the item is not what the model wrote: the first
+                    # is damage that landed inside cited_text, the second is an
+                    # item the reply stopped partway through (see
+                    # annotate.parse.cited_text_violation and
+                    # _incomplete_item_violation).
+                    item_error = result.get("cited_text_error") or result.get("item_error")
+                    if item_error:
                         logger.error(
                             "EXTRACTION FAILURE (pass2) — run %d, paper %d, group %s, key %r: %s",
-                            run.run_id, paper_cell.paper_id, cid, question.key, cited_error,
+                            run.run_id, paper_cell.paper_id, cid, question.key, item_error,
                         )
                         store.save_answer(
                             run.run_id, paper_cell.paper_id, question.version_id,
                             build_error_answer(
                                 run_id=run.run_id, paper_id=paper_cell.paper_id,
-                                question=question, extraction_detail=cited_error,
+                                question=question, extraction_detail=item_error,
                             ),
                             cid,
                         )
@@ -1334,19 +1570,19 @@ async def pass2_pipeline(
                         cited_text_verified=cited_text_verified,
                         citations=citations,
                         raw_response=raw_response,
-                        latency_ms=(p1_latency + p2_latency) if i == 0 else 0,
+                        latency_ms=(p1_latency + p2_latency) if i == 0 else None,
                         # Carry p1 token/cost from stored pass1 payload (i==0 only)
-                        tokens_total=p1_tok_total if i == 0 else 0,
-                        tokens_input=p1_tok_input if i == 0 else 0,
-                        tokens_output=p1_tok_output if i == 0 else 0,
-                        tokens_cached=p1_tok_cached if i == 0 else 0,
+                        tokens_total=p1_tok_total if i == 0 else None,
+                        tokens_input=p1_tok_input if i == 0 else None,
+                        tokens_output=p1_tok_output if i == 0 else None,
+                        tokens_cached=p1_tok_cached if i == 0 else None,
                         cost=p1_cost if i == 0 else None,
                         cost_currency="USD",
                         # p2 (format) figures from this stage (i==0 only)
-                        fmt_tokens_total=fmt_total if i == 0 else 0,
-                        fmt_tokens_input=fmt_input if i == 0 else 0,
-                        fmt_tokens_output=fmt_output if i == 0 else 0,
-                        fmt_tokens_cached=fmt_cached if i == 0 else 0,
+                        fmt_tokens_total=fmt_total if i == 0 else None,
+                        fmt_tokens_input=fmt_input if i == 0 else None,
+                        fmt_tokens_output=fmt_output if i == 0 else None,
+                        fmt_tokens_cached=fmt_cached if i == 0 else None,
                         fmt_cost=fmt_cost if i == 0 else None,
                         confidence=result.get("confidence"),
                         **status_kwargs,
@@ -1572,11 +1808,11 @@ async def reformat_pipeline(
                             cited_text_verified=result["cited_text_verified"],
                             citations=result["citations"],
                             raw_response=new_raw,
-                            latency_ms=old_payload.get("latency_ms", 0),
-                            tokens_total=old_payload.get("tokens_total", 0),
-                            tokens_input=old_payload.get("tokens_input", 0),
-                            tokens_output=old_payload.get("tokens_output", 0),
-                            tokens_cached=old_payload.get("tokens_cached", 0),
+                            latency_ms=old_payload.get("latency_ms"),
+                            tokens_total=old_payload.get("tokens_total"),
+                            tokens_input=old_payload.get("tokens_input"),
+                            tokens_output=old_payload.get("tokens_output"),
+                            tokens_cached=old_payload.get("tokens_cached"),
                             cost=Decimal(old_payload["cost"]) if old_payload.get("cost") else None,
                             cost_currency=old_payload.get("cost_currency", "USD"),
                             fmt_tokens_total=result["fmt_tokens_total"],

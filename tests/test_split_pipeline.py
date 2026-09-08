@@ -442,3 +442,74 @@ async def test_regression_equivalence(pipeline_reg, settings_reg):
         assert "paper" in p, f"Posted payload missing 'paper': {list(p.keys())}"
         assert "question_key" in p, f"Posted payload missing 'question_key': {list(p.keys())}"
         assert "extraction_status" in p, f"Posted payload missing 'extraction_status': {list(p.keys())}"
+
+
+# ---------------------------------------------------------------------------
+# Pass-1 text supplied by the caller
+#
+# The store path only ever finds rows a standalone pass1_pipeline wrote. A host
+# application that keeps its own Pass-1 record hands the same cells in directly,
+# which is what lets it retry a failed Pass 2 without paying for Pass 1 again.
+# ---------------------------------------------------------------------------
+
+def _cells_from_store(store) -> dict:
+    """Every stored cell, grouped the way `pass1_cells` expects."""
+    grouped: dict = {}
+    for row in store.all_answers():
+        payload = json.loads(row["payload_json"])
+        raw = json.loads(payload["raw_response"])
+        key = (row["run_id"], row["paper_id"])
+        group_id = raw.get("batch_group_id") or f"solo_{row['version_id']}"
+        cell = grouped.setdefault(key, {}).setdefault(group_id, {
+            "group_id": group_id,
+            "version_ids": [],
+            "pass1_text": raw["pass1_text"],
+            "p1_usage": raw.get("p1_usage") or {},
+            "p1_payload": payload,
+        })
+        cell["version_ids"].append(row["version_id"])
+    return {key: list(groups.values()) for key, groups in grouped.items()}
+
+
+@pytest.mark.asyncio
+async def test_pass2_from_caller_supplied_pass1(pipeline, settings, tmp_path):
+    """pass1_cells= produces the same answers against a store holding nothing."""
+
+    # Real Pass-1 text, produced the same way the store path produces it.
+    n_saved, _ = await pass1_pipeline(pipeline, settings, dry_run=True)
+    assert n_saved == 4
+    pass1_cells = _cells_from_store(Store(settings.runtime.store_path))
+    assert sum(len(v) for v in pass1_cells.values()) == 4
+
+    empty = Settings()
+    empty.runtime.store_path = str(tmp_path / "empty.db")
+
+    # Control: the store path finds nothing here, which is the whole problem.
+    assert await pass2_pipeline(pipeline, empty, dry_run=True, post=False) == (0, 0)
+
+    n_done, n_failed = await pass2_pipeline(
+        pipeline, empty, dry_run=True, post=False, pass1_cells=pass1_cells,
+    )
+    assert n_failed == 0
+    assert n_done == 4
+
+    rows = Store(str(tmp_path / "empty.db")).all_answers()
+    assert len(rows) == 4
+    for row in rows:
+        assert row["status"] == "done"
+        raw = json.loads(json.loads(row["payload_json"])["raw_response"])
+        assert raw["pass1_text"], "the supplied Pass-1 text must survive into the answer"
+
+
+@pytest.mark.asyncio
+async def test_pass2_caller_cell_without_pass1_text_is_dropped(pipeline, settings):
+    """A cell with no Pass-1 text is counted as failed, never sent to the model.
+
+    Pass 2 would have nothing to reformat, and asking it anyway invites it to
+    invent an answer.
+    """
+    cells = {(10, 42): [{"group_id": "g1", "version_ids": [14, 15], "pass1_text": ""}]}
+    n_done, n_failed = await pass2_pipeline(
+        pipeline, settings, dry_run=True, post=False, pass1_cells=cells,
+    )
+    assert (n_done, n_failed) == (0, 2)

@@ -63,8 +63,68 @@ def _format_llm_error(exc: BaseException) -> str:
 
     return " | ".join(parts)
 
-_DEFAULT_MAX_TOKENS_P1 = 4096
-_DEFAULT_MAX_TOKENS_P2 = 1024
+# Fallbacks for a caller that sets no `max_tokens` in `model_params` /
+# `format_model_params`. Only the batch path has ever needed them: the online
+# path passes `model_params` straight to litellm and sends no ceiling at all, so
+# a run that set nothing got the provider's own (large) default there and these
+# numbers here — the same run, two very different budgets.
+#
+# They were 4096 and 1024, which predate thinking models and are not a real
+# budget on one. Anthropic omits thinking text from the response but still
+# charges it against `max_tokens`: measured over one review's runs, Sonnet 5
+# returned a median 52% of its billed output tokens as visible text. A batched
+# Pass 1 therefore had ~2000 usable tokens for four answers with quotes, ran out
+# mid-sentence, and — because nothing looked at `stop_reason` — the missing last
+# answer surfaced as a Pass-2 "key not found" error, pointing at the wrong pass.
+#
+# Truncation is now detected (see TRUNCATED_FINISH_REASONS) and these are large
+# enough that it should not happen. Callers that care should still send an
+# explicit `max_tokens`; SEER does, on both paths, from one run-config field.
+_DEFAULT_MAX_TOKENS_P1 = 32000
+_DEFAULT_MAX_TOKENS_P2 = 8000
+
+# Defined in `reply_quality`, which is also where the Pass-2 equivalent of
+# `_demote_truncated_p1` lives. Re-exported here because `orchestrator` and
+# every other in-tree caller has always imported it from this module.
+from .reply_quality import TRUNCATED_FINISH_REASONS  # noqa: E402
+
+
+def _demote_truncated_p1(
+    p1_texts: dict[str, str],
+    p1_usage: dict[str, dict],
+    p1_errors: dict[str, str],
+) -> None:
+    """Move every truncated Pass-1 cell out of ``p1_texts`` and into
+    ``p1_errors``, in place.
+
+    A truncated Pass 1 is not a usable answer: the model was mid-sentence, so the
+    last question in the group has no answer block at all. Passing it to Pass 2
+    produces a confident, correct-looking report that the answer was absent, and
+    an error naming the wrong pass. Failing the cell here instead says what
+    actually happened, and leaves it retryable like any other failed cell —
+    callers already treat a cid missing from ``p1_texts`` that way.
+
+    Idempotent: a cell demoted once is gone from ``p1_texts``, so calling this
+    again does nothing. That matters because the batch path calls it before
+    writing its resume dump (so a resumed run cannot reload a truncated answer as
+    a good one, having lost the usage that would flag it) and again on the way
+    out, alongside the online path.
+    """
+    for cid in list(p1_texts):
+        reason = (p1_usage.get(cid) or {}).get("finish_reason")
+        if reason not in TRUNCATED_FINISH_REASONS:
+            continue
+        n_chars = len(p1_texts.pop(cid))
+        detail = (
+            f"pass1 truncated — the model ran out of output budget after {n_chars} "
+            f"characters (finish_reason={reason!r}), so its answer is cut off "
+            "mid-sentence and the last question in the group has no answer block. "
+            "Raise the run's Pass 1 max output tokens and re-run. On a thinking "
+            "model the budget covers the thinking too, even where that text is not "
+            "returned."
+        )
+        p1_errors[cid] = detail
+        logger.warning("P1 truncated (cid=%s): %s", cid, detail)
 
 
 class BatchPendingError(Exception):
@@ -98,38 +158,171 @@ class BatchPendingError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# "Could not reach the provider" vs. "the work failed"
+# ---------------------------------------------------------------------------
+#
+# A status check that never got an answer tells us nothing about the batch. It
+# used to end the whole job anyway: one 5-second TLS handshake timeout on poll
+# 78 of a 340-request Anthropic batch killed a run whose results landed 53
+# minutes later and were never collected. Nothing re-polls a job the driver has
+# already marked failed, so the work was paid for and lost.
+#
+# So transport-shaped failures on the two *read* calls (poll, collect) are
+# re-raised as BatchPendingError — "don't know yet, ask again later" — which the
+# driver already knows how to park and resume. Submission is deliberately not
+# covered: a POST that creates a billable batch must fail loudly rather than be
+# retried into a second charge.
+
+# Timeouts and retry budget for the batch clients (see each provider's __init__).
+_CONNECT_TIMEOUT_SECONDS = 15.0
+_READ_TIMEOUT_SECONDS = 120.0
+_READ_MAX_RETRIES = 8
+
+_TRANSIENT_STATUS_CODES = frozenset({408, 409, 425, 429})
+
+_TRANSIENT_EXC_NAMES = frozenset({
+    # Anthropic and OpenAI SDKs (both Stainless-generated, same class names)
+    "APIConnectionError", "APITimeoutError", "InternalServerError", "RateLimitError",
+    # httpx transport layer underneath both
+    "TransportError", "NetworkError", "ConnectError", "ConnectTimeout", "ReadError",
+    "ReadTimeout", "WriteError", "WriteTimeout", "PoolTimeout", "ProxyError",
+    "ProtocolError", "RemoteProtocolError",
+    # stdlib / ssl / litellm
+    "TimeoutError", "ConnectionError", "ConnectionResetError", "SSLError",
+    "IncompleteRead", "Timeout",
+})
+
+
+def _is_transient_transport_error(exc: BaseException) -> bool:
+    """True when ``exc`` means the provider was unreachable, not that it refused.
+
+    Walks the ``__cause__``/``__context__`` chain, because SDKs wrap the real
+    socket error. A frame counts as transient if it carries a retryable HTTP
+    status (429, 408/409/425, any 5xx) or if any class in its MRO is a known
+    connection/timeout type. A definite HTTP answer — 401 bad key, 404 no such
+    batch — is not transient and must still fail the job: retrying it forever
+    would hide a real misconfiguration behind a job that never finishes.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        status = getattr(cur, "status_code", None)
+        if isinstance(status, int) and (status in _TRANSIENT_STATUS_CODES or status >= 500):
+            return True
+        if any(k.__name__ in _TRANSIENT_EXC_NAMES for k in type(cur).__mro__):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Batch cost calculation
 # ---------------------------------------------------------------------------
 #
 # Batch collectors only ever get token counts back from the provider — the
 # Anthropic/OpenAI batch APIs don't return a dollar cost the way a sync
 # completion response's usage block can be fed straight into
-# litellm.completion_cost() (see llm.py). This mirrors that sync-path
-# calculation but works from a plain {model, usage} dict instead of a real
-# response object, and forces litellm's batch-discounted pricing branch via
-# call_type="retrieve_batch" (batch APIs are typically ~50% off standard
-# per-token pricing).
+# litellm.completion_cost() (see llm.py). So the price is applied here, one
+# rate per token class, from litellm's model table.
+#
+# What is NOT done: handing completion_cost() a synthetic
+# {model, usage} dict with call_type="retrieve_batch". That path is wrong for
+# both providers, in ways that only show up once prompt caching is on:
+#
+#   * Its Anthropic branch computes billable input as
+#     prompt_tokens - cache_read_tokens, because litellm's own Anthropic
+#     response transform folds both cache classes INTO prompt_tokens. The raw
+#     usage block Anthropic returns does the opposite — input_tokens is the
+#     uncached part alone — so on a cache hit that subtraction goes negative
+#     and the item is priced as a refund. Measured on claude-sonnet-5 with
+#     89,427 uncached and 899,923 cache-read tokens: -$0.512 instead of $0.388.
+#   * Neither of its branches charges cache writes at the cache-write rate.
+#   * The branch it takes for a model that publishes input_cost_per_token_batches
+#     (e.g. gpt-5.5) gives cache reads no discount at all — they are billed at
+#     the full batch input rate, ~10x their real price.
+#
+# The two providers also disagree on what an "input token" is, and each
+# collector above stores its provider's own number under "input_tokens", so the
+# uncached count has to be derived per provider.
+
+_BATCH_DISCOUNT = Decimal("0.5")  # batch APIs are 50% off standard per-token pricing
+
 
 def _batch_item_cost(provider: str, model: str, usage: dict) -> Decimal | None:
-    """Compute one collected batch item's cost from its token counts, or None."""
+    """Compute one collected batch item's cost from its token counts, or None.
+
+    None means "no usable pricing for this model" — the caller leaves the cost
+    unset rather than recording a misleading $0.
+    """
     import litellm
 
-    litellm_usage = {
-        "prompt_tokens": usage.get("input_tokens", 0),
-        "completion_tokens": usage.get("output_tokens", 0),
-        "cache_creation_input_tokens": usage.get("cache_write_tokens", 0),
-        "cache_read_input_tokens": usage.get("cache_read_tokens", 0),
-    }
+    p = provider.lower()
     try:
-        cost_float = litellm.completion_cost(
-            completion_response={"model": f"{provider}/{model}", "usage": litellm_usage},
-            call_type="retrieve_batch",
-        )
+        info = litellm.get_model_info(model=model, custom_llm_provider=p)
     except Exception:
+        info = None
+    if not info:
+        logger.warning(
+            "No pricing entry for %s/%s — batch item cost left unset", provider, model
+        )
         return None
-    if cost_float is None:
+
+    def rate(*keys: str) -> Decimal | None:
+        """First non-null, non-zero rate among ``keys``, as a Decimal."""
+        for key in keys:
+            value = info.get(key)
+            if value:
+                return Decimal(str(value))
         return None
-    return Decimal(str(cost_float))
+
+    def batch_rate(batch_key: str, *standard_keys: str) -> Decimal:
+        """Published batch rate if the table has one, else the standard rate halved."""
+        published = rate(batch_key)
+        if published is not None:
+            return published  # already discounted
+        return (rate(*standard_keys) or Decimal(0)) * _BATCH_DISCOUNT
+
+    input_rate = batch_rate("input_cost_per_token_batches", "input_cost_per_token")
+    output_rate = batch_rate("output_cost_per_token_batches", "output_cost_per_token")
+    # litellm's schema has no *_batches entry for either cache class, so these are
+    # always the halved standard rate. A provider that prices neither class bills
+    # those tokens as ordinary input, which is what the input_cost_per_token
+    # fallback expresses.
+    cache_write_rate = batch_rate(
+        "cache_creation_input_token_cost_batches",
+        "cache_creation_input_token_cost",
+        "input_cost_per_token",
+    )
+    cache_read_rate = batch_rate(
+        "cache_read_input_token_cost_batches",
+        "cache_read_input_token_cost",
+        "input_cost_per_token",
+    )
+    if not input_rate and not output_rate:
+        logger.warning(
+            "Pricing entry for %s/%s carries no per-token rates — "
+            "batch item cost left unset", provider, model,
+        )
+        return None
+
+    output_tokens = usage.get("output_tokens", 0) or 0
+    cache_write = usage.get("cache_write_tokens", 0) or 0
+    cache_read = usage.get("cache_read_tokens", 0) or 0
+    reported_input = usage.get("input_tokens", 0) or 0
+    if p == "anthropic":
+        # Anthropic's usage.input_tokens already excludes both cache classes.
+        uncached_input = reported_input
+    else:
+        # OpenAI/Azure report prompt_tokens, which includes cached_tokens.
+        uncached_input = max(0, reported_input - cache_read - cache_write)
+
+    return (
+        uncached_input * input_rate
+        + cache_write * cache_write_rate
+        + cache_read * cache_read_rate
+        + output_tokens * output_rate
+    )
 
 
 def _add_batch_costs(usage_by_cid: dict[str, dict], provider: str, model: str) -> None:
@@ -165,8 +358,27 @@ class BatchProvider(Protocol):
 
 class AnthropicBatchProvider:
     def __init__(self, api_key: str | None = None) -> None:
+        """Build the batch client.
+
+        Two settings the library defaults get wrong for this use. The default
+        connect timeout is 5 seconds, which is far too tight for a call repeated
+        every few minutes for hours — three unlucky handshakes inside 25 seconds
+        is enough to end a healthy run. And the default retry count is 2.
+
+        Reads (`poll`, `collect`) go through `_read_client`, which retries hard:
+        they are idempotent GETs, so a retry costs nothing but a little time.
+        Writes (`submit`) keep the stock retry count on purpose — a POST that
+        creates a billable batch must not be replayed by the SDK on a response
+        we never saw.
+        """
         import anthropic
-        self._client = anthropic.Anthropic(**({"api_key": api_key} if api_key else {}))
+        import httpx
+        kwargs: dict = {"api_key": api_key} if api_key else {}
+        self._client = anthropic.Anthropic(
+            timeout=httpx.Timeout(_READ_TIMEOUT_SECONDS, connect=_CONNECT_TIMEOUT_SECONDS),
+            **kwargs,
+        )
+        self._read_client = self._client.with_options(max_retries=_READ_MAX_RETRIES)
 
     def submit(self, requests: list[dict]) -> str:
         try:
@@ -214,7 +426,7 @@ class AnthropicBatchProvider:
             )
 
     def poll(self, batch_id: str) -> str:
-        batch = self._client.beta.messages.batches.retrieve(batch_id)
+        batch = self._read_client.beta.messages.batches.retrieve(batch_id)
         # processing_status is one of "in_progress" | "canceling" | "ended" (see
         # anthropic.types.beta.messages.beta_message_batch.BetaMessageBatch). Only
         # "ended" is terminal — "canceling" means a cancellation was requested but
@@ -238,7 +450,7 @@ class AnthropicBatchProvider:
         n_succeeded = 0
         n_failed = 0
 
-        for item in self._client.beta.messages.batches.results(batch_id):
+        for item in self._read_client.beta.messages.batches.results(batch_id):
             cid = item.custom_id
             if item.result.type == "succeeded":
                 msg = item.result.message
@@ -262,6 +474,17 @@ class AnthropicBatchProvider:
                         "output_tokens": out,
                         "cache_write_tokens": cw,
                         "cache_read_tokens": cr,
+                        # Why the model stopped -- "max_tokens" means `text` above
+                        # is cut off mid-sentence. Recorded rather than acted on
+                        # here: `collect` reports what the batch returned, and
+                        # `_demote_truncated_p1` decides what that means.
+                        #
+                        # No reasoning_tokens: the Anthropic SDK's usage block has
+                        # no thinking-token field, so `output_tokens` silently
+                        # includes thinking with no way to separate it. That is
+                        # why a truncated thinking-model Pass 1 looked like a
+                        # normal one in the token counts.
+                        "finish_reason": getattr(msg, "stop_reason", None),
                     }
             else:
                 # Non-succeeded item.result.type is one of "errored" | "canceled" |
@@ -300,13 +523,31 @@ class AnthropicBatchProvider:
 
 class OpenAIBatchProvider:
     def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
+        """Build the batch client.
+
+        Two settings the library defaults get wrong for this use. The default
+        connect timeout is 5 seconds, which is far too tight for a call repeated
+        every few minutes for hours — three unlucky handshakes inside 25 seconds
+        is enough to end a healthy run. And the default retry count is 2.
+
+        Reads (`poll`, `collect`) go through `_read_client`, which retries hard:
+        they are idempotent GETs, so a retry costs nothing but a little time.
+        Writes (`submit`) keep the stock retry count on purpose — a POST that
+        creates a billable batch must not be replayed by the SDK on a response
+        we never saw.
+        """
         import openai
+        import httpx
         kwargs: dict = {}
         if api_key:
             kwargs["api_key"] = api_key
         if base_url:
             kwargs["base_url"] = base_url
-        self._client = openai.OpenAI(**kwargs)
+        self._client = openai.OpenAI(
+            timeout=httpx.Timeout(_READ_TIMEOUT_SECONDS, connect=_CONNECT_TIMEOUT_SECONDS),
+            **kwargs,
+        )
+        self._read_client = self._client.with_options(max_retries=_READ_MAX_RETRIES)
 
     def submit(self, requests: list[dict]) -> str:
         try:
@@ -328,7 +569,7 @@ class OpenAIBatchProvider:
             raise
 
     def poll(self, batch_id: str) -> str:
-        batch = self._client.batches.retrieve(batch_id)
+        batch = self._read_client.batches.retrieve(batch_id)
         # status is one of "validating" | "failed" | "in_progress" | "finalizing" |
         # "completed" | "expired" | "cancelling" | "cancelled" (see
         # openai.types.batch.Batch — note both "cancelling"/"cancelled" are spelled
@@ -343,21 +584,22 @@ class OpenAIBatchProvider:
         return "running"
 
     def collect(self, batch_id: str) -> tuple[dict[str, str], dict[str, dict], dict[str, str]]:
-        batch = self._client.batches.retrieve(batch_id)
+        batch = self._read_client.batches.retrieve(batch_id)
         results: dict[str, str] = {}
         usage_by_cid: dict[str, dict] = {}
         errors_by_cid: dict[str, str] = {}
 
         output_file_id = batch.output_file_id
         if output_file_id:
-            raw = self._client.files.content(output_file_id).read().decode()
+            raw = self._read_client.files.content(output_file_id).read().decode()
             for line in raw.splitlines():
                 if not line.strip():
                     continue
                 try:
                     obj = json.loads(line)
                     cid = obj["custom_id"]
-                    text = obj["response"]["body"]["choices"][0]["message"]["content"] or ""
+                    choice = obj["response"]["body"]["choices"][0]
+                    text = choice["message"]["content"] or ""
                     results[cid] = text
                     u = obj.get("response", {}).get("body", {}).get("usage", {})
                     if u:
@@ -367,6 +609,9 @@ class OpenAIBatchProvider:
                             "cache_write_tokens": 0,
                             "cache_read_tokens": (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0,
                             "reasoning_tokens": (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0,
+                            # "length" here means `text` above is cut off — see
+                            # TRUNCATED_FINISH_REASONS and _demote_truncated_p1.
+                            "finish_reason": choice.get("finish_reason"),
                         }
                 except (KeyError, IndexError, json.JSONDecodeError) as exc:
                     logger.warning("Could not parse batch output line: %s", exc)
@@ -381,7 +626,7 @@ class OpenAIBatchProvider:
         # sat "pending forever" from the caller's point of view.
         error_file_id = getattr(batch, "error_file_id", None)
         if error_file_id:
-            raw_err = self._client.files.content(error_file_id).read().decode()
+            raw_err = self._read_client.files.content(error_file_id).read().decode()
             for line in raw_err.splitlines():
                 if not line.strip():
                     continue
@@ -545,8 +790,27 @@ def _poll_once(
     cleared so it won't be endlessly re-polled), or raise BatchPendingError (still
     running — kv left in place so the next external call resumes polling the same
     batch_id, e.g. via a `poll_llm_batches` scheduled command).
+
+    A poll that could not reach the provider at all is the *fourth* case, and it
+    is reported as the third: BatchPendingError with an "unreachable" status, kv
+    left alone. See `_is_transient_transport_error`.
     """
-    result = provider.poll(batch_id)
+    try:
+        result = provider.poll(batch_id)
+    except Exception as exc:
+        if not _is_transient_transport_error(exc):
+            raise
+        logger.warning(
+            "Batch %s: poll could not reach the provider (%s) — treating as still "
+            "pending, will re-poll", batch_id, _format_llm_error(exc),
+        )
+        _console.print(
+            f"[bold]{label}[/] {batch_id} [dim]poll unreachable — will retry[/]"
+        )
+        raise BatchPendingError(
+            batch_id, label, "unreachable (poll failed)",
+            pass_name=pass_name, request_count=request_count,
+        ) from exc
     logger.info("Batch %s: %s", batch_id, result)
     if result == "done":
         return
@@ -597,7 +861,25 @@ async def submit_and_poll(
         pass_name=pass_name, request_count=len(requests),
     )
 
-    results, usage_by_cid, errors_by_cid = provider.collect(batch_id)
+    # Same rule as the poll above, and this one matters more: the batch is done,
+    # the results exist and are one HTTP call away. Losing the job here throws
+    # away work that has already been paid for in full.
+    try:
+        results, usage_by_cid, errors_by_cid = provider.collect(batch_id)
+    except Exception as exc:
+        if not _is_transient_transport_error(exc):
+            raise
+        logger.warning(
+            "Batch %s: collect could not reach the provider (%s) — batch is done, "
+            "will retry collection on the next poll", batch_id, _format_llm_error(exc),
+        )
+        _console.print(
+            f"[bold]{label}[/] {batch_id} [dim]collect unreachable — will retry[/]"
+        )
+        raise BatchPendingError(
+            batch_id, label, "unreachable (collect failed)",
+            pass_name=pass_name, request_count=len(requests),
+        ) from exc
     store.delete_batch_id(batch_key)
     if provider_name and model:
         _add_batch_costs(usage_by_cid, provider_name, model)
@@ -668,8 +950,9 @@ async def _execute_pass1_with_groups(
 
     Returns ``(p1_texts, p1_usage, p1_errors_by_cid, fatal_error)`` — ``p1_errors_by_cid``
     is ``{cid: error_detail}`` for cells that failed with an attributable per-item
-    error (batch item errored/canceled/expired, or an online call that raised);
-    such cids are absent from ``p1_texts``. ``fatal_error`` (unchanged from before)
+    error (batch item errored/canceled/expired, an online call that raised, or a
+    call that ran out of output budget — see ``_demote_truncated_p1``); such cids
+    are absent from ``p1_texts``. ``fatal_error`` (unchanged from before)
     signals a whole-run-aborting failure such as a bad model/API key, not a
     per-cell issue — kept as a separate, rarer signal from ``p1_errors_by_cid``.
 
@@ -850,6 +1133,11 @@ async def _execute_pass1_with_groups(
                     provider_name=run.model_provider, model=run.model_name,
                 )
 
+                # Before the dump, not after: the resume dump holds texts only,
+                # so a truncated answer written to it would come back on the next
+                # resume with no usage left to flag it by.
+                _demote_truncated_p1(p1_texts, p1_usage, p1_errors)
+
                 _save_p1_dump(settings.runtime.p1_dump_dir, run.run_id, chunk_i, p1_texts)
     else:
         # P1 online: gather all papers concurrently
@@ -897,6 +1185,15 @@ async def _execute_pass1_with_groups(
                         "reasoning_content": result.reasoning_content,
                         "cost": result.cost,
                         "latency_ms": result.latency_ms,
+                        "finish_reason": getattr(result, "finish_reason", None),
+                        # The ceiling this call was actually given, recorded next to
+                        # what it spent. A provider that reports no finish_reason
+                        # leaves `output_tokens == max_tokens` as the only evidence
+                        # of a cut-off reply, and reading the ceiling back off a run
+                        # config later cannot be trusted: the config may have been
+                        # edited since, and it is not where the number is resolved
+                        # anyway (SEER folds it into `model_params` at dispatch).
+                        "max_tokens": p1_kwargs.get("max_tokens"),
                     }
                     return cid, result.text, usage
                 finally:
@@ -933,6 +1230,10 @@ async def _execute_pass1_with_groups(
                     cid, text, usage = item
                     p1_texts[cid] = text
                     p1_usage[cid] = usage
+
+    # Covers the online path; a no-op for the batch path, which already ran it
+    # before writing its dump.
+    _demote_truncated_p1(p1_texts, p1_usage, p1_errors)
 
     return p1_texts, p1_usage, p1_errors, None
 
@@ -1025,7 +1326,10 @@ async def _execute_pass2(
     sensible defaults.
 
     ``error_detail`` is populated for cids that failed (batch item error, or an
-    online call that raised); such cids are absent from the first two dicts.
+    online call that raised); such cids are absent from the first two dicts. When
+    the online probe call fails the whole phase is abandoned, and *every* pending
+    cid appears there with that one reason — a cell missing from all three dicts
+    would be written nowhere by the caller and would just look unanswered.
 
     ``response_format``/``require_status`` are shared, opt-in-only knobs: this
     function is called by BOTH the annotate orchestrator and the arbitrate
@@ -1139,6 +1443,13 @@ async def _execute_pass2(
                         "cache_read_tokens": result.usage.cached_tokens,
                         "cost": result.cost,
                         "latency_ms": result.latency_ms,
+                        # Same two fields as Pass 1 above, for the same reason. A
+                        # truncated Pass 2 has a distinctive symptom — its
+                        # structured answer stops mid-object, so the parser reports
+                        # the trailing keys as absent — and without these it is
+                        # indistinguishable from a model that simply skipped them.
+                        "finish_reason": getattr(result, "finish_reason", None),
+                        "max_tokens": p2_kwargs.get("max_tokens"),
                     }
                     return cid, result.text, usage
 
@@ -1159,7 +1470,13 @@ async def _execute_pass2(
                         logger.error("P2 online error on first call — aborting: %s", _format_llm_error(exc), exc_info=True)
                         for coro in p2_tasks[1:]:
                             coro.close()
-                        return {}, {}, {}
+                        # Every pending cell failed, and for one reason. Returning
+                        # three empty dicts instead dropped them silently: the
+                        # caller's parse tail only iterates cids that HAVE Pass-2
+                        # text, and its error loop only iterates this dict — so a
+                        # cell that appeared in neither was never written at all and
+                        # simply looked unanswered. Name the cause on each one.
+                        return {}, {}, {cid: _format_llm_error(exc) for cid in pending_p1}
                     if len(p2_tasks) > 1:
                         p2_results.extend(
                             await asyncio.gather(*p2_tasks[1:], return_exceptions=True)

@@ -68,6 +68,17 @@ The merge happens in `config.py`. When adding a new tunable, add it to `RunConfi
 
 Do not assume work is idempotent above the store layer; the store is the idempotency boundary.
 
+**Delivery is `posted_at`; retryability is `status`.** A cell dropped by a provider error or a
+truncated pass is both — SEER is owed an error answer so a human can see what happened, and the
+cell must be tried again next run. `get_unposted` therefore selects on `posted_at IS NULL`, and
+`mark_posted` leaves a `failed` row's status alone. While one column carried both facts,
+`mark_failed` (which runs right after `save_answer` in every drop handler) took the row out of
+`get_unposted`'s `status='done'` filter, the error answer was never posted, and the paper simply
+disappeared from the run with nothing anywhere to explain it. Do not add a query that decides
+what to post by reading `status` alone. The same rule holds for the `resolutions` table. Store
+files outlive the code that wrote them — a parked batch job is resumed days later from the file
+on disk — so `_add_posted_at` upgrades an old one in place and backfills its posted rows.
+
 ### Batching modes
 
 Controlled by `batching` in `RunConfig`:
@@ -91,7 +102,9 @@ All LLM calls go through `llm.py` which wraps LiteLLM. Model strings are `provid
 
 ### Async batch mode (`batch_p1` / `batch_p2`)
 
-`batch_p1` and `batch_p2` drive the two shared engine helpers `_execute_pass1` and `_execute_pass2` in `batch_runner.py`. Each helper independently selects online or async-batch sub-mode based on its flag. This means batch mode is honored in all three commands (`run`, `pass1`, `pass2`): `batch_p1` affects the Pass-1 phase wherever it runs, and `batch_p2` affects the Pass-2 phase. Batch IDs are stored in `kv` so polling survives restarts.
+`batch_p1` and `batch_p2` drive the two shared engine helpers `_execute_pass1` and `_execute_pass2` in `batch_runner.py`. Each helper independently selects online or async-batch sub-mode based on its flag. This means batch mode is honored in all three commands (`run`, `pass1`, `pass2`): `batch_p1` affects the Pass-1 phase wherever it runs, and `batch_p2` affects the Pass-2 phase. Batch IDs are stored in `kv` so polling survives restarts, and that store is also the only durable record of *whether a batch was collected*: `submit_and_poll` saves the id before polling and deletes it once `collect()` returns, so `Store.owes_batch(batch_id)` answers "does this batch still have results nobody has taken?" for a caller that tracks batches in its own database.
+
+**A read that could not reach the provider is reported as pending, never as a failure.** `_poll_once` and the `collect()` call in `submit_and_poll` both catch transport-shaped errors (`_is_transient_transport_error`: SDK connection/timeout classes, httpx transport errors, 429, 408/409/425, any 5xx, walked down the `__cause__` chain) and raise `BatchPendingError` with an `unreachable (...)` status, leaving the kv batch id in place so the next poll resumes the same batch. A definite HTTP answer — 401, 404 — is not transient and still fails. This exists because one 5-second TLS handshake timeout on the 78th poll of a healthy 340-request batch used to end the whole job: the caller marked it failed, nothing polls a failed job, and the batch finished 53 minutes later and was billed but never collected. Guarding `collect` matters most of all — by then the results exist and are one request away. Both providers are built with a 15 s connect / 120 s read timeout (the library default connect timeout is 5 s) and expose `_read_client = client.with_options(max_retries=8)` used only by `poll`/`collect`; `submit` keeps the stock retry count on purpose, because a POST that creates a billable batch must not be replayed over a response we never saw.
 
 ### Citation verification
 

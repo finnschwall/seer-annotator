@@ -47,6 +47,21 @@ def payload_is_error(payload: dict) -> bool:
     return status in CELL_ERROR_STATUSES
 
 
+# One LLM call answers a whole group of questions, so its usage figures belong on
+# exactly one of the resulting rows. Every OTHER row must pass None for the number
+# fields below — never 0.
+#
+# SEER writes any field that is not None (api/llm_write.py upsert_llm_answer /
+# upsert_resolution). A 0 therefore counts as a value and overwrites whatever is
+# stored; None is skipped and leaves it alone. Since several code paths re-post a
+# group after the fact — the pass-2-only entrypoints, the reformat pass — a 0 in a
+# non-carrying row silently destroys the real count recorded earlier. None cannot.
+# Run totals are identical either way: both blanks sum to nothing.
+#
+# The same applies to cost, which is why it has always been Optional here: a stored
+# 0.0 reads as "this call was free", which is a claim rather than a blank.
+
+
 def build_llm_answer(
     *,
     run_id: int,
@@ -58,19 +73,19 @@ def build_llm_answer(
     cited_text_verified: bool | None = None,
     citations: list | None = None,
     raw_response: dict,
-    latency_ms: int,
-    tokens_total: int,
-    tokens_input: int,
-    tokens_output: int,
-    tokens_cached: int,
-    tokens_reasoning: int = 0,
+    latency_ms: int | None,
+    tokens_total: int | None,
+    tokens_input: int | None,
+    tokens_output: int | None,
+    tokens_cached: int | None,
+    tokens_reasoning: int | None = None,
     reasoning_content: str | None = None,
     cost: Decimal | None,
     cost_currency: str = "USD",
-    fmt_tokens_total: int = 0,
-    fmt_tokens_input: int = 0,
-    fmt_tokens_output: int = 0,
-    fmt_tokens_cached: int = 0,
+    fmt_tokens_total: int | None = None,
+    fmt_tokens_input: int | None = None,
+    fmt_tokens_output: int | None = None,
+    fmt_tokens_cached: int | None = None,
     fmt_cost: Decimal | None = None,
     confidence: int | None = None,
     extraction_status: str | None = None,
@@ -136,19 +151,19 @@ def build_resolution(
     cited_text: str,
     cited_text_verified: bool | None = None,
     raw_response: dict,
-    latency_ms: int,
-    tokens_total: int,
-    tokens_input: int,
-    tokens_output: int,
-    tokens_cached: int,
-    tokens_reasoning: int = 0,
+    latency_ms: int | None,
+    tokens_total: int | None,
+    tokens_input: int | None,
+    tokens_output: int | None,
+    tokens_cached: int | None,
+    tokens_reasoning: int | None = None,
     reasoning_content: str | None = None,
     cost: Decimal | None,
     cost_currency: str = "USD",
-    fmt_tokens_total: int = 0,
-    fmt_tokens_input: int = 0,
-    fmt_tokens_output: int = 0,
-    fmt_tokens_cached: int = 0,
+    fmt_tokens_total: int | None = None,
+    fmt_tokens_input: int | None = None,
+    fmt_tokens_output: int | None = None,
+    fmt_tokens_cached: int | None = None,
     fmt_cost: Decimal | None = None,
     confidence: int | None = None,
     resolution_status: str | None = None,
@@ -273,8 +288,15 @@ def build_error_resolution(
     dispute_item_id: int,
     question: Question,
     resolution_detail: str,
+    raw_response: dict | None = None,
 ) -> dict:
-    """Build a minimal error Resolution payload when adjudication fails for a dispute."""
+    """Build a minimal error Resolution payload when adjudication fails for a dispute.
+
+    ``raw_response`` mirrors ``build_error_answer``'s: the place to carry the
+    evidence for the failure (which pass, the usage it recorded, a diagnostics
+    entry naming the cause) so a consumer does not have to infer it from the
+    wording of ``resolution_detail``.
+    """
     return build_resolution(
         arbiter_run_id=arbiter_run_id,
         paper_id=paper_id,
@@ -284,7 +306,7 @@ def build_error_resolution(
         comment="",
         cited_text="",
         cited_text_verified=None,
-        raw_response={},
+        raw_response=raw_response or {},
         latency_ms=0,
         tokens_total=0,
         tokens_input=0,

@@ -6,7 +6,6 @@ import json
 import logging
 import pathlib
 import uuid
-from decimal import Decimal
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -14,6 +13,7 @@ logger = logging.getLogger(__name__)
 from ..caching import apply_cache
 from ..config import DEFAULT_REQUEST_TIMEOUT, ExperimentRun, Question
 from ..llm import LLMResult, complete as llm_complete, dummy_complete
+from ..reply_quality import pass2_incomplete_reason
 from ..mapping import build_error_answer, build_llm_answer, build_skipped_answer
 from .citation import build_citations
 from .prompt import build_messages, build_format_messages
@@ -130,7 +130,42 @@ async def annotate_group(
         **p2_kwargs,
     )
 
-    parsed = parse_structured_output(p2.text, [q.key for q in questions], annotate_mode=True)
+    # A Pass 2 that looped or ran out of room is not a result document. Parsing
+    # it anyway reads each item's surviving fields off whatever json_repair
+    # closed, which for the fields written last (comment, confidence, status)
+    # means reading nothing and defaulting to "ok". Fail the group on the reply.
+    incomplete = pass2_incomplete_reason(
+        p2.text,
+        {
+            "finish_reason": getattr(p2, "finish_reason", None),
+            "output_tokens": p2.usage.output_tokens,
+            "max_tokens": p2_kwargs.get("max_tokens"),
+        },
+    )
+    if incomplete is not None:
+        code, detail = incomplete
+        logger.error(
+            "EXTRACTION FAILURE — run %d, paper %s: %s", run.run_id, paper_id, detail,
+        )
+        return [
+            build_error_answer(
+                run_id=run.run_id, paper_id=paper_id, question=question,
+                extraction_detail=detail,
+                raw_response={
+                    "pass1_text": p1.text,
+                    "pass2_text": p2.text,
+                    "batch_group_id": batch_group_id,
+                    "diagnostics": [{"phase": "pass2", "code": code, "detail": detail}],
+                } if i == 0 else {
+                    "diagnostics": [{"phase": "pass2", "code": code, "detail": detail}],
+                },
+            )
+            for i, question in enumerate(questions)
+        ]
+
+    parsed = parse_structured_output(
+        p2.text, [q.key for q in questions], annotate_mode=True, require_status=True,
+    )
     # Deterministic scope enforcement (see annotate/scope.py) — enabled=False
     # (early_exit_on_ic_exclusion off) always yields excl_idx=None, so no
     # question can come out "skipped" unless the run opted in.
@@ -172,11 +207,12 @@ async def annotate_group(
             )
             continue
 
-        cited_error = result.get("cited_text_error")
+        # A garbled cited_text, or an item the reply stopped partway through:
+        # either way the item is not what the model wrote, so record an
+        # extraction failure rather than a plausible-looking answer (see
+        # annotate.parse.cited_text_violation and _incomplete_item_violation).
+        cited_error = result.get("cited_text_error") or result.get("item_error")
         if cited_error:
-            # Malformed cited_text means the whole item came back garbled — record
-            # an extraction failure rather than a plausible-looking answer (see
-            # annotate.parse.cited_text_violation).
             logger.error(
                 "EXTRACTION FAILURE — run %d, paper %s, key %r: %s",
                 run.run_id, paper_id, question.key, cited_error,
@@ -224,7 +260,14 @@ async def annotate_group(
                 "batch_group_id": batch_group_id,
             }
 
-        # Usage/cost: attributed fully to the first answer in the group.
+        # Usage/cost: one LLM call answers the whole group, so its figures are
+        # attributed to the group's first answer and every other row carries
+        # None — never 0. The server writes any field that is not None
+        # (api/llm_write.py), so a 0 here would overwrite a real stored count
+        # with zero on any re-post of the group, while None leaves it alone.
+        # Both blanks sum to nothing, so run totals are unaffected either way.
+        # An uncomputable cost is left None for the same reason: a stored 0.0
+        # reads as "this call was free", which is a claim, not a blank.
         # Reasoning model (p1) and format model (p2) are stored separately;
         # only p1 figures are sent to the server.
         if i == 0:
@@ -234,20 +277,20 @@ async def annotate_group(
             tokens_cached = p1.usage.cached_tokens
             tokens_reasoning = p1.usage.reasoning_tokens
             reasoning_content = p1.reasoning_content
-            cost = p1.cost or Decimal(0)
+            cost = p1.cost
             fmt_tokens_total = p2.usage.total_tokens
             fmt_tokens_input = p2.usage.input_tokens
             fmt_tokens_output = p2.usage.output_tokens
             fmt_tokens_cached = p2.usage.cached_tokens
-            fmt_cost = p2.cost or Decimal(0)
+            fmt_cost = p2.cost
             latency_ms = p1.latency_ms + p2.latency_ms
         else:
-            tokens_total = tokens_input = tokens_output = tokens_cached = tokens_reasoning = 0
+            tokens_total = tokens_input = tokens_output = tokens_cached = tokens_reasoning = None
             reasoning_content = None
-            cost = Decimal(0)
-            fmt_tokens_total = fmt_tokens_input = fmt_tokens_output = fmt_tokens_cached = 0
-            fmt_cost = Decimal(0)
-            latency_ms = 0
+            cost = None
+            fmt_tokens_total = fmt_tokens_input = fmt_tokens_output = fmt_tokens_cached = None
+            fmt_cost = None
+            latency_ms = None
 
         status_kwargs: dict = {}
         if status == "invalid":
@@ -409,7 +452,8 @@ async def reformat_group(
             fmt_tokens_cached = p2.usage.cached_tokens
             fmt_cost = p2.cost
         else:
-            fmt_tokens_total = fmt_tokens_input = fmt_tokens_output = fmt_tokens_cached = 0
+            # None, not 0 — see the attribution comment in the sibling block above.
+            fmt_tokens_total = fmt_tokens_input = fmt_tokens_output = fmt_tokens_cached = None
             fmt_cost = None
         results.append({
             "parse_result": result,

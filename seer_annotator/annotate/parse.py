@@ -88,6 +88,14 @@ def _build_annotate_response_format() -> dict:
 # Built once at import time — the annotate path's Pass-2 response_format.
 ANNOTATE_RESPONSE_FORMAT = _build_annotate_response_format()
 
+# The fields every item must carry, read off the schema above rather than
+# retyped. ``status`` is appended per call, because only the annotate path asks
+# for it (see ``_build_annotate_response_format``) — an arbitration item that
+# has no status is complete, not damaged.
+_REQUIRED_ITEM_FIELDS = tuple(
+    _RESPONSE_FORMAT["json_schema"]["schema"]["properties"]["results"]["items"]["required"]
+)
+
 
 def _parse_raw_value(raw: str) -> object:
     """Convert a regex-captured primitive token to a Python value."""
@@ -317,6 +325,39 @@ def cited_text_violation(raw: object) -> str | None:
     )
 
 
+def _incomplete_item_violation(
+    obj: dict, *, require_status: bool = False,
+) -> str | None:
+    """Describe why this item was never finished, or None if it looks complete.
+
+    Only meaningful for an item read out of a **repaired** document. json_repair
+    closes a reply that stopped early, so the document parses and every field the
+    model reached is intact — but the fields it never reached are simply absent,
+    and absent fields have defaults. ``comment`` defaults to "", ``confidence``
+    to None, and ``status`` to "ok", which is what turns a reply that stopped
+    mid-item into an answer that reads as a good one.
+
+    So: an item from salvage that is missing a field the request asked for was
+    cut off, whatever the reply-level evidence says. This is the backstop for a
+    reply that gives no such evidence — one truncated below the output ceiling,
+    or one the provider reported nothing about (see ``reply_quality``).
+
+    ``cited_text_violation`` is the same judgment for the case where the damage
+    landed inside ``cited_text`` specifically; that one still runs, because it
+    also fires on documents that needed no repair at all.
+    """
+    required = _REQUIRED_ITEM_FIELDS + (("status",) if require_status else ())
+    missing = [f for f in required if f not in obj]
+    if not missing:
+        return None
+    return (
+        f"incomplete item — this entry is missing {', '.join(missing)} in a Pass-2 "
+        "reply that only parsed after repair, so the model stopped writing partway "
+        "through it. The fields that did arrive are the ones it reached first, not "
+        "the ones it got right."
+    )
+
+
 def _normalize_cited_text(raw: object) -> str | list | None:
     """Return None when the LLM signalled no verbatim quote is available.
 
@@ -337,7 +378,9 @@ def _normalize_cited_text(raw: object) -> str | list | None:
     return ""
 
 
-def _extract_result(obj: dict) -> dict:
+def _extract_result(
+    obj: dict, *, salvaged: bool = False, require_status: bool = False,
+) -> dict:
     """Pull the standard fields out of a parsed JSON object.
 
     ``status`` is read defensively: older prompts/schemas (arbitration, or the
@@ -345,6 +388,12 @@ def _extract_result(obj: dict) -> dict:
     principle emit a stray value outside _STATUS_VALUES — either way this
     defaults to "ok" (a value was present), matching pre-existing behavior for
     every caller that doesn't look at ``status`` at all.
+
+    That default is only safe for an item the model actually finished writing.
+    ``salvaged=True`` says this item came out of a document that json_repair had
+    to close, and there the missing field may be one the model never reached —
+    so the completeness check below runs and the item is flagged instead. See
+    ``_incomplete_item_violation``.
     """
     status = obj.get("status")
     if status not in _STATUS_VALUES:
@@ -365,6 +414,14 @@ def _extract_result(obj: dict) -> dict:
             obj.get("key"), violation,
         )
         result["cited_text_error"] = violation
+    if salvaged:
+        incomplete = _incomplete_item_violation(obj, require_status=require_status)
+        if incomplete:
+            logger.error(
+                "Incomplete item for key=%r — reporting as an extraction failure: %s",
+                obj.get("key"), incomplete,
+            )
+            result["item_error"] = incomplete
     return result
 
 
@@ -426,7 +483,8 @@ def _strip_code_fence(text: str) -> str:
 
 
 def parse_structured_output(
-    text: str, question_keys: list[str], *, annotate_mode: bool = False
+    text: str, question_keys: list[str], *, annotate_mode: bool = False,
+    require_status: bool = False,
 ) -> list[dict]:
     """Parse pass-2 output when response_format=json_object was used.
 
@@ -438,8 +496,16 @@ def parse_structured_output(
     ``annotate_mode`` is forwarded to ``_fill_missing`` — see its docstring.
     Default False preserves legacy behavior for every existing caller
     (arbitration, and annotate call sites that haven't opted in yet).
+
+    ``require_status`` must match what the caller asked the model for (the
+    ``require_status`` it passed to ``build_format_messages``). It is only used
+    for the completeness check on a repaired document — see
+    ``_incomplete_item_violation`` — and never changes what is parsed. It is a
+    separate argument from ``annotate_mode`` because arbitration passes
+    ``annotate_mode=True`` while asking for no status field at all.
     """
     text = _strip_code_fence(text)
+    salvaged = False
     try:
         obj = json.loads(text)
         if isinstance(obj, dict) and "results" in obj:
@@ -458,23 +524,30 @@ def parse_structured_output(
                 "parse_structured_output: response is not valid JSON (%s) — falling back "
                 "to line-by-line parser. First 200 chars: %.200r", exc, text
             )
-            return parse_format_output(text, question_keys, annotate_mode=annotate_mode)
+            return parse_format_output(
+                text, question_keys, annotate_mode=annotate_mode,
+                require_status=require_status,
+            )
         logger.warning(
             "parse_structured_output: whole-document JSON repair recovered %d item(s) "
             "after %s. First 200 chars: %.200r", len(items), exc, text
         )
+        # Everything read out of these items is salvage: the document parsed
+        # only because json_repair closed what the model never wrote.
+        salvaged = True
 
     results: dict[str, dict] = {}
     for item in items:
         if isinstance(item, dict) and item.get("key"):
-            r = _extract_result(item)
+            r = _extract_result(item, salvaged=salvaged, require_status=require_status)
             results[r["key"]] = r
 
     return _fill_missing(results, question_keys, annotate_mode=annotate_mode)
 
 
 def parse_format_output(
-    text: str, question_keys: list[str], *, annotate_mode: bool = False
+    text: str, question_keys: list[str], *, annotate_mode: bool = False,
+    require_status: bool = False,
 ) -> list[dict]:
     """Extract one dict per question from pass-2 JSON-lines output (repair/opt-out path).
 
@@ -501,10 +574,15 @@ def parse_format_output(
                     line,
                 )
                 continue
+            # Salvage is per line here, not per document: the other lines were
+            # whole JSON objects and are trusted as written.
+            salvaged = True
+        else:
+            salvaged = False
 
         key = obj.get("key")
         if key:
-            r = _extract_result(obj)
+            r = _extract_result(obj, salvaged=salvaged, require_status=require_status)
             results[key] = r
 
     return _fill_missing(results, question_keys, annotate_mode=annotate_mode)
