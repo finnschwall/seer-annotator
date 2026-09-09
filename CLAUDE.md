@@ -14,6 +14,7 @@ seer_annotator/
   store.py          # SQLite: ocr_cache + answers + kv tables
   seer_client.py    # httpx client: fetch OCR markdown, post LLMAnswer
   llm.py            # LiteLLM wrapper → LLMResult (text, usage, cost, latency)
+  pricing.py        # model name → litellm price entry, incl. gateway-namespaced names (google.gemini-3.5-flash)
   batching.py       # Question grouping: per_question / all / size-N / explicit
   batch_runner.py   # Shared two-phase engine: _execute_pass1 / _execute_pass2 (online + batch sub-modes)
   caching.py        # Prompt-cache markers per provider (Anthropic/Gemini/OpenAI)
@@ -145,6 +146,7 @@ Tests use **respx** to mock SEER HTTP endpoints and a built-in dummy LLM (no rea
 
 ## Things to watch out for
 
+- A cost of `None` means "no price known", never $0. `pricing.py` resolves a model name to a price entry, falling back to the underlying model when a gateway's namespaced name (`google.gemini-3.5-flash`) is in no table. Those fallback hits are **guesses** — right for a pass-through gateway, wrong for a self-hosted model named after a vendor's — so `PriceBasis.inferred` travels with them and SEER labels the number. Never `litellm.register_model()` a guessed price: it would become indistinguishable from a real entry, with nothing left to label.
 - `mapping.py` must handle every `question_type` defined in SEER — check here first when adding new question types.
 - `parse.py` uses `json_repair` as a fallback; if answers look wrong, check whether Pass-2 is producing malformed JSON and whether the repair is silently corrupting values. A repair can resynchronise mid-item and swallow later fields into `cited_text`; `parse.cited_text_violation` detects that shape and the answer is saved as an extraction failure (`pass2_malformed_cited_text`), never as a normal answer.
 - One bad reply must never end a run. `_parse_save_post_tail` guards parse/scope per cell and verify/build/save per question, turning any unexpected exception into an error answer (`pass2_parse_crash` / `pass2_unexpected_error`). Nothing above it catches — `run_pipeline` calls it unguarded — so an escape there leaves the rest of the papers unattempted.

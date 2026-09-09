@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
+
+from .pricing import cost_from_usage
 
 
 @dataclass
@@ -110,18 +114,44 @@ async def complete(
     # Passing our own model name adds it as a second candidate: the response's
     # name is still tried first, so a provider that echoes something litellm
     # knows is unaffected (measured: identical results for anthropic and
-    # ollama). It is only a fallback, so a genuinely unpriced endpoint
-    # (hosted_vllm, an OpenAI-compatible local gateway) still ends up as None —
-    # "unknown", which is the honest answer, and not a misleading $0.
+    # ollama).
+    #
+    # That still leaves every model reached through a gateway, whose name
+    # ("openai/google.gemini-3.5-flash") is in no price table anywhere. Those
+    # cannot be rescued by handing completion_cost() a better name: it reads the
+    # provider off the response's own _hidden_params, which for a gateway is
+    # always "openai", and no argument overrides it — so `gemini-3.5-flash` is
+    # looked up as `openai/gemini-3.5-flash` and misses too (measured against
+    # the live endpoint: all four ladder candidates raised). Hence the fallback
+    # below applies the rates itself, from the entry `pricing.py` resolves by
+    # stripping the gateway's namespace.
+    #
+    # A price found that way is a GUESS about which model sits behind the
+    # gateway's label: right for a pass-through, wrong for something
+    # self-hosted under a vendor's name. `pricing.resolve()` reports that, and
+    # every surface printing the number says so — see pricing.py's docstring.
+    #
+    # A genuinely unpriced endpoint (hosted_vllm, a local model no table knows)
+    # still ends up as None — "unknown", which is the honest answer, and not a
+    # misleading $0.
     cost_val: Decimal | None = None
     try:
-        cost_float = litellm.completion_cost(
-            completion_response=response, model=litellm_model
-        )
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cost_float = litellm.completion_cost(
+                completion_response=response, model=litellm_model
+            )
         if cost_float is not None:
             cost_val = Decimal(str(cost_float))
     except Exception:
         pass
+
+    if cost_val is None:
+        cost_val, _basis = cost_from_usage(
+            provider, model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cached_tokens=usage.cached_tokens,
+        )
 
     raw_dict: dict = {}
     try:

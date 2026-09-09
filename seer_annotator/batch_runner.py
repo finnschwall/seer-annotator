@@ -255,13 +255,14 @@ def _batch_item_cost(provider: str, model: str, usage: dict) -> Decimal | None:
     None means "no usable pricing for this model" — the caller leaves the cost
     unset rather than recording a misleading $0.
     """
-    import litellm
+    from .pricing import model_info as resolve_model_info
 
     p = provider.lower()
-    try:
-        info = litellm.get_model_info(model=model, custom_llm_provider=p)
-    except Exception:
-        info = None
+    # Same ladder as the online path (see pricing.py): the name a gateway uses
+    # for a model is in no price table, so an unpriced name is retried under the
+    # underlying model's name. A hit found that way is a guess, which is why the
+    # basis travels with it rather than being flattened into the number.
+    info, _basis = resolve_model_info(p, model)
     if not info:
         logger.warning(
             "No pricing entry for %s/%s — batch item cost left unset", provider, model
