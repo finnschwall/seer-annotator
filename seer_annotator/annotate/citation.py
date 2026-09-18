@@ -7,18 +7,28 @@ multi-citation structure and made per-quote verification impossible to see
 downstream. This module builds the structured replacement: a list of citation
 objects, one per quote, each carrying its own verification result.
 
-Phase 1 (now) fills only `text` and `verified` on each citation object.
-Everything else in the schema below is a deliberate seam for Phase 2, which
-will resolve each quote to the OCR block(s) it actually appears in:
+Each object records the quote and what verification made of it:
 
     {
         "text":         "verbatim quote string",   # required, non-empty str
         "verified":     True,                         # True | False | None
-        "block_ids":    ["a1b2...", ...],            # Phase 2 (omit/[] now)
-        "page_idx":     3,                            # Phase 2
-        "section_path": "Methods > Participants",     # Phase 2
-        "char_offset":  [1204, 1337],                  # Phase 2
+        "reason":       "ok",                         # one of verify.REASONS
+        "verifier":     2,                            # verify.VERIFIER_VERSION
     }
+
+**Where the quote is, is not filled in here.**  SEER attaches `block_ids`,
+`page_idx`, `section_path`, `section_role` and `locator` on its own side, in
+`papers/citation_locate_service.py`, called from the one function every answer
+write passes through.  It has to be there: resolving a quote to a block needs the
+parsed document and its content-anchored ids, and this library is only ever handed
+the rendered text.  Doing it here would mean shipping the block table over the wire
+to compute something the receiver can compute exactly.
+
+`reason` and `verifier` live on the citation rather than on the answer because
+both are facts about *this quote's verification*: the reason is what the check
+found, and the version is which code found it.  Run-level statistics on the SEER
+side are read off them, and a rate is only comparable with another run's if both
+were produced by the same verifier.
 
 `block_ids` is always a list (never a bare id) because a single quote can
 span more than one OCR block (e.g. a sentence split across a page break or a
@@ -32,10 +42,12 @@ from __future__ import annotations
 
 from typing import Callable, Union
 
-# Phase-2 seam: a callable (quote_text: str) -> dict that resolves a verbatim
-# quote to its block_ids/page_idx/section_path/char_offset within the source
-# document. Not implemented yet — build_citations() accepts it as an optional
-# argument so call sites don't need to change again when it lands.
+from .verify import VERIFIER_VERSION
+
+# An optional hook that maps a quote to location keys merged onto its citation.
+# Nothing passes one: SEER places quotes on its own side instead (see the module
+# docstring), which is where the parsed document lives. Kept because it costs
+# nothing and a local caller with its own block table could still use it.
 BlockMatcher = Callable[[str], dict]
 
 
@@ -53,11 +65,12 @@ def build_citations(
             (the `[NO DIRECT QUOTE]` sentinel normalizes to None upstream).
         verify_results: Per-quote verification results from
             annotate.verify.verify_citations(), in the same order as the
-            quotes in cited_text.
-        block_matcher: Phase-2 seam, unused in Phase 1. When the OCR
-            block-resolution step is implemented, pass a callable here that
-            maps a quote's text to a dict of block_ids/page_idx/section_path/
-            char_offset; those keys will be merged onto each citation object.
+            quotes in cited_text. Each contributes its `ok` flag and its
+            `reason`.
+        block_matcher: Optional; nothing in the pipeline passes one. SEER
+            places quotes itself after the answer arrives. A caller holding its
+            own block table can pass a callable mapping a quote's text to
+            location keys, which are merged onto each citation object.
 
     Returns:
         A list of citation dicts (see module docstring for the schema).
@@ -78,6 +91,8 @@ def build_citations(
         citation = {
             "text": str(quote),
             "verified": verify.get("ok"),
+            "reason": verify.get("reason"),
+            "verifier": VERIFIER_VERSION,
         }
         if block_matcher is not None:
             citation.update(block_matcher(citation["text"]))

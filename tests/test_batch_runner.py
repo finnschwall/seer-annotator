@@ -6,7 +6,10 @@ collect()/submit_and_poll() return shape (results, usage_by_cid, errors_by_cid)
 with failed cids excluded from `results` rather than sentineled as "".
 """
 
+import asyncio
 import copy
+import hashlib
+import json
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,11 +20,14 @@ from seer_annotator.batch_runner import (
     TRUNCATED_FINISH_REASONS,
     AnthropicBatchProvider,
     BatchPendingError,
+    OpenAIBatchProvider,
     _batch_item_cost,
     _demote_truncated_p1,
+    _execute_pass1_with_groups,
     _execute_pass2,
     _is_transient_transport_error,
     _poll_once,
+    _served_model_from_raw,
     build_p1_request,
     submit_and_poll,
 )
@@ -688,3 +694,298 @@ def test_online_pass2_probe_failure_names_every_pending_cell():
     assert texts == {} and usage == {}
     assert set(errors) == {"cid1", "cid2"}
     assert "provider is on fire" in errors["cid1"]
+
+
+# ---------------------------------------------------------------------------
+# served_model — the model the provider actually answered with, never the
+# name we asked for (see _served_model_from_raw's docstring).
+# ---------------------------------------------------------------------------
+
+def test_served_model_from_raw_reads_the_echoed_model():
+    assert _served_model_from_raw({"model": "claude-sonnet-5-20260514"}) == "claude-sonnet-5-20260514"
+
+
+def test_served_model_from_raw_handles_empty_or_missing_raw():
+    """A provider's raw response can be empty (dummy provider) or absent
+    (model_dump() raised) — that is None, never a guess from the requested
+    model name, and it must never raise."""
+    assert _served_model_from_raw({}) is None
+    assert _served_model_from_raw(None) is None
+    assert _served_model_from_raw({"other_key": 1}) is None
+    assert _served_model_from_raw({"model": None}) is None
+
+
+class _FakeOnlineResult:
+    """Stands in for llm.LLMResult in the online P1/P2 tests below."""
+
+    def __init__(self, raw: dict | None):
+        self.text = "some answer"
+        self.reasoning_content = None
+        self.usage = SimpleNamespace(
+            input_tokens=10, output_tokens=5, cached_tokens=0, reasoning_tokens=0
+        )
+        self.cost = Decimal("0.001")
+        self.cost_currency = "USD"
+        self.latency_ms = 5
+        self.finish_reason = "stop"
+        self.raw = raw if raw is not None else {}
+
+
+def _run_p1_online(source_texts: dict, raw: dict | None):
+    """Drive _execute_pass1_with_groups' online branch with a single pending
+    cell, bypassing the real prompt builder (build_p1_messages) and the
+    store-backed skip check (should_skip_cell) so the test only exercises the
+    usage-dict construction this change touches."""
+    run = SimpleNamespace(run_id=1, model_name="requested-model", model_provider="anthropic")
+    cfg = SimpleNamespace(
+        batch_p1=False, temperature=None, reasoning_effort=None, model_params={},
+        cache=False, cache_ttl="1h", request_timeout=None, system_prompt="sys",
+    )
+    settings = SimpleNamespace(providers={})
+    papers = [SimpleNamespace(paper_id=1)]
+    groups_def = [[SimpleNamespace(version_id=10)]]
+    pending_cells: dict = {}
+
+    async def _fake_complete(model, provider, messages, **kwargs):
+        return _FakeOnlineResult(raw)
+
+    with patch("seer_annotator.llm.complete", _fake_complete):
+        texts, usage, errors, fatal = asyncio.run(_execute_pass1_with_groups(
+            run, cfg, papers, source_texts, pending_cells, None, settings, False,
+            groups_def,
+            build_p1_messages=lambda source, group, paper_id: [{"role": "user", "content": source}],
+            should_skip_cell=lambda *a: False,
+        ))
+
+    assert fatal is None
+    assert not errors
+    return usage
+
+
+def test_p1_online_usage_carries_served_model_from_raw():
+    usage = _run_p1_online({1: "hello world"}, raw={"model": "claude-sonnet-5-20260514"})
+    (cell_usage,) = usage.values()
+    assert cell_usage["served_model"] == "claude-sonnet-5-20260514"
+
+
+def test_p1_online_usage_served_model_none_when_raw_is_empty():
+    """A raw response with no `model` key must not raise, and must not fall
+    back to the requested model name — that would be exactly the false
+    provenance this field exists to prevent."""
+    usage = _run_p1_online({1: "hello world"}, raw={})
+    (cell_usage,) = usage.values()
+    assert cell_usage["served_model"] is None
+
+
+def test_p1_online_prompt_sha256_is_present_and_stable_for_the_same_messages():
+    messages = [{"role": "user", "content": "hello world"}]
+    expected = hashlib.sha256(
+        json.dumps(messages, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+    usage = _run_p1_online({1: "hello world"}, raw={})
+    (cell_usage,) = usage.values()
+    assert cell_usage["prompt_sha256"] == expected
+
+    # Run it again — same messages must hash the same way every time.
+    usage_again = _run_p1_online({1: "hello world"}, raw={})
+    (cell_usage_again,) = usage_again.values()
+    assert cell_usage_again["prompt_sha256"] == expected
+
+
+def test_p1_online_prompt_sha256_differs_for_different_messages():
+    usage_a = _run_p1_online({1: "hello world"}, raw={})
+    usage_b = _run_p1_online({1: "goodbye world"}, raw={})
+    (hash_a,) = (u["prompt_sha256"] for u in usage_a.values())
+    (hash_b,) = (u["prompt_sha256"] for u in usage_b.values())
+    assert hash_a != hash_b
+
+
+def test_p2_online_usage_carries_served_model_from_raw():
+    run = SimpleNamespace(run_id=1, model_name="m", model_provider="anthropic")
+    cfg = SimpleNamespace(
+        format_model="fmt", format_model_provider="anthropic", format_model_params={},
+        format_temperature=None, format_structured_output=False, batch_p2=False,
+        request_timeout=None,
+    )
+    settings = SimpleNamespace(providers={})
+    pending_cells = {"cid1": (SimpleNamespace(paper_id=1), [], 0)}
+
+    async def _fake_complete(model, provider, messages, **kwargs):
+        return _FakeOnlineResult({"model": "claude-sonnet-5-20260514"})
+
+    with patch("seer_annotator.llm.complete", _fake_complete):
+        texts, usage, errors = asyncio.run(_execute_pass2(
+            run, cfg, {"cid1": "p1 text"}, pending_cells,
+            store=None, settings=settings, dry_run=False,
+        ))
+
+    assert not errors
+    assert usage["cid1"]["served_model"] == "claude-sonnet-5-20260514"
+
+
+def test_p2_online_usage_served_model_none_when_raw_is_empty():
+    run = SimpleNamespace(run_id=1, model_name="m", model_provider="anthropic")
+    cfg = SimpleNamespace(
+        format_model="fmt", format_model_provider="anthropic", format_model_params={},
+        format_temperature=None, format_structured_output=False, batch_p2=False,
+        request_timeout=None,
+    )
+    settings = SimpleNamespace(providers={})
+    pending_cells = {"cid1": (SimpleNamespace(paper_id=1), [], 0)}
+
+    async def _fake_complete(model, provider, messages, **kwargs):
+        return _FakeOnlineResult({})
+
+    with patch("seer_annotator.llm.complete", _fake_complete):
+        texts, usage, errors = asyncio.run(_execute_pass2(
+            run, cfg, {"cid1": "p1 text"}, pending_cells,
+            store=None, settings=settings, dry_run=False,
+        ))
+
+    assert not errors
+    assert usage["cid1"]["served_model"] is None
+
+
+# ---------------------------------------------------------------------------
+# served_model on the batch paths — collect() reads whatever shape each
+# provider's batch results actually carry, which is NOT the same shape as
+# the online response (see AnthropicBatchProvider/OpenAIBatchProvider.collect).
+# ---------------------------------------------------------------------------
+
+def test_anthropic_collect_records_served_model_from_message():
+    """The batch item's message carries `model` the same way a synchronous
+    Messages response does — the snapshot that actually answered, not the
+    alias the batch was submitted under."""
+    class _Usage:
+        input_tokens = 1000
+        output_tokens = 50
+        cache_creation_input_tokens = 0
+        cache_read_input_tokens = 0
+
+    class _Block:
+        text = "ok"
+
+    class _Msg:
+        content = [_Block()]
+        usage = _Usage()
+        stop_reason = "end_turn"
+        model = "claude-sonnet-5-20260514"
+
+    class _Result:
+        type = "succeeded"
+        message = _Msg()
+
+    class _Item:
+        custom_id = "cid1"
+        result = _Result()
+
+    class _Batches:
+        def results(self, batch_id):
+            return [_Item()]
+
+    provider = AnthropicBatchProvider.__new__(AnthropicBatchProvider)
+    client = type("C", (), {
+        "beta": type("B", (), {"messages": type("M", (), {"batches": _Batches()})()})(),
+    })()
+    provider._client = client
+    provider._read_client = client
+
+    _, usage_by_cid, _ = provider.collect("batch_x")
+
+    assert usage_by_cid["cid1"]["served_model"] == "claude-sonnet-5-20260514"
+
+
+def test_anthropic_collect_served_model_none_when_message_has_no_model_attr():
+    """An unexpected SDK shape (no `model` attribute) must not raise — a
+    provenance key is not worth failing a paid batch collection over."""
+    class _Usage:
+        input_tokens = 1000
+        output_tokens = 50
+        cache_creation_input_tokens = 0
+        cache_read_input_tokens = 0
+
+    class _Block:
+        text = "ok"
+
+    class _Msg:
+        content = [_Block()]
+        usage = _Usage()
+        stop_reason = "end_turn"
+        # deliberately no `model` attribute
+
+    class _Result:
+        type = "succeeded"
+        message = _Msg()
+
+    class _Item:
+        custom_id = "cid1"
+        result = _Result()
+
+    class _Batches:
+        def results(self, batch_id):
+            return [_Item()]
+
+    provider = AnthropicBatchProvider.__new__(AnthropicBatchProvider)
+    client = type("C", (), {
+        "beta": type("B", (), {"messages": type("M", (), {"batches": _Batches()})()})(),
+    })()
+    provider._client = client
+    provider._read_client = client
+
+    _, usage_by_cid, _ = provider.collect("batch_x")
+
+    assert usage_by_cid["cid1"]["served_model"] is None
+
+
+class _FakeFileContent:
+    """Stands in for the httpx-backed object openai.files.content(...) returns."""
+
+    def __init__(self, text: str):
+        self._text = text
+
+    def read(self):
+        return self
+
+    def decode(self):
+        return self._text
+
+
+def _openai_collect_with_output_line(body_extra: dict):
+    line = json.dumps({
+        "custom_id": "cid1",
+        "response": {
+            "body": {
+                "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                **body_extra,
+            },
+        },
+    })
+
+    class _Files:
+        def content(self, file_id):
+            return _FakeFileContent(line)
+
+    class _Batches:
+        def retrieve(self, batch_id):
+            return SimpleNamespace(output_file_id="file1", error_file_id=None)
+
+    provider = OpenAIBatchProvider.__new__(OpenAIBatchProvider)
+    provider._read_client = SimpleNamespace(batches=_Batches(), files=_Files())
+
+    _, usage_by_cid, _ = provider.collect("batch_x")
+    return usage_by_cid
+
+
+def test_openai_collect_records_served_model_from_response_body():
+    """The output file's per-line response body is an ordinary chat-completions
+    response, `model` included — same field the online path reads off
+    `result.raw`, just nested under response/body because this is a batch line."""
+    usage_by_cid = _openai_collect_with_output_line({"model": "gpt-5.5-2026-04-24"})
+    assert usage_by_cid["cid1"]["served_model"] == "gpt-5.5-2026-04-24"
+
+
+def test_openai_collect_served_model_none_when_body_has_no_model_key():
+    usage_by_cid = _openai_collect_with_output_line({})
+    assert usage_by_cid["cid1"]["served_model"] is None

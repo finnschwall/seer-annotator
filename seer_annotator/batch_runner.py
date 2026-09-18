@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import io
 import json
 import logging
@@ -28,6 +29,21 @@ from rich.progress import (
 
 logger = logging.getLogger(__name__)
 _console = Console()
+
+
+def _served_model_from_raw(raw: dict | None) -> str | None:
+    """The model that actually answered, as the provider echoed it back.
+
+    Never the model name we asked for: a provider can roll its snapshot
+    mid-run, so "the model we requested" is not evidence of "the model that
+    answered". `raw` is the provider's own response body and can be empty
+    (dummy/test provider, or a `model_dump()` that raised) — that is `None`,
+    never a guess built from the requested model name.
+    """
+    if not raw:
+        return None
+    served = raw.get("model")
+    return served if isinstance(served, str) else None
 
 
 def _format_llm_error(exc: BaseException) -> str:
@@ -486,6 +502,11 @@ class AnthropicBatchProvider:
                         # why a truncated thinking-model Pass 1 looked like a
                         # normal one in the token counts.
                         "finish_reason": getattr(msg, "stop_reason", None),
+                        # The batch item's own message carries `model` the same
+                        # way a synchronous Messages response does — the
+                        # snapshot that actually answered, not the alias we
+                        # submitted the batch under.
+                        "served_model": getattr(msg, "model", None),
                     }
             else:
                 # Non-succeeded item.result.type is one of "errored" | "canceled" |
@@ -613,6 +634,12 @@ class OpenAIBatchProvider:
                             # "length" here means `text` above is cut off — see
                             # TRUNCATED_FINISH_REASONS and _demote_truncated_p1.
                             "finish_reason": choice.get("finish_reason"),
+                            # Each output line's response body is the ordinary
+                            # chat-completions response for that item, "model"
+                            # included — same field the online path reads off
+                            # `result.raw`, just nested one level under
+                            # "response"/"body" because this is a batch line.
+                            "served_model": obj["response"]["body"].get("model"),
                         }
                 except (KeyError, IndexError, json.JSONDecodeError) as exc:
                     logger.warning("Could not parse batch output line: %s", exc)
@@ -1195,6 +1222,14 @@ async def _execute_pass1_with_groups(
                         # edited since, and it is not where the number is resolved
                         # anyway (SEER folds it into `model_params` at dispatch).
                         "max_tokens": p1_kwargs.get("max_tokens"),
+                        "served_model": _served_model_from_raw(result.raw),
+                        # Hash of the exact messages sent, not the requested model
+                        # name or run config — lets a reader confirm that a later
+                        # reconstruction of the prompt matches what actually went
+                        # out, without having to store the prompt text itself.
+                        "prompt_sha256": hashlib.sha256(
+                            json.dumps(messages, sort_keys=True, default=str).encode("utf-8")
+                        ).hexdigest(),
                     }
                     return cid, result.text, usage
                 finally:
@@ -1451,6 +1486,7 @@ async def _execute_pass2(
                         # indistinguishable from a model that simply skipped them.
                         "finish_reason": getattr(result, "finish_reason", None),
                         "max_tokens": p2_kwargs.get("max_tokens"),
+                        "served_model": _served_model_from_raw(result.raw),
                     }
                     return cid, result.text, usage
 
