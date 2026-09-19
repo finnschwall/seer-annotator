@@ -10,14 +10,14 @@ def store(tmp_path):
 
 
 def test_ocr_roundtrip(store):
-    assert store.get_ocr(1) is None
-    store.save_ocr(1, "hello markdown")
-    assert store.get_ocr(1) == "hello markdown"
+    assert store.get_ocr(1, "") is None
+    store.save_ocr(1, "hello markdown", "")
+    assert store.get_ocr(1, "") == "hello markdown"
 
 
 def test_ocr_none_stored(store):
-    store.save_ocr(2, None)
-    assert store.get_ocr(2) is None
+    store.save_ocr(2, None, "")
+    assert store.get_ocr(2, "") is None
 
 
 def test_answer_lifecycle(store):

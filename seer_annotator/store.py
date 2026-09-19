@@ -58,9 +58,11 @@ class Store:
         with self._tx() as con:
             con.executescript("""
                 CREATE TABLE IF NOT EXISTS ocr_cache (
-                    paper_id   INTEGER PRIMARY KEY,
+                    paper_id   INTEGER NOT NULL,
+                    variant    TEXT NOT NULL DEFAULT '',
                     markdown   TEXT,
-                    fetched_at TEXT NOT NULL
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY (paper_id, variant)
                 );
 
                 CREATE TABLE IF NOT EXISTS answers (
@@ -97,6 +99,7 @@ class Store:
             """)
             self._add_posted_at(con, "answers")
             self._add_posted_at(con, "resolutions")
+            self._add_ocr_variant(con)
 
     @staticmethod
     def _add_posted_at(con: sqlite3.Connection, table: str) -> None:
@@ -114,22 +117,81 @@ class Store:
         con.execute(f"ALTER TABLE {table} ADD COLUMN posted_at TEXT")
         con.execute(f"UPDATE {table} SET posted_at = updated_at WHERE status = 'posted'")
 
+    @staticmethod
+    def _add_ocr_variant(con: sqlite3.Connection) -> None:
+        """Re-key an `ocr_cache` written before the cache knew about renderings.
+
+        A store file outlives the code that wrote it (a batch job is resumed days
+        later from a `state.db` on disk), so the schema is brought forward in
+        place — see `_add_posted_at`. SQLite cannot add a column to a primary
+        key, so the table is rebuilt rather than altered.
+
+        Carried-over rows land on the variant ``'legacy'``, which no client ever
+        asks for. That is deliberate: the old schema recorded the text but not
+        which rendering it was, so serving such a row to a run would be a guess.
+        Keeping them costs nothing (one refetch each, once) and leaves the
+        resumed job's text visible to `get_ocr_any`.
+        """
+        cols = {row["name"] for row in con.execute("PRAGMA table_info(ocr_cache)")}
+        if not cols or "variant" in cols:
+            return
+        con.execute("ALTER TABLE ocr_cache RENAME TO ocr_cache_pre_variant")
+        con.execute(
+            """CREATE TABLE ocr_cache (
+                   paper_id   INTEGER NOT NULL,
+                   variant    TEXT NOT NULL DEFAULT '',
+                   markdown   TEXT,
+                   fetched_at TEXT NOT NULL,
+                   PRIMARY KEY (paper_id, variant)
+               )"""
+        )
+        con.execute(
+            """INSERT INTO ocr_cache (paper_id, variant, markdown, fetched_at)
+               SELECT paper_id, 'legacy', markdown, fetched_at FROM ocr_cache_pre_variant"""
+        )
+        con.execute("DROP TABLE ocr_cache_pre_variant")
+
     # ------------------------------------------------------------------
     # OCR cache
     # ------------------------------------------------------------------
 
-    def get_ocr(self, paper_id: int) -> str | None:
+    def get_ocr(self, paper_id: int, variant: str) -> str | None:
+        """Return the cached text of one *rendering* of a paper, or None.
+
+        `variant` is the opaque key the client gave for the run being served
+        (`SeerClient.ocr_variant`). One paper has as many cache rows as the runs
+        in this job have distinct renderings of it — a run that withholds the
+        reference list and one that does not are two different texts, and the
+        paper id alone cannot tell them apart.
+        """
         with self._connect() as con:
             row = con.execute(
-                "SELECT markdown FROM ocr_cache WHERE paper_id = ?", (paper_id,)
+                "SELECT markdown FROM ocr_cache WHERE paper_id = ? AND variant = ?",
+                (paper_id, variant),
             ).fetchone()
         return row["markdown"] if row else None
 
-    def save_ocr(self, paper_id: int, markdown: str | None) -> None:
+    def get_ocr_any(self, paper_id: int) -> str | None:
+        """Return the most recently fetched rendering of a paper, whichever it is.
+
+        For readers with no run in hand — the debug UI. Never for assembling a
+        prompt or verifying a quote: those must ask for the rendering their own
+        run was sent, via `get_ocr`.
+        """
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT markdown FROM ocr_cache WHERE paper_id = ? "
+                "ORDER BY fetched_at DESC LIMIT 1",
+                (paper_id,),
+            ).fetchone()
+        return row["markdown"] if row else None
+
+    def save_ocr(self, paper_id: int, markdown: str | None, variant: str) -> None:
         with self._tx() as con:
             con.execute(
-                "INSERT OR REPLACE INTO ocr_cache (paper_id, markdown, fetched_at) VALUES (?,?,?)",
-                (paper_id, markdown, _now()),
+                "INSERT OR REPLACE INTO ocr_cache (paper_id, variant, markdown, fetched_at)"
+                " VALUES (?,?,?,?)",
+                (paper_id, variant, markdown, _now()),
             )
 
     # ------------------------------------------------------------------

@@ -1,4 +1,20 @@
-"""SEER API client: fetch OCR markdown, post LLMAnswers."""
+"""SEER API client: fetch OCR markdown, post LLMAnswers.
+
+Source text is asked for **per run**, not per paper. One job can drive several
+runs through one client (a whole dispute set adjudicated in one go), and two runs
+of the same job may be sent different text for the same paper — SEER's
+`exclude_sections` decides which sections of a paper are withheld from the model,
+and it is a per-run setting. A client therefore answers two questions:
+
+* `ocr_variant(run_id)` — an opaque key naming the rendering this client will
+  produce for that run. Equal keys mean "you may reuse one run's text for the
+  other"; the library only ever compares it and uses it as a cache key.
+* `fetch_ocr_markdown(paper_id, run_id)` — the text itself, rendered for that run.
+
+Both are part of the protocol, not optional extras: an orchestrator calls them
+unconditionally, and a client that does not implement them fails loudly rather
+than quietly serving every run the first run's text.
+"""
 
 from __future__ import annotations
 
@@ -70,8 +86,22 @@ class SeerClient:
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(headers=self._headers, timeout=60)
 
-    async def fetch_ocr_markdown(self, paper_id: int) -> str | None:
-        """Return OCR markdown for paper_id, or None if unavailable."""
+    def ocr_variant(self, run_id: int) -> str:
+        """Rendering key for `run_id` — constant, because this endpoint has one.
+
+        `/papers/<id>/ocr/` serves the whole paper and takes no run: over HTTP
+        every run of a job sees the same text, and saying so with one shared key
+        is the honest answer. An in-process client that renders per run (SEER's
+        `OrmSeerClient`, which applies that run's `exclude_sections`) overrides
+        this with a key that distinguishes them.
+        """
+        return ""
+
+    async def fetch_ocr_markdown(self, paper_id: int, run_id: int) -> str | None:
+        """Return OCR markdown for paper_id as `run_id` should see it, or None.
+
+        `run_id` is unused here — see `ocr_variant`.
+        """
         url = f"{self._base}/papers/{paper_id}/ocr/"
         async with self._client() as client:
             for attempt in range(_MAX_RETRIES):

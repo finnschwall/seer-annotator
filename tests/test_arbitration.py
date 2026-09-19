@@ -288,3 +288,81 @@ def test_candidates_only_omits_paper_text():
     )
     full_text = " ".join(m["content"] for m in messages if isinstance(m["content"], str))
     assert "THIS SHOULD NOT APPEAR" not in full_text
+
+
+@pytest.mark.asyncio
+async def test_each_run_in_one_dispute_set_gets_its_own_rendering(settings):
+    """Two arbiter runs, one job, one client, different text per run.
+
+    A dispute set is adjudicated by several `ArbiterRun`s driven through a single
+    client, and each has its own `exclude_sections` — what is withheld from the
+    model is a per-run decision. Before the client protocol carried the run, the
+    first run to ask for a paper fixed what every later run in the job was sent.
+    """
+    import seer_annotator.llm as llm_mod
+
+    payload = json.loads(json.dumps(DISPUTE_PIPELINE))
+    second = json.loads(json.dumps(payload["runs"][0]))
+    second.update({"run_id": 22, "name": "gpt-4o-arbiter-with-refs"})
+    third = json.loads(json.dumps(payload["runs"][0]))
+    third.update({"run_id": 23, "name": "gpt-4o-arbiter-twin"})
+    payload["runs"] = [payload["runs"][0], second, third]
+    pipeline = DisputePipelineConfig.model_validate(payload)
+
+    # Run 23 renders exactly like run 21 — it must share the cache entry, not
+    # pay for a second fetch.
+    variants = {21: "no-refs", 22: "whole", 23: "no-refs"}
+    texts = {
+        "no-refs": "BODY ONLY, references withheld",
+        "whole": "BODY AND THE WHOLE REFERENCE LIST",
+    }
+
+    class PerRunClient(SeerClient):
+        def __init__(self):
+            super().__init__(pipeline.api_base, pipeline.api_token,
+                             pipeline.review_id, pipeline.questions)
+            self.fetches = []
+
+        def ocr_variant(self, run_id: int) -> str:
+            return variants[run_id]
+
+        async def fetch_ocr_markdown(self, paper_id: int, run_id: int):
+            self.fetches.append((paper_id, run_id))
+            return texts[variants[run_id]]
+
+        async def post_resolutions_bulk(self, resolutions):
+            return None
+
+    client = PerRunClient()
+
+    prompts: list[str] = []
+
+    async def recording_complete(model, provider, messages, **kw):
+        prompts.append(
+            " ".join(m["content"] for m in messages if isinstance(m.get("content"), str))
+        )
+        return await llm_mod.dummy_complete(model, provider, messages, **kw)
+
+    original = llm_mod.complete
+    llm_mod.complete = recording_complete
+    try:
+        store = Store(settings.runtime.store_path)
+        await run_arbitration_pipeline(pipeline, settings, store=store, client=client)
+    finally:
+        llm_mod.complete = original
+
+    # One fetch per *rendering*, not per run and not once for the whole job.
+    assert client.fetches == [(42, 21), (42, 22)]
+
+    # Every run's own text, and only its own, reached the model. Pass 2 is sent
+    # Pass 1's reply rather than the paper, so only the prompts carrying paper
+    # text at all are counted: one per run, three runs.
+    carrying = [p for p in prompts if texts["no-refs"] in p or texts["whole"] in p]
+    with_refs = [p for p in carrying if texts["whole"] in p]
+    without_refs = [p for p in carrying if texts["whole"] not in p]
+    assert len(carrying) == 3, "expected one Pass-1 prompt with paper text per run"
+    assert len(with_refs) == 1, "only run 22 asked for the reference list"
+    assert len(without_refs) == 2, "runs 21 and 23 asked for the paper without it"
+    for prompt in without_refs:
+        assert texts["no-refs"] in prompt
+        assert "REFERENCE LIST" not in prompt

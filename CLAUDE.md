@@ -13,6 +13,7 @@ seer_annotator/
   orchestrator.py   # Unified chunked run_pipeline; pass1_pipeline; pass2_pipeline; reformat_pipeline
   store.py          # SQLite: ocr_cache + answers + kv tables
   seer_client.py    # httpx client: fetch OCR markdown, post LLMAnswer
+  source_text.py    # one definition of the text a given run sees for a given paper
   llm.py            # LiteLLM wrapper → LLMResult (text, usage, cost, latency)
   pricing.py        # model name → litellm price entry, incl. gateway-namespaced names (google.gemini-3.5-flash)
   batching.py       # Question grouping: per_question / all / size-N / explicit
@@ -65,9 +66,26 @@ The merge happens in `config.py`. When adding a new tunable, add it to `RunConfi
 - Status flow via `pass1` / `pass2`: `pending` → `pass1_done` → `done` → `posted`
   - `pass1_done` is written only by the `pass1` command (not by `run`); it indicates Pass-1 text is stored and ready for Pass-2 formatting
 - On restart: `done`/`posted` cells are skipped — no recomputation; `pass1_done` cells are skipped by `pass1` but picked up by `pass2`
-- OCR markdown is fetched once and cached in `ocr_cache`; `batch_runner` stores batch job IDs in the `kv` table
+- OCR markdown is cached in `ocr_cache`, keyed on **(paper, rendering)** — see below; `batch_runner` stores batch job IDs in the `kv` table
 
 Do not assume work is idempotent above the store layer; the store is the idempotency boundary.
+
+### Source text is per run, not per paper
+
+One job can drive several runs through one client — a whole dispute set is adjudicated in one
+go — and the client may render a paper differently for each of them: SEER withholds the sections
+a run's `exclude_sections` names. So "the text for paper 7" is not a question with one answer.
+
+Two calls express this, and both are part of the client protocol (`seer_client.py`):
+`ocr_variant(run_id)` returns an opaque key for the rendering a run will be sent, and
+`fetch_ocr_markdown(paper_id, run_id)` returns that text. `ocr_cache` is keyed on
+`(paper_id, variant)`, so runs that render alike share one entry and runs that do not cannot
+read each other's. Always go through `source_text.py`; it is the only place that pairs a fetch
+with the key it must be stored under.
+
+A client that does not implement both is a bug, not a case to handle — the orchestrators call
+them unconditionally. `SeerClient` itself answers `""` for every run, which is true of it: the
+REST endpoint takes no run and serves the whole paper.
 
 **Delivery is `posted_at`; retryability is `status`.** A cell dropped by a provider error or a
 truncated pass is both — SEER is owed an error answer so a human can see what happened, and the

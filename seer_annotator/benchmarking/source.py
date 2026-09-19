@@ -250,12 +250,23 @@ class DjangoSource:
         try:
             con = sqlite3.connect(uri, uri=True)
             try:
-                row = con.execute("SELECT markdown FROM ocr_cache WHERE paper_id=?", (paper_id,)).fetchone()
+                rows = con.execute(
+                    "SELECT markdown FROM ocr_cache WHERE paper_id=?", (paper_id,)
+                ).fetchall()
             finally:
                 con.close()
         except sqlite3.Error as exc:
             raise SourceSafetyError(f"could not read archived state database read-only: {path}: {exc}") from exc
-        return row[0] if row else None
+        if len(rows) > 1:
+            # One store can hold several renderings of a paper — a job driving
+            # runs that withhold different sections caches one per rendering.
+            # Nothing here says which of them this run was sent, and quietly
+            # picking one would put text into a benchmark that the run never saw.
+            raise SourceSafetyError(
+                f"archived state {path} holds {len(rows)} renderings of paper {paper_id}; "
+                "cannot say which this run was sent"
+            )
+        return rows[0][0] if rows else None
 
     def current_source_text(self, paper_id: int) -> str | None:
         """Read the currently registered OCR markdown, only for explicit override."""

@@ -102,7 +102,9 @@ def create_app(pipeline: PipelineConfig, settings: Settings) -> FastAPI:
 
     @app.get("/api/ocr/{paper_id}")
     def get_ocr(paper_id: int) -> dict:
-        md = store.get_ocr(paper_id)
+        # Whatever rendering was fetched last: this is a debug viewer, and it
+        # has no run whose withheld sections it could ask for.
+        md = store.get_ocr_any(paper_id)
         paper = next((p for p in pipeline.papers if p.paper_id == paper_id), None)
         return {
             "paper_id": paper_id,

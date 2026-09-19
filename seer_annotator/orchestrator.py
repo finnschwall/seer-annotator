@@ -28,6 +28,7 @@ from .config import PipelineConfig, ProviderSettings, RunConfig, Settings, effec
 from .progress import ProgressReporter, ProgressReporterProtocol
 from .rate_limiter import PerProviderRateLimiter
 from .seer_client import SeerClient
+from .source_text import cached_full_text_for_run, full_text_for_run
 from .store import Store
 from .mapping import build_error_answer, build_llm_answer, build_skipped_answer, payload_is_error
 from .annotate.citation import build_citations
@@ -762,10 +763,9 @@ async def run_pipeline(
 
                 for paper in chunk_papers:
                     if cfg.text_source == "full_text":
-                        source = store.get_ocr(paper.paper_id)
-                        if source is None:
-                            source = await client.fetch_ocr_markdown(paper.paper_id)
-                            store.save_ocr(paper.paper_id, source)
+                        source = await full_text_for_run(
+                            client, store, paper.paper_id, run.run_id,
+                        )
                         if source is None:
                             logger.warning("No OCR for paper %d — posting error for all questions", paper.paper_id)
                             no_ocr_papers.append(paper)
@@ -1084,10 +1084,9 @@ async def pass1_pipeline(
         source_texts: dict[int, str] = {}
         for paper in papers:
             if cfg.text_source == "full_text":
-                source = store.get_ocr(paper.paper_id)
-                if source is None:
-                    source = await client.fetch_ocr_markdown(paper.paper_id)
-                    store.save_ocr(paper.paper_id, source)
+                source = await full_text_for_run(
+                    client, store, paper.paper_id, run.run_id,
+                )
                 if source is not None:
                     source_texts[paper.paper_id] = source
                 # papers without OCR are skipped silently for pass1
@@ -1363,11 +1362,9 @@ async def pass2_pipeline(
             # against an empty string does not fail loudly; it silently reports
             # every citation in the paper as unverified.
             if cfg.text_source == "full_text":
-                source_text = store.get_ocr(paper.paper_id)
-                if source_text is None:
-                    source_text = await client.fetch_ocr_markdown(paper.paper_id)
-                    store.save_ocr(paper.paper_id, source_text)
-                source_text = source_text or ""
+                source_text = await full_text_for_run(
+                    client, store, paper.paper_id, run.run_id,
+                ) or ""
             else:
                 source_text = paper.abstract
 
@@ -1611,6 +1608,7 @@ async def reformat_pipeline(
     pipeline: PipelineConfig,
     settings: Settings,
     *,
+    client: SeerClient | None = None,
     format_model: str | None = None,
     format_model_provider: str | None = None,
     dry_run: bool = False,
@@ -1636,6 +1634,12 @@ async def reformat_pipeline(
     _litellm.suppress_debug_info = True
 
     store = Store(settings.runtime.store_path)
+    # Nothing is fetched here — the client is asked only which rendering of a
+    # paper the run was sent, so the stored text is read back under the right
+    # key. See `reformat_arbitration_pipeline` for the same argument.
+    client = client or SeerClient(
+        pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions,
+    )
     question_map = {q.version_id: q for q in pipeline.questions}
     question_order = {q.version_id: i for i, q in enumerate(pipeline.questions)}
     paper_map = {p.paper_id: p for p in pipeline.papers}
@@ -1705,7 +1709,9 @@ async def reformat_pipeline(
                     continue
 
                 if cfg.text_source == "full_text":
-                    source_text = store.get_ocr(paper.paper_id) or ""
+                    source_text = cached_full_text_for_run(
+                        client, store, paper.paper_id, run.run_id,
+                    ) or ""
                 else:
                     source_text = paper_map.get(paper.paper_id, paper).abstract
 

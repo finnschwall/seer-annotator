@@ -55,6 +55,7 @@ from .annotate.verify import verify_citation
 from .annotate.scope import ic_answer_passes
 from .arbitrate.prompt import build_dispute_messages
 from .orchestrator import _chunks, _p1_drop_reason
+from .source_text import cached_full_text_for_run, full_text_for_run
 
 logger = logging.getLogger(__name__)
 
@@ -192,12 +193,20 @@ def _skip_resolution_cell_fn(store: Store):
     return _fn
 
 
-def _resolve_source_text(cfg: ArbiterRunConfig, paper: Paper, store: Store) -> str:
+def _resolve_source_text(
+    cfg: ArbiterRunConfig, paper: Paper, store: Store, client: SeerClient, run_id: int
+) -> str:
+    """Source text for a pass that only re-reads what Pass 1 was already sent.
+
+    `client` is here for `ocr_variant` alone — nothing is fetched. Which
+    rendering of the paper this run saw is the client's answer to give, and the
+    runs of one dispute set do not have to agree on it.
+    """
     if cfg.text_source == "candidates_only":
         return ""
     if cfg.text_source == "abstract":
         return paper.abstract
-    return store.get_ocr(paper.paper_id) or ""
+    return cached_full_text_for_run(client, store, paper.paper_id, run_id) or ""
 
 
 def _parse_save_post_tail_resolutions(
@@ -596,10 +605,9 @@ async def run_arbitration_pipeline(
                         source_texts[paper.paper_id] = ""
                         continue
                     if cfg.text_source == "full_text":
-                        source = store.get_ocr(paper.paper_id)
-                        if source is None:
-                            source = await client.fetch_ocr_markdown(paper.paper_id)
-                            store.save_ocr(paper.paper_id, source)
+                        source = await full_text_for_run(
+                            client, store, paper.paper_id, run.run_id,
+                        )
                         if source is None:
                             logger.warning(
                                 "No OCR for paper %d — posting error for all its disputes", paper.paper_id
@@ -918,10 +926,9 @@ async def arbitration_pass1_pipeline(
             if cfg.text_source == "candidates_only":
                 source_texts[paper.paper_id] = ""
             elif cfg.text_source == "full_text":
-                source = store.get_ocr(paper.paper_id)
-                if source is None:
-                    source = await client.fetch_ocr_markdown(paper.paper_id)
-                    store.save_ocr(paper.paper_id, source)
+                source = await full_text_for_run(
+                    client, store, paper.paper_id, run.run_id,
+                )
                 if source is not None:
                     source_texts[paper.paper_id] = source
                 # papers without OCR are skipped silently for pass1
@@ -1076,7 +1083,7 @@ async def arbitration_pass2_pipeline(
             if not rows:
                 continue
 
-            source_text = _resolve_source_text(cfg, paper, store)
+            source_text = _resolve_source_text(cfg, paper, store, client, run.run_id)
 
             groups: dict[str, list[dict]] = {}
             for row in rows:
@@ -1272,6 +1279,7 @@ async def reformat_arbitration_pipeline(
     pipeline: DisputePipelineConfig,
     settings: Settings,
     *,
+    client: SeerClient | None = None,
     format_model: str | None = None,
     format_model_provider: str | None = None,
     dry_run: bool = False,
@@ -1295,6 +1303,13 @@ async def reformat_arbitration_pipeline(
     _litellm.suppress_debug_info = True
 
     store = Store(settings.runtime.store_path)
+    # Nothing is fetched here — the client is asked only which rendering of a
+    # paper each run was sent, so the stored text is read back under the right
+    # key. A caller whose Pass 1 ran through a different client must hand that
+    # same client in, or its runs' text will not be found.
+    client = client or SeerClient(
+        pipeline.api_base, pipeline.api_token, pipeline.review_id, pipeline.questions,
+    )
     disputes = [d for d in pipeline.disputes if (dispute_item_ids is None or d.dispute_item_id in dispute_item_ids)]
     question_map = {q.version_id: q for q in pipeline.questions}
     question_order = {q.version_id: i for i, q in enumerate(pipeline.questions)}
@@ -1359,7 +1374,9 @@ async def reformat_arbitration_pipeline(
                     progress.advance(paper_task)
                     continue
 
-                source_text = _resolve_source_text(cfg, paper_map.get(paper.paper_id, paper), store)
+                source_text = _resolve_source_text(
+                    cfg, paper_map.get(paper.paper_id, paper), store, client, run.run_id,
+                )
 
                 groups: dict[str, list[dict]] = {}
                 for row in rows:

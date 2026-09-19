@@ -611,16 +611,20 @@ def preview_prompt(
 
     store = Store(settings.runtime.store_path)
 
-    async def _fetch_ocr(paper_id: int) -> str | None:
-        cached = store.get_ocr(paper_id)
+    client = SeerClient(pipeline.api_base, pipeline.api_token)
+
+    async def _fetch_ocr(paper_id: int, run_id: int) -> str | None:
+        # Per run: what a paper looks like to the model is the run's setting, so
+        # the preview asks the same question the pipeline does.
+        variant = client.ocr_variant(run_id)
+        cached = store.get_ocr(paper_id, variant)
         if cached is not None:
             return cached
         if no_fetch:
             return None
-        client = SeerClient(pipeline.api_base, pipeline.api_token)
-        text = await client.fetch_ocr_markdown(paper_id)
+        text = await client.fetch_ocr_markdown(paper_id, run_id)
         if text is not None:
-            store.save_ocr(paper_id, text)
+            store.save_ocr(paper_id, text, variant)
         return text
 
     lines: list[str] = []
@@ -631,7 +635,7 @@ def preview_prompt(
             groups = resolve_groups(cfg, pipeline.questions)
 
             for paper in papers_to_process:
-                ocr_text = await _fetch_ocr(paper.paper_id)
+                ocr_text = await _fetch_ocr(paper.paper_id, exp_run.run_id)
                 if ocr_text is None:
                     ocr_text = "[OCR TEXT NOT AVAILABLE — run the pipeline first or remove --no-fetch]"
 
@@ -743,19 +747,23 @@ def _preview_dispute_prompt(
     question_by_key = {q.key: q for q in pipeline.questions}
     store = Store(settings.runtime.store_path)
 
-    async def _source_text(paper, cfg):
+    client = SeerClient(pipeline.api_base, pipeline.api_token)
+
+    async def _source_text(paper, cfg, run_id: int):
         if cfg.text_source == "candidates_only":
             return ""
         if cfg.text_source == "abstract":
             return paper.abstract
-        cached = store.get_ocr(paper.paper_id)
+        # Per run — see `_fetch_ocr` in the annotation preview above.
+        variant = client.ocr_variant(run_id)
+        cached = store.get_ocr(paper.paper_id, variant)
         if cached is not None:
             return cached
         if no_fetch:
             return "[OCR TEXT NOT AVAILABLE — run the pipeline first or remove --no-fetch]"
-        text = await SeerClient(pipeline.api_base, pipeline.api_token).fetch_ocr_markdown(paper.paper_id)
+        text = await client.fetch_ocr_markdown(paper.paper_id, run_id)
         if text is not None:
-            store.save_ocr(paper.paper_id, text)
+            store.save_ocr(paper.paper_id, text, variant)
             return text
         return "[OCR TEXT NOT AVAILABLE]"
 
@@ -777,7 +785,7 @@ def _preview_dispute_prompt(
                     groups = resolve_groups(cfg, questions)
                 candidates = {(d.paper_id, d.version_id): d.candidates for d in paper_disputes}
                 item_types = {d.version_id: d.item_type for d in paper_disputes}
-                source_text = await _source_text(paper, cfg)
+                source_text = await _source_text(paper, cfg, run.run_id)
                 for group_idx, group in enumerate(groups):
                     keys = ", ".join(q.key for q in group)
                     lines.append(
