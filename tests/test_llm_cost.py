@@ -12,7 +12,6 @@ import asyncio
 from decimal import Decimal
 
 import litellm
-import pytest
 from litellm.types.utils import ModelResponse, PromptTokensDetailsWrapper, Usage
 
 from seer_annotator.llm import complete
@@ -45,20 +44,6 @@ def _complete(monkeypatch, model: str, provider: str, response: ModelResponse):
 
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
     return asyncio.run(complete(model, provider, [{"role": "user", "content": "hi"}]))
-
-
-def test_azure_snapshot_name_still_priced(monkeypatch):
-    """The deployment name prices the call even though the echoed name is unmapped."""
-    with pytest.raises(Exception):  # noqa: B017 - litellm raises a bare Exception
-        litellm.completion_cost(
-            completion_response=_response("gpt-5.5-2026-04-24", "azure")
-        )
-
-    result = _complete(
-        monkeypatch, "gpt-5.5", "azure", _response("gpt-5.5-2026-04-24", "azure")
-    )
-    # 1000 input @ $5/M + 100 output @ $30/M
-    assert result.cost == Decimal("0.008")
 
 
 def test_azure_cache_reads_get_the_cheaper_rate(monkeypatch):

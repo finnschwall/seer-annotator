@@ -22,7 +22,7 @@ from rich.progress import (
 _console = Console()
 
 from .batching import resolve_groups
-from .batch_runner import TRUNCATED_FINISH_REASONS, _execute_pass1, _execute_pass2
+from .batch_runner import TRUNCATED_FINISH_REASONS, _execute_pass1, _execute_pass2, is_quota_exhausted
 from .reply_quality import pass2_incomplete_reason
 from .config import PipelineConfig, ProviderSettings, RunConfig, Settings, effective_run_config
 from .progress import ProgressReporter, ProgressReporterProtocol
@@ -633,6 +633,12 @@ async def run_pipeline(
             first_error: list[ExtractionError] = []
             run_cell_errors = 0
             run_had_fatal_error = False
+            # Set once any cell's error text says the account is out of
+            # credits/quota (see is_quota_exhausted). Unlike an ordinary
+            # per-cell failure, this always stops the run -- continuing to
+            # burn through further chunks against an empty account cannot
+            # succeed, so it overrides cfg.fail_fast rather than obeying it.
+            quota_exhausted = False
 
             reporter = (
                 reporter_factory(run.run_id)
@@ -813,6 +819,10 @@ async def run_pipeline(
                         msg = f"Run {run.run_id} ({run.name}): pass-1 aborted during early-exit round"
                         all_run_errors.append(msg)
                         run_had_fatal_error = True
+                    if not quota_exhausted and any(is_quota_exhausted(str(e)) for e in round_errors):
+                        logger.error("Run %d: provider out of credits/quota (early-exit round) — stopping this run", run.run_id)
+                        run_had_fatal_error = True
+                        quota_exhausted = True
                     first_error.extend(round_errors)
                 else:
                     # Phase 1
@@ -840,8 +850,20 @@ async def run_pipeline(
                         # multi-run "Run all" pipeline) instead of silently completing 0/N cells
                         # and reporting "succeeded".
                         run_had_fatal_error = True
+                        if is_quota_exhausted(p1_error):
+                            quota_exhausted = True
                     elif chunk_failed > 0:
                         logger.warning("Run %d: %d/%d cells failed in chunk %d", run.run_id, chunk_failed, n_pending, chunk_i + 1)
+
+                    if not quota_exhausted and any(is_quota_exhausted(e) for e in p1_errors.values()):
+                        # The probe call succeeded but a later concurrent P1 call hit the
+                        # same wall (only the first call is probed before the rest are
+                        # fired together — see _execute_pass1). Those already-in-flight
+                        # calls can't be un-sent, but nothing later in this run should
+                        # keep trying against an empty account.
+                        logger.error("Run %d: provider out of credits/quota (pass 1) — stopping this run", run.run_id)
+                        run_had_fatal_error = True
+                        quota_exhausted = True
 
                     # Cells that entered pending_cells but got no Pass-1 output at all
                     # (API error/timeout inside _execute_pass1) would otherwise vanish
@@ -916,6 +938,11 @@ async def run_pipeline(
                             _count_payload(p2_drop_payload)
                             store.mark_failed(run.run_id, paper.paper_id, q.version_id, err_detail)
 
+                    if not quota_exhausted and any(is_quota_exhausted(e) for e in p2_errors.values()):
+                        logger.error("Run %d: provider out of credits/quota (pass 2) — stopping this run", run.run_id)
+                        run_had_fatal_error = True
+                        quota_exhausted = True
+
                     # Parse / verify / save
                     err = _parse_save_post_tail(
                         p1_texts=p1_texts,
@@ -956,7 +983,7 @@ async def run_pipeline(
                     message=_progress_message(f"chunk {chunk_i + 1}/{len(chunks)}"),
                 )
 
-                if (first_error or run_had_fatal_error) and cfg.fail_fast:
+                if (first_error or run_had_fatal_error) and (cfg.fail_fast or quota_exhausted):
                     break
 
             progress.update(chunk_task, visible=False)
@@ -978,7 +1005,7 @@ async def run_pipeline(
             progress.advance(run_task)
             logger.debug("Run %d complete", run.run_id)
 
-            run_failed = (bool(first_error) or run_had_fatal_error) and cfg.fail_fast
+            run_failed = (bool(first_error) or run_had_fatal_error) and (cfg.fail_fast or quota_exhausted)
             any_run_failed = any_run_failed or run_failed
             will_continue = (run_idx < len(runs) - 1) and not run_failed
 

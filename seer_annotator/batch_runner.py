@@ -208,6 +208,30 @@ _TRANSIENT_EXC_NAMES = frozenset({
     "IncompleteRead", "Timeout",
 })
 
+# A provider that has run out of quota/credits often reports it through the
+# same exception type and status code as a transient network blip -- Ollama
+# wraps "you have reached your session usage limit" as a plain
+# APIConnectionError with status_code=500, indistinguishable from a dropped
+# connection by class/status alone. These substrings are the only thing that
+# tells the two apart, so they are checked first and always win: no amount of
+# retrying buys anything back until the account is topped up.
+_QUOTA_EXHAUSTED_MARKERS = (
+    "insufficient_quota", "exceeded your current quota", "credit balance",
+    "usage limit", "add usage credits", "add credits", "billing",
+)
+
+
+def is_quota_exhausted(text: str) -> bool:
+    """True when an error message means the account is out of credits/quota.
+
+    Takes already-formatted text (as ``_format_llm_error`` produces, and as
+    callers outside this module -- the orchestrator's per-cell error dicts,
+    its fatal-error string -- actually hold) rather than an exception object,
+    so it can be reused wherever only the stored message text survives.
+    """
+    lowered = text.lower()
+    return any(marker in lowered for marker in _QUOTA_EXHAUSTED_MARKERS)
+
 
 def _is_transient_transport_error(exc: BaseException) -> bool:
     """True when ``exc`` means the provider was unreachable, not that it refused.
@@ -218,11 +242,18 @@ def _is_transient_transport_error(exc: BaseException) -> bool:
     connection/timeout type. A definite HTTP answer — 401 bad key, 404 no such
     batch — is not transient and must still fail the job: retrying it forever
     would hide a real misconfiguration behind a job that never finishes.
+
+    Quota/credit exhaustion is checked first and disqualifies every other
+    rule below it: it is never transient, however it is dressed up by the
+    SDK, because retrying cannot fix an empty account. See
+    ``_QUOTA_EXHAUSTED_MARKERS``.
     """
     seen: set[int] = set()
     cur: BaseException | None = exc
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
+        if is_quota_exhausted(str(cur)):
+            return False
         status = getattr(cur, "status_code", None)
         if isinstance(status, int) and (status in _TRANSIENT_STATUS_CODES or status >= 500):
             return True
